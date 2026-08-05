@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pressly/goose/v3"
@@ -296,13 +297,9 @@ func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
 
 // UpsertEnvVar inserts or updates an environment variable for appID.
 func (s *Store) UpsertEnvVar(appID int64, key, valueEncrypted string, isSecret bool) error {
-	isSecretInt := 0
-	if isSecret {
-		isSecretInt = 1
-	}
 	_, err := s.db.Exec(`INSERT INTO env_vars(app_id, key, value_encrypted, is_secret)
 		VALUES(?, ?, ?, ?) ON CONFLICT(app_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, is_secret = excluded.is_secret`,
-		appID, key, valueEncrypted, isSecretInt)
+		appID, key, valueEncrypted, isSecret)
 	return err
 }
 
@@ -334,11 +331,27 @@ func (s *Store) ListEnvVars(appID int64) ([]EnvVar, error) {
 	return envVars, rows.Err()
 }
 
+func scanDomain(row *sql.Row) (*Domain, error) {
+	var d Domain
+	err := row.Scan(&d.ID, &d.AppID, &d.Hostname)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
 // AddDomain adds a domain for appID. Returns ErrNotFound if appID does not exist.
 // Returns an error if the hostname already exists (UNIQUE constraint).
 func (s *Store) AddDomain(appID int64, hostname string) (*Domain, error) {
 	res, err := s.db.Exec(`INSERT INTO domains(app_id, hostname) VALUES(?, ?)`, appID, hostname)
 	if err != nil {
+		// Map FOREIGN KEY constraint violation to ErrNotFound
+		if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	id, err := res.LastInsertId()
@@ -394,13 +407,6 @@ func (s *Store) DeleteDomain(id int64) error {
 
 // DomainByHostname looks up a domain by hostname. Returns ErrNotFound if none exists.
 func (s *Store) DomainByHostname(hostname string) (*Domain, error) {
-	var d Domain
-	err := s.db.QueryRow(`SELECT id, app_id, hostname FROM domains WHERE hostname = ?`, hostname).Scan(&d.ID, &d.AppID, &d.Hostname)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &d, nil
+	row := s.db.QueryRow(`SELECT id, app_id, hostname FROM domains WHERE hostname = ?`, hostname)
+	return scanDomain(row)
 }

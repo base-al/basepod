@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -277,6 +278,15 @@ func TestDeleteEnvVar(t *testing.T) {
 	vars, _ = s.ListEnvVars(app.ID)
 	if len(vars) != 1 || vars[0].Key != "VAR2" {
 		t.Fatalf("after delete, expected VAR2, got: %+v", vars)
+	}
+}
+
+func TestAddDomainInvalidAppID(t *testing.T) {
+	s := open(t)
+	// appID 99999 does not exist; should return ErrNotFound due to FK constraint
+	_, err := s.AddDomain(99999, "nonexistent.com")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for invalid appID, got %v", err)
 	}
 }
 
