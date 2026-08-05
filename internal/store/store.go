@@ -41,14 +41,18 @@ type App struct {
 	Status   string
 }
 
-// Deployment is a single deploy attempt for an App.
+// Deployment is a single deploy attempt for an App. StartedAt is always
+// set (RFC3339 UTC); FinishedAt is "" until the deployment reaches a
+// terminal status (see FinishDeployment).
 type Deployment struct {
-	ID       int64
-	AppID    int64
-	Number   int
-	ImageRef string
-	Status   string
-	Error    string
+	ID         int64
+	AppID      int64
+	Number     int
+	ImageRef   string
+	Status     string
+	Error      string
+	StartedAt  string
+	FinishedAt string
 }
 
 // EnvVar is an environment variable for an App.
@@ -251,12 +255,17 @@ func (s *Store) DeleteApp(id int64) error {
 
 // CreateDeployment inserts a new deployment for appID. The Number is
 // per-app max+1 (starting at 1), and Status starts "deploying".
+// started_at is set explicitly (rather than left to the column's SQL
+// default) so the returned Deployment's StartedAt matches exactly what
+// was persisted.
 func (s *Store) CreateDeployment(appID int64, imageRef string) (*Deployment, error) {
 	var n int
 	if err := s.db.QueryRow(`SELECT COALESCE(MAX(number), 0) + 1 FROM deployments WHERE app_id = ?`, appID).Scan(&n); err != nil {
 		return nil, err
 	}
-	res, err := s.db.Exec(`INSERT INTO deployments(app_id, number, image_ref) VALUES(?, ?, ?)`, appID, n, imageRef)
+	startedAt := time.Now().UTC().Format(timeFormat)
+	res, err := s.db.Exec(`INSERT INTO deployments(app_id, number, image_ref, started_at) VALUES(?, ?, ?, ?)`,
+		appID, n, imageRef, startedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +273,7 @@ func (s *Store) CreateDeployment(appID int64, imageRef string) (*Deployment, err
 	if err != nil {
 		return nil, err
 	}
-	return &Deployment{ID: id, AppID: appID, Number: n, ImageRef: imageRef, Status: "deploying"}, nil
+	return &Deployment{ID: id, AppID: appID, Number: n, ImageRef: imageRef, Status: "deploying", StartedAt: startedAt}, nil
 }
 
 // FinishDeployment sets a deployment's terminal status and error message,
@@ -277,7 +286,7 @@ func (s *Store) FinishDeployment(id int64, status, errMsg string) error {
 
 // ListDeployments returns all deployments for appID, newest first.
 func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
-	rows, err := s.db.Query(`SELECT id, app_id, number, image_ref, status, error
+	rows, err := s.db.Query(`SELECT id, app_id, number, image_ref, status, error, started_at, finished_at
 		FROM deployments WHERE app_id = ? ORDER BY number DESC`, appID)
 	if err != nil {
 		return nil, err
@@ -287,9 +296,11 @@ func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
 	var deployments []Deployment
 	for rows.Next() {
 		var d Deployment
-		if err := rows.Scan(&d.ID, &d.AppID, &d.Number, &d.ImageRef, &d.Status, &d.Error); err != nil {
+		var finishedAt sql.NullString
+		if err := rows.Scan(&d.ID, &d.AppID, &d.Number, &d.ImageRef, &d.Status, &d.Error, &d.StartedAt, &finishedAt); err != nil {
 			return nil, err
 		}
+		d.FinishedAt = finishedAt.String
 		deployments = append(deployments, d)
 	}
 	return deployments, rows.Err()

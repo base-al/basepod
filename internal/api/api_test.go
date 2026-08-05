@@ -287,6 +287,9 @@ func TestAppLifecycle(t *testing.T) {
 	if deployed.Status != "healthy" {
 		t.Fatalf("unexpected deployment response: %+v", deployed)
 	}
+	if deployed.StartedAt == "" {
+		t.Fatalf("expected non-empty started_at on deploy response: %+v", deployed)
+	}
 
 	// get -> contains the deployment
 	var got appDetailResponse
@@ -296,6 +299,9 @@ func TestAppLifecycle(t *testing.T) {
 	}
 	if len(got.Deployments) != 1 || got.Deployments[0].Image != "nginx:alpine" {
 		t.Fatalf("expected 1 deployment with image nginx:alpine, got %+v", got.Deployments)
+	}
+	if got.Deployments[0].StartedAt == "" || got.Deployments[0].FinishedAt == "" {
+		t.Fatalf("expected non-empty started_at/finished_at on a finished deployment, got %+v", got.Deployments[0])
 	}
 
 	// delete -> 204

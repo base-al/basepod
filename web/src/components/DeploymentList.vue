@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import type { TableColumn } from '@nuxt/ui'
 
 import type { Deployment } from '../lib/api'
+import { relativeTime } from '../lib/relativeTime'
 import StatusBadge from './StatusBadge.vue'
 
 const props = defineProps<{ deployments: Deployment[] }>()
@@ -16,6 +17,7 @@ const columns: TableColumn<Deployment>[] = [
   { accessorKey: 'number', header: '#' },
   { accessorKey: 'image', header: 'Image' },
   { accessorKey: 'status', header: 'Status' },
+  { accessorKey: 'started_at', header: 'Started' },
   { accessorKey: 'error', header: 'Error' },
 ]
 
@@ -59,6 +61,12 @@ function displayError(deployment: Deployment) {
 
     <template #status-cell="{ row }">
       <StatusBadge :status="row.original.status" />
+    </template>
+
+    <template #started_at-cell="{ row }">
+      <span class="text-xs text-slate-400" :title="row.original.started_at">
+        {{ relativeTime(row.original.started_at) }}
+      </span>
     </template>
 
     <template #error-cell="{ row }">

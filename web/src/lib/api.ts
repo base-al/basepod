@@ -32,15 +32,17 @@ export interface App {
   status: AppStatus
 }
 
-/** One deploy attempt for an app. Note: the API does not return any
- * started/finished timestamps (internal/store.Deployment has no time
- * fields at all) — there is no data to render a "relative time" column
- * from, so the UI omits one rather than fabricate it. */
+/** One deploy attempt for an app, in the exact wire shape
+ * internal/api/apps.go's deploymentResponse returns — snake_case to match
+ * the JSON tags directly. started_at is always an RFC3339 string;
+ * finished_at is "" until the deployment reaches a terminal status. */
 export interface Deployment {
   number: number
   image: string
   status: DeploymentStatus
   error: string
+  started_at: string
+  finished_at: string
 }
 
 export interface AppDetail extends App {

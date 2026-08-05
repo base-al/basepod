@@ -39,14 +39,23 @@ func toAppResponse(app *store.App) appResponse {
 }
 
 type deploymentResponse struct {
-	Number int    `json:"number"`
-	Image  string `json:"image"`
-	Status string `json:"status"`
-	Error  string `json:"error"`
+	Number     int    `json:"number"`
+	Image      string `json:"image"`
+	Status     string `json:"status"`
+	Error      string `json:"error"`
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at"`
 }
 
 func toDeploymentResponse(d store.Deployment) deploymentResponse {
-	return deploymentResponse{Number: d.Number, Image: d.ImageRef, Status: d.Status, Error: d.Error}
+	return deploymentResponse{
+		Number:     d.Number,
+		Image:      d.ImageRef,
+		Status:     d.Status,
+		Error:      d.Error,
+		StartedAt:  d.StartedAt,
+		FinishedAt: d.FinishedAt,
+	}
 }
 
 type appDetailResponse struct {

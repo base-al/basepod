@@ -50,10 +50,22 @@ func TestDeploymentNumbering(t *testing.T) {
 	if d1.Number != 1 || d2.Number != 2 {
 		t.Fatalf("numbers: %d, %d", d1.Number, d2.Number)
 	}
+	if d1.StartedAt == "" || d2.StartedAt == "" {
+		t.Fatalf("expected CreateDeployment to set started_at: d1=%+v d2=%+v", d1, d2)
+	}
 	s.FinishDeployment(d2.ID, "healthy", "")
 	ds, _ := s.ListDeployments(app.ID)
 	if len(ds) != 2 || ds[0].Number != 2 || ds[0].Status != "healthy" {
 		t.Fatalf("list wrong: %+v", ds)
+	}
+	if ds[0].StartedAt == "" {
+		t.Fatalf("expected started_at on listed deployment, got %+v", ds[0])
+	}
+	if ds[0].FinishedAt == "" {
+		t.Fatalf("expected finished_at on a finished deployment, got %+v", ds[0])
+	}
+	if ds[1].FinishedAt != "" {
+		t.Fatalf("expected empty finished_at on a still-deploying deployment, got %+v", ds[1])
 	}
 }
 
