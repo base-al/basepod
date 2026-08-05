@@ -182,6 +182,8 @@ if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
 	fail "server process exited during startup — see log above"
 fi
 
+curl -s --max-time 10 "${API_BASE}/" | grep -q '<div id="app"' || fail "dashboard shell not served at /"
+
 # ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------

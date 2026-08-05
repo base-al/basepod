@@ -83,6 +83,23 @@ scripted end-to-end (also run in CI on every push/PR).
   bp-caddy`, then set `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` to free
   ports and restart.
 
+## Contributing
+
+The dashboard (`web/`) is a Vite/Vue app that gets embedded into the
+`basepod` binary at build time (`web/embed.go`). Useful targets:
+
+```bash
+make ui     # build the dashboard into web/dist
+make build  # ui, then compile the basepod binary
+make dev    # instructions for running server + dashboard with hot-reload
+make test   # go test ./...
+```
+
+Only a placeholder `web/dist/index.html` ("BasePod dashboard not built —
+run make ui") is committed, so `go build ./...` works without Node
+installed — `.gitignore` excludes the rest of `web/dist/`. **Never commit
+a real `make ui` build**; CI builds the dashboard fresh on every run.
+
 ## Why BasePod
 
 - **Rootless Podman** instead of a privileged Docker daemon; apps are
