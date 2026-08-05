@@ -75,6 +75,14 @@ localhost:3080/api/v1/apps/hello`.
 See [`scripts/e2e-local.sh`](scripts/e2e-local.sh) for this whole flow
 scripted end-to-end (also run in CI on every push/PR).
 
+## Known issues (v0.1)
+
+- If the first `basepod server` boot fails because port 80/443 is
+  already taken, a created-but-never-started `bp-caddy` container with
+  the old port mapping can be left behind. Remedy: `podman rm -f
+  bp-caddy`, then set `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` to free
+  ports and restart.
+
 ## Why BasePod
 
 - **Rootless Podman** instead of a privileged Docker daemon; apps are

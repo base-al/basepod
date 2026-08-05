@@ -44,11 +44,17 @@ func newFakeRuntime(ops *[]string) *fakeRuntime {
 func (f *fakeRuntime) record(s string) { *f.ops = append(*f.ops, s) }
 
 func (f *fakeRuntime) PullImage(ctx context.Context, ref string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.record("pull:" + ref)
 	return f.pullErr
 }
 
 func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if f.createErr != nil {
 		f.record("create-err:" + spec.Name)
 		return "", f.createErr
@@ -65,6 +71,9 @@ func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpe
 }
 
 func (f *fakeRuntime) StartContainer(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.record("start:" + id)
 	if f.startErr != nil {
 		return f.startErr
@@ -76,7 +85,15 @@ func (f *fakeRuntime) StartContainer(ctx context.Context, id string) error {
 	return nil
 }
 
+// StopContainer and RemoveContainer deliberately honor ctx cancellation
+// (unlike, say, always succeeding regardless of ctx) so tests can prove
+// that deploy.go's cleanup paths use a context.WithoutCancel-derived
+// context rather than the caller's ctx directly — see
+// TestFailDetachesCleanupFromCancelledContext.
 func (f *fakeRuntime) StopContainer(ctx context.Context, id string, timeoutSec int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.record("stop:" + id)
 	if f.stopErr != nil {
 		return f.stopErr
@@ -89,6 +106,9 @@ func (f *fakeRuntime) StopContainer(ctx context.Context, id string, timeoutSec i
 }
 
 func (f *fakeRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.record("remove:" + id)
 	if err, ok := f.removeErrIDs[id]; ok {
 		return err
@@ -101,6 +121,9 @@ func (f *fakeRuntime) RemoveContainer(ctx context.Context, id string, force bool
 }
 
 func (f *fakeRuntime) InspectContainer(ctx context.Context, nameOrID string) (*podman.ContainerInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	for _, c := range f.containers {
 		if c.ID == nameOrID || c.Name == nameOrID {
 			cc := c
@@ -111,6 +134,9 @@ func (f *fakeRuntime) InspectContainer(ctx context.Context, nameOrID string) (*p
 }
 
 func (f *fakeRuntime) ListContainers(ctx context.Context, labelFilters map[string]string) ([]podman.ContainerInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var out []podman.ContainerInfo
 	for _, c := range f.containers {
 		match := true
@@ -451,6 +477,64 @@ func TestRemoveAppBestEffortTeardown(t *testing.T) {
 	}
 	if router.calls != 1 {
 		t.Fatalf("router.calls = %d, want 1 (Routes()+Apply must still run after a per-container error)", router.calls)
+	}
+
+	// Regression for I1: the app's store row is still "running" at this
+	// point (RemoveApp never touches the store — the caller deletes the
+	// row afterwards), so Routes() would include blog's own route unless
+	// RemoveApp explicitly filters it out before calling router.Apply.
+	// Assert on the *applied* set, not just the call count.
+	for _, rt := range router.lastRoutes {
+		if rt.Slug == "blog" || rt.Hostname == "blog.apps.localhost" {
+			t.Errorf("router.lastRoutes still contains removed app's route: %+v", router.lastRoutes)
+		}
+	}
+}
+
+// TestFailDetachesCleanupFromCancelledContext is a regression test for I2:
+// fail()'s cleanup (RemoveContainer of the just-created, not-yet-live
+// container) must happen even when the ctx passed into Deploy has already
+// been cancelled — e.g. Ctrl-C during pull, or the deploy's own timeout
+// expiring — otherwise that container is orphaned still holding the live
+// bp-<slug> DNS alias. fakeRuntime's Stop/Remove/List calls honor ctx
+// cancellation (see their comments), so this test only passes if fail()
+// derives its cleanup context via context.WithoutCancel(ctx) rather than
+// using the (cancelled) ctx directly.
+func TestFailDetachesCleanupFromCancelledContext(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	// Simulate the ctx being cancelled mid-probe (Ctrl-C / deploy
+	// timeout) and the probe surfacing that as its own error, the way a
+	// real HTTP probe would once its request context dies.
+	probe := func(pctx context.Context, upstream string) error {
+		cancel()
+		return pctx.Err()
+	}
+
+	eng := New(st, rt, router, probe, "apps.localhost")
+	eng.probeInterval = time.Millisecond
+	eng.probeAttempts = 1
+
+	app, err := st.CreateApp("blog", "nginx:old", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dep, err := eng.Deploy(ctx, app, "nginx:new")
+	if err == nil {
+		t.Fatal("expected error from cancelled context during probe")
+	}
+	if dep.Status != "failed" {
+		t.Errorf("dep.Status = %q, want failed", dep.Status)
+	}
+
+	if len(rt.containers) != 0 {
+		t.Errorf("containers = %+v, want the new container removed despite the cancelled ctx (fail() must use a detached cleanup context)", rt.containers)
 	}
 }
 

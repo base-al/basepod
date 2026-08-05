@@ -139,8 +139,18 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 // to "running" if other (old) containers are still up for it, or "error"
 // if this was the only container. It never touches old containers.
 func (e *Engine) fail(ctx context.Context, app *store.App, dep *store.Deployment, newContainerID string, cause error) (*store.Deployment, error) {
+	// Cleanup below must survive a cancelled/expired ctx: fail is reached
+	// from mid-pull Ctrl-C or the deploy's own timeout expiring, and if we
+	// used ctx directly every podman call here would fail instantly,
+	// orphaning the just-created container still holding the live
+	// bp-<slug> DNS alias. context.WithoutCancel (Go 1.21+) keeps ctx's
+	// values but drops its cancellation/deadline; we still bound it with
+	// our own timeout so a stuck podman call can't hang forever.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+
 	if newContainerID != "" {
-		if err := e.rt.RemoveContainer(ctx, newContainerID, true); err != nil {
+		if err := e.rt.RemoveContainer(cleanupCtx, newContainerID, true); err != nil {
 			fmt.Fprintf(e.log, "deploy: cleanup failed container %s: %v\n", newContainerID, err)
 		}
 	}
@@ -152,7 +162,7 @@ func (e *Engine) fail(ctx context.Context, app *store.App, dep *store.Deployment
 	dep.Error = cause.Error()
 
 	status := "error"
-	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
+	containers, err := e.rt.ListContainers(cleanupCtx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
 	if err != nil {
 		fmt.Fprintf(e.log, "deploy: list containers for %s: %v\n", app.Slug, err)
 	} else {
@@ -178,7 +188,14 @@ func (e *Engine) fail(ctx context.Context, app *store.App, dep *store.Deployment
 // container, so a stray old container is a cleanup nuisance, not a
 // correctness problem.
 func (e *Engine) removeOldContainers(ctx context.Context, slug string, keepNumber int) {
-	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true", "basepod.app": slug})
+	// Same reasoning as fail's cleanupCtx: this runs after traffic has
+	// already cut over, so a cancelled/expired ctx must not stop us from
+	// stopping/removing the previous generation — otherwise it's left
+	// running as an orphan.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+
+	containers, err := e.rt.ListContainers(cleanupCtx, map[string]string{"basepod.managed": "true", "basepod.app": slug})
 	if err != nil {
 		fmt.Fprintf(e.log, "deploy: list containers for %s: %v\n", slug, err)
 		return
@@ -188,10 +205,10 @@ func (e *Engine) removeOldContainers(ctx context.Context, slug string, keepNumbe
 		if c.Labels["basepod.deployment"] == keep {
 			continue
 		}
-		if err := e.rt.StopContainer(ctx, c.ID, 10); err != nil {
+		if err := e.rt.StopContainer(cleanupCtx, c.ID, 10); err != nil {
 			fmt.Fprintf(e.log, "deploy: stop old container %s: %v\n", c.Name, err)
 		}
-		if err := e.rt.RemoveContainer(ctx, c.ID, false); err != nil {
+		if err := e.rt.RemoveContainer(cleanupCtx, c.ID, false); err != nil {
 			fmt.Fprintf(e.log, "deploy: remove old container %s: %v\n", c.Name, err)
 		}
 	}
@@ -226,7 +243,11 @@ func (e *Engine) probeUntilUp(ctx context.Context, upstream string) error {
 // RemoveApp stops and removes every container belonging to app, then
 // re-applies the route set so its hostname is dropped from Caddy. It
 // does not touch the store; the caller (API layer) owns deleting the
-// app's row.
+// app's row — which means RemoveApp typically runs while the app's
+// store status is still "running" (handleDeleteApp calls RemoveApp
+// before deleting the store row), so Routes() would otherwise still
+// include this app. We explicitly drop app.Slug's route below rather
+// than relying on caller ordering.
 //
 // Stop/remove is best-effort per container, mirroring
 // removeOldContainers: a container that fails to stop or remove is
@@ -238,15 +259,22 @@ func (e *Engine) probeUntilUp(ctx context.Context, upstream string) error {
 // around) or a failure in Routes()/router.Apply itself is returned as
 // an error.
 func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
-	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.app": app.Slug})
+	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
 	if err != nil {
 		return fmt.Errorf("deploy: list containers for %s: %w", app.Slug, err)
 	}
+
+	// Teardown must survive a cancelled/expired ctx (see fail's
+	// cleanupCtx comment) so a container isn't left running — and
+	// holding the live bp-<slug> DNS alias — just because the caller's
+	// request context ended first.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
 	for _, c := range containers {
-		if err := e.rt.StopContainer(ctx, c.ID, 10); err != nil {
+		if err := e.rt.StopContainer(cleanupCtx, c.ID, 10); err != nil {
 			fmt.Fprintf(e.log, "deploy: stop container %s: %v\n", c.Name, err)
 		}
-		if err := e.rt.RemoveContainer(ctx, c.ID, true); err != nil {
+		if err := e.rt.RemoveContainer(cleanupCtx, c.ID, true); err != nil {
 			fmt.Fprintf(e.log, "deploy: remove container %s: %v\n", c.Name, err)
 		}
 	}
@@ -255,7 +283,19 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 	if err != nil {
 		return fmt.Errorf("deploy: compute routes: %w", err)
 	}
-	if err := e.router.Apply(ctx, routes); err != nil {
+	// Routes() includes every app whose store status is "running",
+	// which this app still is at this point (the caller deletes the
+	// store row only after RemoveApp returns). Drop its own route
+	// explicitly so we never re-apply a route for the app we're in the
+	// middle of removing, regardless of caller ordering.
+	filtered := make([]caddy.AppRoute, 0, len(routes))
+	for _, r := range routes {
+		if r.Slug == app.Slug {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if err := e.router.Apply(ctx, filtered); err != nil {
 		return fmt.Errorf("deploy: apply routes: %w", err)
 	}
 	return nil
