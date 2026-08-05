@@ -26,12 +26,15 @@ func TestRenderTwoAppsGolden(t *testing.T) {
 
 // TestRenderTwoAppsWithDashboardGolden proves the dashboard route is
 // prepended (before every app route) as a terminal host-match reverse
-// proxy to its upstream.
+// proxy to its upstream — the dashboard API's unix socket dial string
+// (see DashboardSockDial), not a network address, so only the bp-caddy
+// container (which alone gets the socket's bind mount — see
+// DashboardSockMountDest) can ever reach it.
 func TestRenderTwoAppsWithDashboardGolden(t *testing.T) {
 	got, err := Render([]AppRoute{
 		{Slug: "wiki", Hostnames: []string{"wiki.apps.example.com", "wiki.custom.com"}, Upstream: "bp-wiki:3000"},
 		{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"},
-	}, &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: "10.89.2.1:3080"})
+	}, &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: DashboardSockDial()})
 	if err != nil {
 		t.Fatal(err)
 	}

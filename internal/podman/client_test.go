@@ -484,6 +484,40 @@ func TestInspectContainerIgnoresNonTCPBindings(t *testing.T) {
 	}
 }
 
+// TestInspectContainerParsesBindMounts proves InspectContainer parses the
+// top-level "Mounts" array into []BindMount, keeping only bind-type
+// entries (e.g. skipping a volume mount) and sorting the result
+// deterministically regardless of the daemon's own ordering.
+func TestInspectContainerParsesBindMounts(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/bp-caddy/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"Id":     "c1",
+			"Name":   "/bp-caddy",
+			"State":  map[string]any{"Status": "running"},
+			"Config": map[string]any{"Labels": map[string]string{}},
+			"Mounts": []map[string]any{
+				{"Type": "bind", "Source": "/data/caddy-sock", "Destination": "/run/basepod"},
+				{"Type": "bind", "Source": "/data/caddy-config", "Destination": "/etc/caddy"},
+				{"Type": "volume", "Name": "somevolume", "Source": "/var/lib/containers/vol", "Destination": "/ignored"},
+			},
+		})
+	})
+	c := fakeDaemon(t, mux)
+	info, err := c.InspectContainer(context.Background(), "bp-caddy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []BindMount{
+		{Source: "/data/caddy-config", Dest: "/etc/caddy"},
+		{Source: "/data/caddy-sock", Dest: "/run/basepod"},
+	}
+	if !reflect.DeepEqual(info.Mounts, want) {
+		t.Errorf("Mounts = %+v, want %+v (volume mount filtered out, sorted by Destination)", info.Mounts, want)
+	}
+}
+
 func TestPingSuccess(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v5.0.0/libpod/_ping", func(w http.ResponseWriter, _ *http.Request) {

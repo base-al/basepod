@@ -24,7 +24,7 @@
                   "handler": "reverse_proxy",
                   "upstreams": [
                     {
-                      "dial": "10.89.2.1:3080"
+                      "dial": "unix//run/basepod/api.sock"
                     }
                   ]
                 }

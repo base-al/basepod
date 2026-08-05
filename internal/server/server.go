@@ -147,47 +147,41 @@ func Run(ctx context.Context, cfgPath string) error {
 		}
 	}
 
-	// dashboardRoute and gatewayListener are only set when the dashboard
-	// route is actually usable: the setting isn't "off", the "basepod"
-	// network reports a gateway address, and a second listener bound to
-	// it (gateway:3080) actually succeeds. Any of those failing disables
-	// the dashboard route (nil) rather than failing boot — Caddy must
-	// never be pointed at a dead upstream.
+	// dashboardRoute and dashboardListener are only set when the dashboard
+	// route is actually usable: the setting isn't "off", and a unix
+	// socket bound at mgr.SockDir()/DashboardSockName — the same host
+	// directory Manager's create() bind-mounts into (only) the bp-caddy
+	// container, at DashboardSockMountDest — actually opens (mgr.Ensure
+	// above guarantees that directory already exists on disk). A unix
+	// socket, rather than a TCP listener on the "basepod" network's
+	// gateway address (this feature's first cut), is what actually
+	// restricts the dashboard API to bp-caddy: no app container gets this
+	// bind mount, so none can reach the socket file, whereas every
+	// container on the network could reach a gateway-address TCP
+	// listener. Any failure here disables the dashboard route (nil)
+	// rather than failing boot — Caddy must never be pointed at a dead
+	// upstream.
 	var dashboardRoute *caddy.DashboardRoute
-	var gatewayListener net.Listener
+	var dashboardListener net.Listener
 	if dashboardDomain != "" {
-		netInfo, err := pc.InspectNetwork(ctx, caddy.NetworkName)
-		if err != nil {
-			// Best-effort, like the gateway-bind failure below: the
-			// dashboard route is a convenience on top of a control plane
-			// that's otherwise fully up (mgr.Ensure already succeeded, so
-			// the network exists) — it must never be the reason boot
-			// fails outright.
-			log.Printf("basepod: dashboard: could not inspect %q network, dashboard route disabled: %v", caddy.NetworkName, err)
-		} else if netInfo.Gateway == "" {
-			log.Printf("basepod: dashboard: network %q has no gateway address — dashboard route disabled", caddy.NetworkName)
+		sockPath := filepath.Join(mgr.SockDir(), caddy.DashboardSockName)
+		l, failReason := prepareDashboardListener(sockPath)
+		if failReason != "" {
+			// Expected on macOS: podman machine shares host directories
+			// into its VM over virtiofs, which doesn't carry unix sockets
+			// across that boundary — the dashboard route is Linux-first
+			// for that reason; macOS operators keep using
+			// http://localhost:3080 (or an SSH tunnel to a remote box)
+			// instead. Warn and continue rather than failing boot.
+			log.Printf(
+				"basepod: dashboard: %s, dashboard route disabled (expected on macOS — podman "+
+					"machine's virtiofs bind mounts don't carry unix sockets across the VM boundary; "+
+					"see README's Remote access section)",
+				failReason,
+			)
 		} else {
-			gatewayAddr := netInfo.Gateway + ":3080"
-			l, err := net.Listen("tcp", gatewayAddr)
-			if err != nil {
-				// Expected on macOS podman machine: the gateway address
-				// lives inside the podman-machine VM's own network
-				// namespace and isn't bindable from the host — the
-				// dashboard route is Linux-first for that reason; macOS
-				// operators keep using http://localhost:3080 (or an SSH
-				// tunnel to a remote box) instead. Warn and continue
-				// rather than failing boot, or leaving Caddy pointed at a
-				// listener that was never actually opened.
-				log.Printf(
-					"basepod: dashboard: could not bind gateway listener %s, dashboard route disabled "+
-						"(expected on macOS podman-machine — the VM boundary prevents binding its internal "+
-						"gateway IP from the host; see README's Remote access section): %v",
-					gatewayAddr, err,
-				)
-			} else {
-				gatewayListener = l
-				dashboardRoute = &caddy.DashboardRoute{Hostname: dashboardDomain, Upstream: gatewayAddr}
-			}
+			dashboardListener = l
+			dashboardRoute = &caddy.DashboardRoute{Hostname: dashboardDomain, Upstream: caddy.DashboardSockDial()}
 		}
 	}
 	// http.Server.Shutdown closes every listener passed to Serve, so this
@@ -195,8 +189,8 @@ func Run(ctx context.Context, cfgPath string) error {
 	// mgr.Apply below failing after the listener was already bound); a
 	// second Close() past that point is a harmless no-op error, ignored.
 	defer func() {
-		if gatewayListener != nil {
-			_ = gatewayListener.Close()
+		if dashboardListener != nil {
+			_ = dashboardListener.Close()
 		}
 	}()
 
@@ -248,9 +242,10 @@ func Run(ctx context.Context, cfgPath string) error {
 	go pruneSessions(ctx, st, pruneInitialDelay, pruneInterval)
 
 	// serveErr is sized for both listeners (the main cfg.Listen one, always
-	// started, plus the optional gateway one) — each of up to two goroutines
-	// below sends exactly one value, and the buffer means neither can block
-	// trying to send after the other has already caused Run to return.
+	// started, plus the optional dashboard unix socket) — each of up to
+	// two goroutines below sends exactly one value, and the buffer means
+	// neither can block trying to send after the other has already caused
+	// Run to return.
 	serveErr := make(chan error, 2)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -260,9 +255,9 @@ func Run(ctx context.Context, cfgPath string) error {
 		serveErr <- nil
 	}()
 
-	if gatewayListener != nil {
+	if dashboardListener != nil {
 		go func() {
-			if err := srv.Serve(gatewayListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := srv.Serve(dashboardListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				serveErr <- err
 				return
 			}
@@ -373,6 +368,46 @@ func resolveDashboardDomain(current, rootDomain string) (domain string, writeDef
 	default:
 		return current, false
 	}
+}
+
+// dashboardSockPerm is the dashboard's unix socket's file mode:
+// owner+group read/write, no "other" access at all. This is defense in
+// depth on top of the bind mount itself (see DashboardSockMountDest's doc
+// comment) — only bp-caddy's container ever sees this file in the first
+// place, since no app container gets that mount, but a restrictive mode
+// means even a process inside bp-caddy's own container running as an
+// unexpected UID/GID can't reach it either.
+const dashboardSockPerm = 0o660
+
+// prepareDashboardListener binds a unix socket at sockPath for the
+// dashboard's second listener, applying dashboardSockPerm to it. Every
+// failure mode — removing a stale socket file left behind by a previous
+// run (net.Listen would otherwise fail with "address already in use"
+// against it), the bind itself (e.g. macOS, where podman machine's
+// virtiofs bind mounts don't carry unix sockets across the VM boundary),
+// or the chmod — is reported through the string return rather than an
+// error: every one of them means "disable the dashboard route and keep
+// booting", never "fail Run", so there is nothing for a caller to
+// meaningfully do with a typed error here.
+//
+// This is its own function — called from Run right after mgr.Ensure, but
+// only touching the filesystem (no podman/store I/O) — so tests can
+// exercise it directly against a temp directory, without needing to run
+// all of Run against a fake podman daemon (see
+// TestPrepareDashboardListener*).
+func prepareDashboardListener(sockPath string) (l net.Listener, failReason string) {
+	if err := os.RemoveAll(sockPath); err != nil {
+		return nil, fmt.Sprintf("could not remove stale socket %s: %v", sockPath, err)
+	}
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return nil, fmt.Sprintf("could not bind unix socket %s: %v", sockPath, err)
+	}
+	if err := os.Chmod(sockPath, dashboardSockPerm); err != nil {
+		_ = l.Close()
+		return nil, fmt.Sprintf("could not chmod socket %s: %v", sockPath, err)
+	}
+	return l, ""
 }
 
 // checkPodmanVersion parses a libpod version string (e.g. "4.9.2" or

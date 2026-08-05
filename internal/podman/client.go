@@ -603,6 +603,42 @@ type inspectResponse struct {
 			HostPort string `json:"HostPort"`
 		} `json:"PortBindings"`
 	} `json:"HostConfig"`
+	Mounts []mountInspectEntry `json:"Mounts"`
+}
+
+// mountInspectEntry is one element of libpod inspect's top-level "Mounts"
+// array. Only bind mounts (Type == "bind") are meaningful to BasePod —
+// every mount it creates is one (see podman.CreateSpec.Mounts) — so
+// parseBindMounts filters to those and drops everything else (e.g. any
+// mount unrelated to basepod that happens to exist).
+type mountInspectEntry struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+}
+
+// parseBindMounts converts libpod inspect's "Mounts" array into
+// []BindMount, keeping only bind-type entries. Callers (caddy.driftReason)
+// compare mounts only as a set of Source→Destination pairs, so ReadOnly is
+// left at its zero value here rather than parsed from the (unused) "RW"
+// field. Sorted by Destination then Source for a deterministic,
+// comparable order, since libpod's Mounts array has no guaranteed
+// ordering.
+func parseBindMounts(raw []mountInspectEntry) []BindMount {
+	var out []BindMount
+	for _, m := range raw {
+		if m.Type != "bind" {
+			continue
+		}
+		out = append(out, BindMount{Source: m.Source, Dest: m.Destination})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Dest != out[j].Dest {
+			return out[i].Dest < out[j].Dest
+		}
+		return out[i].Source < out[j].Source
+	})
+	return out
 }
 
 // InspectContainer fetches details for a container by name or ID.
@@ -630,6 +666,7 @@ func (c *Client) InspectContainer(ctx context.Context, nameOrID string) (*Contai
 		Labels: raw.Config.Labels,
 		Image:  raw.ImageName,
 		Ports:  parsePortBindings(raw.HostConfig.PortBindings),
+		Mounts: parseBindMounts(raw.Mounts),
 	}, nil
 }
 

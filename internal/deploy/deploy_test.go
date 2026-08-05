@@ -763,7 +763,7 @@ func TestApplyRoutesPassesDashboardToRouter(t *testing.T) {
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: "10.89.2.1:3080"}
+	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: caddy.DashboardSockDial()}
 	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, dashboard)
 	ctx := context.Background()
 
@@ -786,7 +786,7 @@ func TestRemoveAppPassesDashboardToRouter(t *testing.T) {
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: "10.89.2.1:3080"}
+	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: caddy.DashboardSockDial()}
 	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, dashboard)
 	ctx := context.Background()
 

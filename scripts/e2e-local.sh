@@ -13,8 +13,8 @@
 # (finite SSE fetch, query-token auth scoped to the logs route only), the
 # dashboard's static asset pipeline (hashed asset + immutable
 # Cache-Control), and (added in v0.3) the dashboard being served remotely
-# through Caddy over HTTPS at basepod.<root-domain> (its own listener on
-# the "basepod" network's gateway address — Linux-first, see README).
+# through Caddy over HTTPS at basepod.<root-domain> (proxied to a unix
+# socket only the bp-caddy container can reach — Linux-first, see README).
 # Safe to run repeatedly on a dev machine or in CI
 # (GitHub Actions ubuntu-24.04 runner with rootless podman); requires a
 # reachable podman socket (`podman machine start` on macOS,
@@ -205,14 +205,15 @@ printf '%s' "${asset_headers}" | grep -qi '^HTTP/[0-9.]* 200' || fail "asset ${a
 printf '%s' "${asset_headers}" | grep -qi '^Cache-Control:.*immutable' || fail "asset ${asset_path} missing immutable Cache-Control: ${asset_headers}"
 
 # ---------------------------------------------------------------------------
-# Dashboard — served automatically by Caddy at https://basepod.<root-domain>
-# once the server discovers the "basepod" network's gateway IP and binds its
-# second (gateway-facing) listener there at boot (see
-# internal/server.Run and resolveDashboardDomain). This is Linux-first:
-# this CI runner (ubuntu-24.04 rootless podman) can bind the gateway
-# address directly, but macOS podman-machine cannot (the gateway lives
-# inside the VM's own network namespace) — see README's Remote access
-# section for the macOS fallback.
+# Dashboard — served automatically by Caddy at https://basepod.<root-domain>,
+# proxied to a unix socket (data_dir/caddy-sock/api.sock) that only the
+# bp-caddy container can reach — bind-mounted into it alone, at
+# DashboardSockMountDest (see internal/caddy.Manager and
+# internal/server.Run/prepareDashboardListener). This works out of the box
+# on Linux, rootless included (this CI runner: ubuntu-24.04 rootless
+# podman); macOS podman-machine cannot, since its virtiofs bind mounts
+# don't carry unix sockets across the VM boundary — see README's Remote
+# access section for the macOS fallback.
 # ---------------------------------------------------------------------------
 DASHBOARD_DOMAIN="basepod.${ROOT_DOMAIN}"
 CADDY_CONFIG="${DATA_DIR}/caddy/current.json"

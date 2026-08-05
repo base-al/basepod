@@ -23,9 +23,9 @@ type CreateSpec struct {
 }
 
 // ContainerInfo is a summarized view of a libpod container, as returned by
-// InspectContainer and ListContainers. Image and Ports are populated by
-// InspectContainer only (ListContainers's libpod endpoint doesn't carry
-// either) and are the zero value there.
+// InspectContainer and ListContainers. Image, Ports, and Mounts are
+// populated by InspectContainer only (ListContainers's libpod endpoint
+// doesn't carry any of them) and are the zero value there.
 type ContainerInfo struct {
 	ID     string
 	Name   string
@@ -33,6 +33,7 @@ type ContainerInfo struct {
 	Labels map[string]string
 	Image  string        // human-readable image ref (libpod inspect's "ImageName"), e.g. "docker.io/library/caddy:2.10-alpine"
 	Ports  []PortMapping // parsed from inspect's HostConfig.PortBindings; TCP only (v0.3)
+	Mounts []BindMount   // parsed from inspect's top-level "Mounts"; bind mounts only (v0.3), ReadOnly always false (unused by callers — see caddy.driftReason)
 }
 
 // NetworkInfo is a summarized view of a libpod network, as returned by

@@ -25,6 +25,36 @@ const ContainerName = "bp-caddy"
 // join.
 const NetworkName = "basepod"
 
+// DashboardSockMountDest is the container-side path the caddy-sock host
+// directory (Manager.SockDir()) is bind-mounted onto (see create and
+// desiredMounts) — where BasePod's own dashboard API's unix socket
+// (DashboardSockName, created host-side by internal/server) shows up
+// inside the bp-caddy container. Deliberately a directory mount, not a
+// single-file mount: only bp-caddy gets it (no app container does), which
+// is what actually restricts the dashboard API to Caddy — unlike v0.3's
+// first cut of this feature, which listened on the "basepod" network's
+// gateway address and so was reachable by every container on that
+// network.
+const DashboardSockMountDest = "/run/basepod"
+
+// DashboardSockName is the dashboard API unix socket's file name (not
+// path) inside DashboardSockMountDest — shared between internal/server
+// (which creates the real socket file, host-side, at
+// SockDir()/DashboardSockName) and DashboardSockDial (the Caddy dial
+// string built from it): both describe the same file, viewed from two
+// different mount namespaces, and must agree on its name.
+const DashboardSockName = "api.sock"
+
+// DashboardSockDial returns the Caddy JSON reverse_proxy upstream "dial"
+// string for the dashboard's unix socket, exactly as Caddy resolves it
+// inside the bp-caddy container. Caddy's dial syntax for a unix socket is
+// "unix/" followed by the absolute path (see AdminSocket for the same
+// pattern applied to Caddy's own admin API socket), giving
+// "unix//run/basepod/api.sock".
+func DashboardSockDial() string {
+	return "unix/" + DashboardSockMountDest + "/" + DashboardSockName
+}
+
 // Runtime is the podman capability the manager needs (satisfied by
 // *podman.Client).
 type Runtime interface {
@@ -79,6 +109,17 @@ func (m *Manager) dataDir() string {
 	return filepath.Join(filepath.Dir(m.configDir), "caddy-data")
 }
 
+// SockDir is the host directory bind-mounted into the Caddy container at
+// DashboardSockMountDest (/run/basepod), shared with internal/server: it
+// creates the dashboard API's actual unix socket file there
+// (SockDir()/DashboardSockName), and this bind mount is what makes it
+// visible to (only) the bp-caddy container. A sibling of configDir, like
+// dataDir, for the same reason: no app's own config/data bind mount
+// should ever double as an entry into this directory.
+func (m *Manager) SockDir() string {
+	return filepath.Join(filepath.Dir(m.configDir), "caddy-sock")
+}
+
 // driftStopTimeout bounds how long Ensure waits for a drifted bp-caddy
 // container to stop gracefully before recreating it — short, since a
 // drifted container (wrong image/ports, or stuck in "created") is being
@@ -110,7 +151,11 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return m.create(ctx)
 	}
 
-	if reason := driftReason(info, m.desiredPorts()); reason != "" {
+	desiredMounts, err := m.desiredMounts()
+	if err != nil {
+		return fmt.Errorf("caddy: resolve desired mounts: %w", err)
+	}
+	if reason := driftReason(info, m.desiredPorts(), desiredMounts); reason != "" {
 		log.Printf("caddy: %s has drifted (%s) — recreating", ContainerName, reason)
 		if err := m.rt.StopContainer(ctx, info.ID, driftStopTimeout); err != nil {
 			return fmt.Errorf("caddy: stop drifted %s: %w", ContainerName, err)
@@ -139,16 +184,73 @@ func (m *Manager) desiredPorts() []podman.PortMapping {
 	}
 }
 
+// resolvedMountSources ensures configDir, dataDir, and SockDir all exist
+// (MkdirAll) and returns their real (symlink-free) host paths — see
+// create's comment on why bind-mount sources must be resolved through
+// EvalSymlinks under podman machine (macOS). This is the single source of
+// truth both create (building a fresh container's Mounts) and
+// desiredMounts (what Ensure's drift check compares an existing
+// container's inspected mounts against) call through, so the two can
+// never compute a different "desired" mount set from each other.
+func (m *Manager) resolvedMountSources() (configSrc, dataSrc, sockSrc string, err error) {
+	if err := os.MkdirAll(m.configDir, 0o755); err != nil {
+		return "", "", "", fmt.Errorf("caddy: create config dir %q: %w", m.configDir, err)
+	}
+	dataDir := m.dataDir()
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return "", "", "", fmt.Errorf("caddy: create data dir %q: %w", dataDir, err)
+	}
+	sockDir := m.SockDir()
+	// 0o750, tighter than config/data's 0o755: this directory exists
+	// solely to carry the dashboard API's unix socket into (only) the
+	// bp-caddy container — see DashboardSockMountDest's doc comment.
+	if err := os.MkdirAll(sockDir, 0o750); err != nil {
+		return "", "", "", fmt.Errorf("caddy: create socket dir %q: %w", sockDir, err)
+	}
+
+	configSrc, err = filepath.EvalSymlinks(m.configDir)
+	if err != nil {
+		return "", "", "", fmt.Errorf("caddy: resolve config dir %q: %w", m.configDir, err)
+	}
+	dataSrc, err = filepath.EvalSymlinks(dataDir)
+	if err != nil {
+		return "", "", "", fmt.Errorf("caddy: resolve data dir %q: %w", dataDir, err)
+	}
+	sockSrc, err = filepath.EvalSymlinks(sockDir)
+	if err != nil {
+		return "", "", "", fmt.Errorf("caddy: resolve socket dir %q: %w", sockDir, err)
+	}
+	return configSrc, dataSrc, sockSrc, nil
+}
+
+// desiredMounts is the bind-mount set create() builds — the same set
+// Ensure compares an existing container's inspected mounts against for
+// drift (see resolvedMountSources).
+func (m *Manager) desiredMounts() ([]podman.BindMount, error) {
+	configSrc, dataSrc, sockSrc, err := m.resolvedMountSources()
+	if err != nil {
+		return nil, err
+	}
+	return []podman.BindMount{
+		{Source: configSrc, Dest: "/etc/caddy"},
+		{Source: dataSrc, Dest: "/data"},
+		{Source: sockSrc, Dest: DashboardSockMountDest},
+	}, nil
+}
+
 // driftReason reports why an existing bp-caddy container no longer
 // matches what Ensure would create today, or "" if it matches. Checked in
 // order: a container stuck in "created" (made but never started
 // successfully — reconciling it in place isn't meaningfully different
 // from recreating it, and recreating is simpler to reason about); an
 // image mismatch (a newer basepod build changed the pinned Caddy image);
-// then a port-mapping mismatch (the known stale-port-mapping issue: a
-// previous boot's ports don't match the currently configured
-// httpPort/httpsPort).
-func driftReason(info *podman.ContainerInfo, desiredPorts []podman.PortMapping) string {
+// a port-mapping mismatch (the known stale-port-mapping issue: a previous
+// boot's ports don't match the currently configured httpPort/httpsPort);
+// then a bind-mount set mismatch — added so a container created by an
+// older BasePod build (before the dashboard's caddy-sock mount existed)
+// gets recreated on upgrade and picks up the new mount, rather than
+// running forever without it.
+func driftReason(info *podman.ContainerInfo, desiredPorts []podman.PortMapping, desiredMounts []podman.BindMount) string {
 	switch {
 	case info.State == "created":
 		return "state=created (previous boot never started it successfully)"
@@ -156,9 +258,33 @@ func driftReason(info *podman.ContainerInfo, desiredPorts []podman.PortMapping) 
 		return fmt.Sprintf("image %s != desired %s", info.Image, Image)
 	case !portsEqual(info.Ports, desiredPorts):
 		return fmt.Sprintf("ports %v != desired %v", info.Ports, desiredPorts)
+	case !mountsEqual(info.Mounts, desiredMounts):
+		return fmt.Sprintf("mounts %v != desired %v", info.Mounts, desiredMounts)
 	default:
 		return ""
 	}
+}
+
+// mountsEqual reports whether a and b contain the same {Source,Dest}
+// pairs, ignoring order and ignoring ReadOnly (InspectContainer never
+// populates it — see parseBindMounts).
+func mountsEqual(a, b []podman.BindMount) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	type key struct{ source, dest string }
+	counts := make(map[key]int, len(a))
+	for _, m := range a {
+		counts[key{m.Source, m.Dest}]++
+	}
+	for _, m := range b {
+		k := key{m.Source, m.Dest}
+		if counts[k] == 0 {
+			return false
+		}
+		counts[k]--
+	}
+	return true
 }
 
 // portsEqual reports whether a and b contain the same
@@ -187,12 +313,17 @@ func portsEqual(a, b []podman.PortMapping) bool {
 // and creates and starts the bp-caddy container. Called only when
 // InspectContainer reports the container doesn't exist yet.
 func (m *Manager) create(ctx context.Context) error {
-	if err := os.MkdirAll(m.configDir, 0o755); err != nil {
-		return fmt.Errorf("caddy: create config dir %q: %w", m.configDir, err)
-	}
-	dataDir := m.dataDir()
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return fmt.Errorf("caddy: create data dir %q: %w", dataDir, err)
+	// Resolve bind-mount sources to their real (symlink-free) path (also
+	// MkdirAll's config/data/sock dirs into existence — see
+	// resolvedMountSources). Podman machine (macOS) shares host
+	// directories into its VM by their canonical path (e.g.
+	// /private/tmp), not through macOS-only symlinks like /tmp ->
+	// /private/tmp; passing the symlinked path straight through as a
+	// bind-mount source fails inside the VM with "no such file or
+	// directory" even though the path exists on the host.
+	configSrc, dataSrc, sockSrc, err := m.resolvedMountSources()
+	if err != nil {
+		return err
 	}
 
 	initial, err := Render(nil, nil)
@@ -205,22 +336,6 @@ func (m *Manager) create(ctx context.Context) error {
 
 	if err := m.rt.PullImage(ctx, Image); err != nil {
 		return fmt.Errorf("caddy: pull %s: %w", Image, err)
-	}
-
-	// Resolve bind-mount sources to their real (symlink-free) path.
-	// Podman machine (macOS) shares host directories into its VM by
-	// their canonical path (e.g. /private/tmp), not through
-	// macOS-only symlinks like /tmp -> /private/tmp; passing the
-	// symlinked path straight through as a bind-mount source fails
-	// inside the VM with "no such file or directory" even though the
-	// path exists on the host.
-	configSrc, err := filepath.EvalSymlinks(m.configDir)
-	if err != nil {
-		return fmt.Errorf("caddy: resolve config dir %q: %w", m.configDir, err)
-	}
-	dataSrc, err := filepath.EvalSymlinks(dataDir)
-	if err != nil {
-		return fmt.Errorf("caddy: resolve data dir %q: %w", dataDir, err)
 	}
 
 	spec := podman.CreateSpec{
@@ -244,6 +359,13 @@ func (m *Manager) create(ctx context.Context) error {
 		Mounts: []podman.BindMount{
 			{Source: configSrc, Dest: "/etc/caddy"},
 			{Source: dataSrc, Dest: "/data"},
+			// Shared with internal/server: it creates the dashboard API's
+			// actual unix socket file host-side, at
+			// SockDir()/DashboardSockName — this mount is what makes that
+			// file (and only that file's directory) visible inside
+			// bp-caddy, and bp-caddy alone, unlike the network-wide
+			// gateway listener this replaced.
+			{Source: sockSrc, Dest: DashboardSockMountDest},
 		},
 		RestartPolicy: "always",
 	}

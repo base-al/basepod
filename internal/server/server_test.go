@@ -180,6 +180,89 @@ func TestResolveDashboardDomain(t *testing.T) {
 	}
 }
 
+// shortTempDir returns a freshly created temp directory with a short
+// path, cleaned up via t.Cleanup. Unlike t.TempDir() (which nests under
+// this package's test binary path plus the test's own name, easily
+// exceeding 100+ characters for a name like
+// TestPrepareDashboardListenerBindsAndChmods), this is safe to build a
+// unix socket path under: macOS enforces a ~104-byte sun_path limit
+// (Linux's is a little more forgiving, at 108), and a long test name
+// nested under TempDir() reliably blows past it, failing the bind with
+// "invalid argument" for reasons that have nothing to do with the
+// behavior under test.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "bpsock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// TestPrepareDashboardListenerBindsAndChmods proves a fresh socket path
+// binds successfully and ends up with dashboardSockPerm (0660: owner+group
+// read/write, no "other" access) — the defense-in-depth restriction on
+// top of the bind mount itself that only bp-caddy's container can ever
+// see this file (see DashboardSockMountDest's doc comment).
+func TestPrepareDashboardListenerBindsAndChmods(t *testing.T) {
+	sockPath := filepath.Join(shortTempDir(t), "api.sock")
+
+	l, reason := prepareDashboardListener(sockPath)
+	if reason != "" {
+		t.Fatalf("prepareDashboardListener: unexpected failure reason %q", reason)
+	}
+	if l == nil {
+		t.Fatal("prepareDashboardListener: listener is nil despite empty failReason")
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	if l.Addr().Network() != "unix" || l.Addr().String() != sockPath {
+		t.Errorf("listener address = %s %s, want unix %s", l.Addr().Network(), l.Addr().String(), sockPath)
+	}
+
+	fi, err := os.Stat(sockPath)
+	if err != nil {
+		t.Fatalf("stat socket file: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != dashboardSockPerm {
+		t.Errorf("socket mode = %o, want %o", perm, dashboardSockPerm)
+	}
+}
+
+// TestPrepareDashboardListenerRemovesStaleSocket proves a leftover file at
+// sockPath (as an unclean shutdown might leave behind) doesn't block a
+// fresh bind — net.Listen("unix", ...) would otherwise fail with "address
+// already in use" against it.
+func TestPrepareDashboardListenerRemovesStaleSocket(t *testing.T) {
+	sockPath := filepath.Join(shortTempDir(t), "api.sock")
+	if err := os.WriteFile(sockPath, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	l, reason := prepareDashboardListener(sockPath)
+	if reason != "" {
+		t.Fatalf("prepareDashboardListener: unexpected failure reason %q", reason)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+}
+
+// TestPrepareDashboardListenerFailsOnBadPath proves a sockPath whose
+// parent directory doesn't exist fails through the string-reason path
+// (nil listener, non-empty reason naming the path) rather than panicking
+// or returning a usable listener.
+func TestPrepareDashboardListenerFailsOnBadPath(t *testing.T) {
+	sockPath := filepath.Join(shortTempDir(t), "does-not-exist", "api.sock")
+
+	l, reason := prepareDashboardListener(sockPath)
+	if l != nil {
+		t.Fatalf("prepareDashboardListener: expected nil listener, got %v", l)
+	}
+	if reason == "" || !strings.Contains(reason, sockPath) {
+		t.Errorf("prepareDashboardListener: reason = %q, want it to name %q", reason, sockPath)
+	}
+}
+
 // TestCheckPodmanVersionUnparseable proves a malformed version string
 // (not even a dotted major.minor) is reported as an error rather than
 // panicking or silently passing the gate.

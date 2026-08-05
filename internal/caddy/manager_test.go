@@ -104,6 +104,17 @@ func (f *fakeExecer) Exec(ctx context.Context, container string, cmd ...string) 
 	return f.err
 }
 
+// TestDashboardSockDial proves the Caddy dial string built for the
+// dashboard's unix socket follows the same "unix/" + absolute-path
+// pattern as AdminSocket, giving the exact form Caddy's docs (and this
+// package's own admin-socket usage) expect: "unix//run/basepod/api.sock".
+func TestDashboardSockDial(t *testing.T) {
+	want := "unix//run/basepod/api.sock"
+	if got := DashboardSockDial(); got != want {
+		t.Errorf("DashboardSockDial() = %q, want %q", got, want)
+	}
+}
+
 func TestEnsureCreatesWhenMissing(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
@@ -144,10 +155,11 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	}
 
 	dataDir := filepath.Join(filepath.Dir(configDir), "caddy-data")
+	sockDir := filepath.Join(filepath.Dir(configDir), "caddy-sock")
 	// Mount sources are resolved to their real (symlink-free) path (see
 	// manager.go's create): on macOS, t.TempDir() lives under /var/folders,
 	// itself a symlink to /private/var/folders, so the resolved path
-	// differs from configDir/dataDir as constructed above.
+	// differs from configDir/dataDir/sockDir as constructed above.
 	wantConfigSrc, err := filepath.EvalSymlinks(configDir)
 	if err != nil {
 		t.Fatalf("EvalSymlinks(configDir): %v", err)
@@ -156,9 +168,14 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks(dataDir): %v", err)
 	}
+	wantSockSrc, err := filepath.EvalSymlinks(sockDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(sockDir): %v", err)
+	}
 	wantMounts := []podman.BindMount{
 		{Source: wantConfigSrc, Dest: "/etc/caddy"},
 		{Source: wantDataSrc, Dest: "/data"},
+		{Source: wantSockSrc, Dest: DashboardSockMountDest},
 	}
 	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
 		t.Errorf("spec.Mounts = %+v, want %+v", spec.Mounts, wantMounts)
@@ -174,6 +191,15 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 
 	if fi, err := os.Stat(dataDir); err != nil || !fi.IsDir() {
 		t.Errorf("caddy-data dir not created at %s: %v", dataDir, err)
+	}
+	if fi, err := os.Stat(sockDir); err != nil || !fi.IsDir() {
+		t.Errorf("caddy-sock dir not created at %s: %v", sockDir, err)
+	} else if perm := fi.Mode().Perm(); perm&0o007 != 0 {
+		// The umask in effect may strip bits MkdirAll(0o750) requested, so
+		// this only asserts the property that actually matters (no
+		// "other" access), rather than an exact 0750 match that could be
+		// legitimately narrower under a stricter umask.
+		t.Errorf("caddy-sock dir mode = %o, want no world-accessible bits", perm)
 	}
 
 	got, err := os.ReadFile(filepath.Join(configDir, "current.json"))
@@ -194,13 +220,48 @@ var matchingPorts = []podman.PortMapping{
 	{ContainerPort: 443, HostPort: 8443},
 }
 
+// wantMounts computes the desired bind-mount set (config, data, and
+// socket dirs, all resolved through EvalSymlinks exactly as
+// manager.go's resolvedMountSources does) for a Manager rooted at
+// configDir, so a "no drift" test can build a fakeRuntime.inspectInfo
+// whose Mounts matches it. It also creates the three directories (via
+// MkdirAll, mirroring resolvedMountSources), since EvalSymlinks requires
+// them to exist.
+func wantMounts(t *testing.T, configDir string) []podman.BindMount {
+	t.Helper()
+	dataDir := filepath.Join(filepath.Dir(configDir), "caddy-data")
+	sockDir := filepath.Join(filepath.Dir(configDir), "caddy-sock")
+	for _, d := range []string{configDir, dataDir, sockDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", d, err)
+		}
+	}
+	configSrc, err := filepath.EvalSymlinks(configDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(configDir): %v", err)
+	}
+	dataSrc, err := filepath.EvalSymlinks(dataDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(dataDir): %v", err)
+	}
+	sockSrc, err := filepath.EvalSymlinks(sockDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(sockDir): %v", err)
+	}
+	return []podman.BindMount{
+		{Source: configSrc, Dest: "/etc/caddy"},
+		{Source: dataSrc, Dest: "/data"},
+		{Source: sockSrc, Dest: DashboardSockMountDest},
+	}
+}
+
 func TestEnsureStartsWhenStopped(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "exited",
-		Image: Image, Ports: matchingPorts,
+		Image: Image, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
 	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -221,7 +282,7 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "running",
-		Image: Image, Ports: matchingPorts,
+		Image: Image, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
 	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -329,12 +390,17 @@ func TestEnsureRecreatesOnPortMismatch(t *testing.T) {
 }
 
 // TestEnsureNoopWhenAllMatch is the drift matrix's negative case: a
-// running container whose state, image, and ports (regardless of
+// running container whose state, image, ports, and mounts (regardless of
 // declaration order) all match the desired spec exactly must not be
 // touched at all.
 func TestEnsureNoopWhenAllMatch(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
+
+	mounts := wantMounts(t, configDir)
+	// Deliberately reversed order vs. desiredMounts() too, to prove that
+	// comparison is set-based, not positional, exactly like ports below.
+	reversedMounts := []podman.BindMount{mounts[2], mounts[1], mounts[0]}
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "running",
@@ -345,6 +411,7 @@ func TestEnsureNoopWhenAllMatch(t *testing.T) {
 			{ContainerPort: 443, HostPort: 8443},
 			{ContainerPort: 80, HostPort: 8080},
 		},
+		Mounts: reversedMounts,
 	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -355,6 +422,42 @@ func TestEnsureNoopWhenAllMatch(t *testing.T) {
 	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v (no drift — must not stop/remove/recreate)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureRecreatesOnMountMismatch proves a running container whose
+// inspected bind mounts don't match the currently desired set is
+// recreated with the correct mounts — the case that matters most in
+// practice: a bp-caddy container created by a pre-dashboard BasePod build
+// (missing the caddy-sock mount entirely) must be recreated on upgrade so
+// it picks up the new mount, rather than running forever without it.
+func TestEnsureRecreatesOnMountMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image, Ports: matchingPorts,
+		// No caddy-sock mount at all — as an old (pre-dashboard) bp-caddy
+		// container would report.
+		Mounts: []podman.BindMount{
+			{Source: "/old/config", Dest: "/etc/caddy"},
+			{Source: "/old/data", Dest: "/data"},
+		},
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+
+	want := wantMounts(t, configDir)
+	if !reflect.DeepEqual(fr.createSpec.Mounts, want) {
+		t.Errorf("recreated spec.Mounts = %+v, want %+v", fr.createSpec.Mounts, want)
 	}
 }
 
@@ -404,7 +507,7 @@ func TestApplyWritesDashboardRoute(t *testing.T) {
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
 	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
-	dashboard := &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: "10.89.2.1:3080"}
+	dashboard := &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: DashboardSockDial()}
 	if err := mgr.Apply(context.Background(), routes, dashboard); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -416,7 +519,7 @@ func TestApplyWritesDashboardRoute(t *testing.T) {
 	if !strings.Contains(string(got), "basepod.apps.example.com") {
 		t.Errorf("current.json missing dashboard hostname, got: %s", got)
 	}
-	if !strings.Contains(string(got), "10.89.2.1:3080") {
+	if !strings.Contains(string(got), DashboardSockDial()) {
 		t.Errorf("current.json missing dashboard upstream, got: %s", got)
 	}
 }
