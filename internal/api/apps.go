@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -75,8 +74,7 @@ type createAppRequest struct {
 // constraint.
 func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	var req createAppRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if !readJSON(w, r, &req) {
 		return
 	}
 
@@ -195,8 +193,8 @@ func (a *api) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req deployRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if err := decodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		writeDecodeError(w, err)
 		return
 	}
 

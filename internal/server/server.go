@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +40,21 @@ var Version = "dev"
 // shutdownTimeout bounds how long Run waits for in-flight requests to
 // finish once a shutdown signal arrives.
 const shutdownTimeout = 10 * time.Second
+
+// readHeaderTimeout and idleTimeout bound the http.Server built by
+// newHTTPServer. There is deliberately no ReadTimeout or WriteTimeout:
+// see newHTTPServer's doc comment for why.
+const (
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 120 * time.Second
+)
+
+// minPodmanMajor and minPodmanMinor are the oldest libpod API version
+// BasePod supports — see checkPodmanVersion.
+const (
+	minPodmanMajor = 4
+	minPodmanMinor = 9
+)
 
 // Run loads configuration from cfgPath and serves the BasePod control
 // plane until ctx is canceled or a SIGINT/SIGTERM is received.
@@ -90,6 +107,14 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: podman not reachable — is Podman running? try `podman machine start`: %w", err)
 	}
 
+	podmanVersion, err := pc.Version(ctx)
+	if err != nil {
+		return fmt.Errorf("server: checking podman version: %w", err)
+	}
+	if err := checkPodmanVersion(podmanVersion); err != nil {
+		return err
+	}
+
 	mgr := caddy.NewManager(pc, caddy.PodmanExec, filepath.Join(cfg.DataDir, "caddy"), cfg.HTTPPort, cfg.HTTPSPort)
 	if err := mgr.Ensure(ctx); err != nil {
 		return fmt.Errorf("server: ensure caddy: %w", err)
@@ -119,10 +144,7 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: apply routes: %w", err)
 	}
 
-	srv := &http.Server{
-		Addr:    cfg.Listen,
-		Handler: rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs)),
-	}
+	srv := newHTTPServer(cfg.Listen, rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs)))
 
 	log.Printf("basepod: listening on %s", cfg.Listen)
 	log.Printf("basepod: root domain %s", rootDomain)
@@ -148,6 +170,75 @@ func Run(ctx context.Context, cfgPath string) error {
 		}
 		return nil
 	}
+}
+
+// newHTTPServer builds the control plane's http.Server.
+//
+// ReadHeaderTimeout bounds how long a client may take sending request
+// headers (a slowloris-style defense) and IdleTimeout bounds how long a
+// keep-alive connection may sit idle between requests — both are safe
+// fixed bounds regardless of what a request's handler does.
+//
+// There is deliberately no ReadTimeout or WriteTimeout, unlike most
+// hardened http.Server setups:
+//   - ReadTimeout would bound the entire request, including the body —
+//     but a deploy request's body is read up front and then the handler
+//     itself runs synchronously for up to deployTimeout (5 minutes, see
+//     internal/api) pulling images and polling health probes; a
+//     ReadTimeout tuned for normal requests would have nothing to do
+//     with that and one tuned to accommodate it would defeat the point.
+//   - WriteTimeout would cut off in-progress writes on a fixed
+//     wall-clock deadline from when the connection was accepted,
+//     including GET .../logs's Server-Sent-Events stream (see
+//     handleAppLogs), which is designed to stay open indefinitely for
+//     follow=1 — it has to be bounded some other way, not by an
+//     http.Server-wide timer.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+}
+
+// checkPodmanVersion parses a libpod version string (e.g. "4.9.2" or
+// "5.0.0-dev") and reports an actionable error naming the found version
+// if it is older than minPodmanMajor.minPodmanMinor. Only major.minor are
+// compared — the patch segment (and any "-dev"-style suffix fused onto
+// it) is ignored entirely, so "4.9.0", "4.9.2", and "4.9.0-dev" are all
+// treated alike.
+//
+// This is its own function — called from Run right after pc.Version, but
+// not itself doing any I/O — so tests can exercise the version gate
+// directly against a literal version string, without needing to run all
+// of Run against a fake podman daemon (see TestCheckPodmanVersion).
+func checkPodmanVersion(version string) error {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return fmt.Errorf("server: could not parse podman version %q — expected a dotted major.minor(.patch) version", version)
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("server: could not parse podman version %q: %w", version, err)
+	}
+	// The minor segment may itself carry a "-dev"-style suffix (e.g. a
+	// two-segment version like "4.9-dev"); a three-segment version's
+	// suffix instead lands on parts[2] (the patch segment), which is
+	// ignored outright, so it never reaches here.
+	minorStr, _, _ := strings.Cut(parts[1], "-")
+	minor, err := strconv.Atoi(minorStr)
+	if err != nil {
+		return fmt.Errorf("server: could not parse podman version %q: %w", version, err)
+	}
+
+	if major > minPodmanMajor || (major == minPodmanMajor && minor >= minPodmanMinor) {
+		return nil
+	}
+	return fmt.Errorf(
+		"server: found podman version %s, but basepod requires podman >= %d.%d — please upgrade podman",
+		version, minPodmanMajor, minPodmanMinor,
+	)
 }
 
 // rootHandler composes the process's single HTTP server: apiHandler (as

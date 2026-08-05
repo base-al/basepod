@@ -290,6 +290,36 @@ func TestPingSuccess(t *testing.T) {
 	}
 }
 
+// TestVersion proves Version reads the "Version" field out of libpod's
+// GET /version response, requesting the correct versioned libpod path.
+func TestVersion(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/version", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]string{"Version": "4.8.0"})
+	})
+	c := fakeDaemon(t, mux)
+	got, err := c.Version(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "4.8.0" {
+		t.Fatalf("Version() = %q, want %q", got, "4.8.0")
+	}
+}
+
+func TestVersionErrorStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/version", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"message": "boom"})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.Version(context.Background()); err == nil {
+		t.Fatal("expected an error for a non-200 /version response")
+	}
+}
+
 // TestContainerLogsQueryAndRawBody proves ContainerLogs sends the expected
 // query parameters and returns the response body completely unparsed
 // (raw multiplex bytes, not JSON-decoded) for the caller to stream.

@@ -149,7 +149,8 @@ func TestHandleAppLogsEventFraming(t *testing.T) {
 }
 
 // TestHandleAppLogsDefaultAndCappedTail proves tail defaults to 200 when
-// omitted and is capped at 5000 rather than passed through uncapped.
+// omitted, is clamped up to 1 when present but zero or negative, and is
+// capped at 5000 rather than passed through uncapped.
 func TestHandleAppLogsDefaultAndCappedTail(t *testing.T) {
 	st := newTestStore(t)
 	createTestApp(t, st)
@@ -160,7 +161,10 @@ func TestHandleAppLogsDefaultAndCappedTail(t *testing.T) {
 		query    string
 		wantTail int
 	}{
-		{"", 200},
+		{"", 200},            // absent -> default
+		{"?tail=0", 1},       // present, zero -> clamped up to 1
+		{"?tail=-5", 1},      // present, negative -> clamped up to 1
+		{"?tail=9999", 5000}, // present, over max -> capped at 5000
 		{"?tail=9999999", 5000},
 		{"?tail=10", 10},
 	}

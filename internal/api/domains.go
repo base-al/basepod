@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
@@ -76,8 +75,7 @@ func (a *api) handleAddDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req addDomainRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if !readJSON(w, r, &req) {
 		return
 	}
 

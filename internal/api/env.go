@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -104,8 +103,7 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req []envVarResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if !readJSON(w, r, &req) {
 		return
 	}
 

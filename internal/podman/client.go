@@ -261,6 +261,32 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
+// versionResponse is the subset of libpod's GET /version payload Version
+// cares about — the top-level daemon version string (e.g. "4.9.2").
+type versionResponse struct {
+	Version string `json:"Version"`
+}
+
+// Version reports the connected daemon's version string (e.g. "4.9.2"),
+// read from libpod's GET /version endpoint. Callers use this at boot to
+// enforce a minimum podman version (see server.checkPodmanVersion) —
+// BasePod relies on libpod API behavior (e.g. explicit bridge-mode netns,
+// see CreateContainer) that isn't reliably present on older daemons.
+func (c *Client) Version(ctx context.Context) (string, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/version", nil)
+	if err != nil {
+		return "", fmt.Errorf("podman: version: %w", err)
+	}
+	if status != http.StatusOK {
+		return "", apiError(status, data)
+	}
+	var v versionResponse
+	if err := json.Unmarshal(data, &v); err != nil {
+		return "", fmt.Errorf("podman: decoding version response: %w", err)
+	}
+	return v.Version, nil
+}
+
 // pullStreamLine is one line of the newline-delimited JSON stream libpod
 // sends back from POST /images/pull. Errors that occur mid-pull (e.g. a
 // missing manifest) are reported *inside* this stream with a 200 status,

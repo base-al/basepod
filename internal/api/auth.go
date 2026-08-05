@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net"
 	"net/http"
 	"time"
@@ -44,8 +43,7 @@ func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if !readJSON(w, r, &req) {
 		return
 	}
 

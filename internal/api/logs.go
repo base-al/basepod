@@ -20,8 +20,14 @@ const (
 	// that omits it gets the last defaultLogTail lines; one that asks for
 	// more than maxLogTail is silently capped rather than rejected, since
 	// an enormous tail is a resource-usage mistake, not a client error
-	// worth failing the request over.
+	// worth failing the request over. A present-but-non-positive tail
+	// (0 or negative) is clamped up to minLogTail rather than treated as
+	// "unset": podman's own client treats tail<=0 as "all logs" (see
+	// internal/podman.Client.ContainerLogs), which is a very different,
+	// far more expensive request than the caller most likely intended by
+	// passing 0.
 	defaultLogTail = 200
+	minLogTail     = 1
 	maxLogTail     = 5000
 
 	// logHeartbeatInterval is how often handleAppLogs writes an SSE
@@ -50,7 +56,8 @@ type demuxedLine struct {
 // and the client disconnecting.
 //
 // Query params: follow (bool, default false) and tail (int, default
-// defaultLogTail, capped at maxLogTail).
+// defaultLogTail when omitted; clamped to minLogTail when zero or
+// negative, and to maxLogTail when it exceeds it).
 //
 // Errors: 404 "app_not_found" if the slug doesn't exist, 409
 // "not_running" if the app has no running container, 502 "logs_failed"
@@ -63,14 +70,18 @@ func (a *api) handleAppLogs(w http.ResponseWriter, r *http.Request) {
 	tail := defaultLogTail
 	if v := r.URL.Query().Get("tail"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "invalid_request", "tail must be a non-negative integer")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "tail must be an integer")
 			return
 		}
-		tail = n
-	}
-	if tail > maxLogTail {
-		tail = maxLogTail
+		switch {
+		case n <= 0:
+			tail = minLogTail
+		case n > maxLogTail:
+			tail = maxLogTail
+		default:
+			tail = n
+		}
 	}
 
 	src, err := a.logs(r.Context(), slug, follow, tail)
