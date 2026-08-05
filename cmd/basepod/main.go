@@ -27,9 +27,17 @@ func main() {
 }
 
 func newServerCmd() *cobra.Command {
-	return &cobra.Command{Use: "server", Short: "Run the control plane", RunE: func(*cobra.Command, []string) error {
-		return fmt.Errorf("not implemented yet")
-	}}
+	var cfgPath string
+	cmd := &cobra.Command{
+		Use:   "server",
+		Short: "Run the control plane",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			server.Version = Version
+			return server.Run(cmd.Context(), cfgPath)
+		},
+	}
+	cmd.Flags().StringVar(&cfgPath, "config", config.DefaultPath(), "config file")
+	return cmd
 }
 
 func newSetupCmd() *cobra.Command {
