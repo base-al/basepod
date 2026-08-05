@@ -572,9 +572,16 @@ cli_logs_out=$(BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" logs "${BUILD_SLUG}
 # (or need the cleanup trap's backstop) on the next run.
 # ---------------------------------------------------------------------------
 log "deleting app '${BUILD_SLUG}'..."
-build_delete_code=$(http_code -X DELETE -H "Authorization: Bearer ${TOKEN}" \
-	"${API_BASE}/api/v1/apps/${BUILD_SLUG}")
-[ "${build_delete_code}" = "204" ] || fail "delete app ${BUILD_SLUG}: expected 204, got ${build_delete_code}"
+# Uses deploy_curl's generous budget, not http_code's fixed 5s: by this
+# point in the script the runner has just finished six build+rollout
+# cycles back to back, and RemoveApp's container-stop-and-remove plus a
+# route reapply can occasionally run long on a loaded CI runner (observed
+# 30-50s elsewhere in this same run) — a tight timeout here would read as
+# a false failure ("000"), not an actual bug.
+build_delete_raw=$(deploy_curl -w '\n%{http_code}' -X DELETE "${API_BASE}/api/v1/apps/${BUILD_SLUG}" || true)
+build_delete_code=$(printf '%s' "${build_delete_raw}" | tail -n1)
+build_delete_body=$(printf '%s' "${build_delete_raw}" | sed '$d')
+[ "${build_delete_code}" = "204" ] || fail "delete app ${BUILD_SLUG}: expected 204, got ${build_delete_code}: ${build_delete_body}"
 
 buildtest_route_gone() {
 	body=$(curl -sk --max-time 5 \
