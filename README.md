@@ -5,7 +5,8 @@ image, a git repo, or a compose file — and get a running app with
 automatic HTTPS. Like CapRover, but rootless, daemonless, and shipped as
 a single Go binary.
 
-> **Status: v0.1 shipped, v0.2 (dashboard) is the current milestone.**
+> **Status: v0.1 and v0.2 shipped; v0.3 (real deploys — tarball builds,
+> rollback, CLI core) is complete on this branch, pending release.**
 > The detailed design lives in [`docs/plan/`](docs/plan/) — start with
 > [01 — Overview & Architecture](docs/plan/01.overview-and-architecture.md).
 
@@ -46,6 +47,11 @@ By default the API listens on `127.0.0.1:3080`, and BasePod's own
 Caddy container serves apps on ports 80/443 (override with
 `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` if those clash on your
 machine).
+
+> Once an app exists (create it once from the [dashboard](#dashboard) or
+> the [API](#api)), day-to-day shipping is `basepod deploy`: `cd` into
+> your project and run it — see [CLI](#cli) below for the full
+> quick-reference. That's the primary dev flow as of v0.3.
 
 ### Backup
 
@@ -125,6 +131,40 @@ localhost:3080/api/v1/apps/hello`.
 See [`scripts/e2e-local.sh`](scripts/e2e-local.sh) for this whole flow
 (plus env vars, custom domains, and log streaming) scripted end-to-end
 (also run in CI on every push/PR).
+
+### CLI
+
+The `basepod` binary doubles as a client: same executable, run against
+a running server (local or remote) to log in, deploy, and manage apps
+without curl.
+
+```bash
+# Log in once — saves the server URL + session token as a named context
+# in ~/.config/basepod/cli.yaml (override with BASEPOD_CLI_CONFIG).
+./basepod login http://localhost:3080 --email admin@example.com
+
+# Deploy from source: tars the given directory (must have a Containerfile
+# or Dockerfile at its root, default cwd), uploads it, builds it, and
+# rolls it out — the same pipeline POST /deploy/tarball drives above.
+./basepod deploy . -a hello
+
+# ...or deploy an existing image instead of building from source.
+./basepod deploy -a hello --image ghcr.io/user/app:tag
+
+# Tail logs (-f to follow; omit for a fixed --tail window).
+./basepod logs hello -f
+./basepod logs hello --tail 200
+
+# Roll back to an earlier deployment's exact image (see `basepod status`
+# or the dashboard's history tab for deployment numbers).
+./basepod rollback hello 3
+```
+
+Other commands: `basepod apps` (list, `--json` for scripting), `basepod
+env <app> [set KEY=VALUE... | unset KEY...]`, `basepod status` (system +
+every app in one shot), and `basepod context list|use <name>` for
+juggling multiple saved servers. Every server-talking command accepts a
+one-off `--context <name>` flag.
 
 ## Contributing
 
