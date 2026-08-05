@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -35,6 +36,11 @@ type fakeRuntime struct {
 	// IDs — used to make exactly one container in a multi-container
 	// teardown fail while the rest succeed.
 	removeErrIDs map[string]error
+
+	// createdSpecs records the full CreateSpec passed to CreateContainer,
+	// keyed by container name, so tests can assert on fields (like Env)
+	// that ContainerInfo doesn't carry.
+	createdSpecs map[string]podman.CreateSpec
 }
 
 func newFakeRuntime(ops *[]string) *fakeRuntime {
@@ -66,6 +72,10 @@ func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpe
 		labels[k] = v
 	}
 	f.containers[id] = podman.ContainerInfo{ID: id, Name: spec.Name, State: "created", Labels: labels}
+	if f.createdSpecs == nil {
+		f.createdSpecs = map[string]podman.CreateSpec{}
+	}
+	f.createdSpecs[spec.Name] = spec
 	f.record("create:" + spec.Name)
 	return id, nil
 }
@@ -209,7 +219,7 @@ func newTestEngine(t *testing.T, st *store.Store) (*Engine, *fakeRuntime, *fakeR
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost")
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	return eng, rt, router, prober, ops
@@ -266,8 +276,8 @@ func TestDeployHappyPath(t *testing.T) {
 	if router.calls != 1 {
 		t.Fatalf("router.calls = %d, want 1", router.calls)
 	}
-	want := []caddy.AppRoute{{Slug: "blog", Hostname: "blog.apps.localhost", Upstream: "bp-blog:80"}}
-	if len(router.lastRoutes) != 1 || router.lastRoutes[0] != want[0] {
+	want := []caddy.AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.localhost"}, Upstream: "bp-blog:80"}}
+	if len(router.lastRoutes) != 1 || !reflect.DeepEqual(router.lastRoutes[0], want[0]) {
 		t.Errorf("router.lastRoutes = %+v, want %+v", router.lastRoutes, want)
 	}
 
@@ -432,6 +442,149 @@ func TestFailedPull(t *testing.T) {
 	}
 }
 
+// TestDeployInjectsDecryptedEnv proves Deploy reads the app's env vars,
+// decrypts each ValueEncrypted through the Engine's decrypt func, and
+// passes the resulting plaintext map as CreateSpec.Env to CreateContainer.
+func TestDeployInjectsDecryptedEnv(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	decrypt := func(s string) (string, error) { return "plain-" + s, nil }
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt)
+	eng.probeInterval = time.Millisecond
+	eng.probeAttempts = 5
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:old", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertEnvVar(app.ID, "FOO", "enc-foo", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertEnvVar(app.ID, "BAR", "enc-bar", true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.Deploy(ctx, app, "nginx:new"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	spec, ok := rt.createdSpecs["bp-blog-1"]
+	if !ok {
+		t.Fatal("CreateContainer spec not recorded for bp-blog-1")
+	}
+	want := map[string]string{"FOO": "plain-enc-foo", "BAR": "plain-enc-bar"}
+	if !reflect.DeepEqual(spec.Env, want) {
+		t.Errorf("spec.Env = %+v, want %+v", spec.Env, want)
+	}
+}
+
+// TestDeployFailsOnDecryptError proves that when decrypting a stored env
+// var fails, Deploy fails through the normal fail() path: no new
+// container is ever created, and the previous (old, healthy) container is
+// left completely untouched — a half-injected env must never ship.
+func TestDeployFailsOnDecryptError(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	decrypt := func(s string) (string, error) { return "", errors.New("bad key") }
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt)
+	eng.probeInterval = time.Millisecond
+	eng.probeAttempts = 5
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First deploy has no env vars yet, so decrypt is never invoked and
+	// this establishes a healthy "old" container for the assertion below.
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+
+	if err := st.UpsertEnvVar(app.ID, "FOO", "enc-foo", false); err != nil {
+		t.Fatal(err)
+	}
+
+	dep2, err := eng.Deploy(ctx, app, "nginx:v2")
+	if err == nil {
+		t.Fatal("expected error from decrypt failure")
+	}
+	if dep2.Status != "failed" {
+		t.Errorf("dep2.Status = %q, want failed", dep2.Status)
+	}
+	if dep2.Error == "" {
+		t.Error("dep2.Error empty, want decrypt failure message")
+	}
+
+	var oldID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			oldID = id
+		}
+		if c.Name == "bp-blog-2" {
+			t.Errorf("bp-blog-2 should never have been created (decrypt fails before CreateContainer), got %+v", c)
+		}
+	}
+	if oldID == "" {
+		t.Fatal("bp-blog-1 (old, healthy) should still exist")
+	}
+	if got := rt.containers[oldID]; got.State != "running" {
+		t.Errorf("bp-blog-1 state = %q, want still running (untouched)", got.State)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "running" {
+		t.Errorf("app.Status = %q, want running (old container still up)", gotApp.Status)
+	}
+	if gotApp.ImageRef != "nginx:v1" {
+		t.Errorf("app.ImageRef = %q, want unchanged nginx:v1", gotApp.ImageRef)
+	}
+}
+
+// TestRoutesIncludeCustomDomains proves Routes() builds each running
+// app's Hostnames as [slug.rootDomain] followed by that app's custom
+// domains (from ListAllDomains), sorted lexically.
+func TestRoutesIncludeCustomDomains(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppStatus(app.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddDomain(app.ID, "blog.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddDomain(app.ID, "aaa.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err := eng.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("routes = %+v, want 1 route", routes)
+	}
+	want := []string{"blog.apps.localhost", "aaa.example.com", "blog.example.com"}
+	if !reflect.DeepEqual(routes[0].Hostnames, want) {
+		t.Errorf("Hostnames = %v, want %v", routes[0].Hostnames, want)
+	}
+}
+
 // TestRemoveAppBestEffortTeardown is a regression test: RemoveApp must
 // not abort teardown (or skip re-applying routes) just because one
 // container's removal errors. It should keep going for every remaining
@@ -485,8 +638,13 @@ func TestRemoveAppBestEffortTeardown(t *testing.T) {
 	// RemoveApp explicitly filters it out before calling router.Apply.
 	// Assert on the *applied* set, not just the call count.
 	for _, rt := range router.lastRoutes {
-		if rt.Slug == "blog" || rt.Hostname == "blog.apps.localhost" {
+		if rt.Slug == "blog" {
 			t.Errorf("router.lastRoutes still contains removed app's route: %+v", router.lastRoutes)
+		}
+		for _, h := range rt.Hostnames {
+			if h == "blog.apps.localhost" {
+				t.Errorf("router.lastRoutes still contains removed app's hostname: %+v", router.lastRoutes)
+			}
 		}
 	}
 }
@@ -516,7 +674,7 @@ func TestFailDetachesCleanupFromCancelledContext(t *testing.T) {
 		return pctx.Err()
 	}
 
-	eng := New(st, rt, router, probe, "apps.localhost")
+	eng := New(st, rt, router, probe, "apps.localhost", nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 1
 

@@ -6,9 +6,9 @@ import (
 )
 
 type AppRoute struct {
-	Slug     string
-	Hostname string
-	Upstream string
+	Slug      string
+	Hostnames []string
+	Upstream  string
 }
 
 const AdminSocket = "unix//var/run/caddy/admin.sock"
@@ -73,7 +73,7 @@ func Render(routes []AppRoute) ([]byte, error) {
 		caddy_routes[i] = Route{
 			Match: []HostMatch{
 				{
-					Host: []string{route.Hostname},
+					Host: route.Hostnames,
 				},
 			},
 			Handle: []ReverseProxyHandler{

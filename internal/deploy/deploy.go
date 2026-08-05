@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	osexec "os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,11 @@ type Engine struct {
 	probe      Prober
 	rootDomain string
 
+	// decrypt turns an EnvVar.ValueEncrypted into its plaintext value.
+	// nil disables env injection entirely: Deploy fails rather than ship
+	// a container silently missing configured env vars (see Deploy).
+	decrypt func(string) (string, error)
+
 	// probeInterval and probeAttempts control the health-probe retry
 	// loop; they default to 1s/30 (New) and are unexported so tests can
 	// shrink them to keep the suite fast.
@@ -44,13 +50,17 @@ type Engine struct {
 
 // New builds an Engine. rootDomain is appended to an app's slug to form
 // its hostname (e.g. rootDomain "apps.example.com" -> "blog.apps.example.com").
-func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string) *Engine {
+// decrypt turns a stored EnvVar's encrypted value into plaintext; pass nil
+// to disable env injection (Deploy then fails rather than silently
+// omitting configured env vars).
+func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(string) (string, error)) *Engine {
 	return &Engine{
 		st:            st,
 		rt:            rt,
 		router:        router,
 		probe:         probe,
 		rootDomain:    rootDomain,
+		decrypt:       decrypt,
 		probeInterval: time.Second,
 		probeAttempts: 30,
 		log:           os.Stderr,
@@ -88,6 +98,30 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 		NetworkAliases: []string{"bp-" + app.Slug},
 		RestartPolicy:  "always",
 	}
+
+	envVars, err := e.st.ListEnvVars(app.ID)
+	if err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: list env vars: %w", err))
+	}
+	if len(envVars) > 0 {
+		// A half-injected env must never ship silently: with no decrypt
+		// func the caller has env injection disabled entirely, so refuse
+		// to deploy an app that has configured env vars rather than
+		// starting it with them silently missing.
+		if e.decrypt == nil {
+			return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: app has env vars but env injection is disabled"))
+		}
+		env := make(map[string]string, len(envVars))
+		for _, ev := range envVars {
+			plain, err := e.decrypt(ev.ValueEncrypted)
+			if err != nil {
+				return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: decrypt env var %s: %w", ev.Key, err))
+			}
+			env[ev.Key] = plain
+		}
+		spec.Env = env
+	}
+
 	id, err := e.rt.CreateContainer(ctx, spec)
 	if err != nil {
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: create container: %w", err))
@@ -114,12 +148,8 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: mark running: %w", err))
 	}
 
-	routes, err := e.Routes()
-	if err != nil {
-		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: compute routes: %w", err))
-	}
-	if err := e.router.Apply(ctx, routes); err != nil {
-		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: apply routes: %w", err))
+	if err := e.ApplyRoutes(ctx); err != nil {
+		return e.fail(ctx, app, dep, id, err)
 	}
 
 	// Traffic is now on the new container's alias; only past this point
@@ -302,25 +332,57 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 }
 
 // Routes builds the current route set: every app whose store status is
-// "running", mapped to its stable alias upstream. The result is not
-// sorted; caddy.Render sorts by slug itself.
+// "running", mapped to its stable alias upstream and a Hostnames list —
+// the app's generated slug.rootDomain hostname first, followed by its
+// custom domains (from ListAllDomains) sorted lexically. The result is
+// not sorted by slug; caddy.Render sorts by slug itself.
 func (e *Engine) Routes() ([]caddy.AppRoute, error) {
 	apps, err := e.st.ListApps()
 	if err != nil {
 		return nil, fmt.Errorf("deploy: list apps: %w", err)
 	}
+	domains, err := e.st.ListAllDomains()
+	if err != nil {
+		return nil, fmt.Errorf("deploy: list domains: %w", err)
+	}
+	// Group the single ListAllDomains query by app rather than issuing a
+	// ListDomains query per app.
+	customByApp := make(map[int64][]string, len(domains))
+	for _, d := range domains {
+		customByApp[d.AppID] = append(customByApp[d.AppID], d.Hostname)
+	}
+
 	var routes []caddy.AppRoute
 	for _, a := range apps {
 		if a.Status != "running" {
 			continue
 		}
+		custom := customByApp[a.ID]
+		sort.Strings(custom)
+		hostnames := append([]string{a.Slug + "." + e.rootDomain}, custom...)
 		routes = append(routes, caddy.AppRoute{
-			Slug:     a.Slug,
-			Hostname: a.Slug + "." + e.rootDomain,
-			Upstream: fmt.Sprintf("bp-%s:%d", a.Slug, a.Port),
+			Slug:      a.Slug,
+			Hostnames: hostnames,
+			Upstream:  fmt.Sprintf("bp-%s:%d", a.Slug, a.Port),
 		})
 	}
 	return routes, nil
+}
+
+// ApplyRoutes recomputes the current route set via Routes and pushes it
+// to the router (Caddy). It's the shared Routes()+router.Apply sequence
+// used by Deploy on every successful cutover, and is exported so the API
+// layer can trigger a route refresh directly (e.g. after a domain is
+// added or removed) without going through a deploy.
+func (e *Engine) ApplyRoutes(ctx context.Context) error {
+	routes, err := e.Routes()
+	if err != nil {
+		return fmt.Errorf("deploy: compute routes: %w", err)
+	}
+	if err := e.router.Apply(ctx, routes); err != nil {
+		return fmt.Errorf("deploy: apply routes: %w", err)
+	}
+	return nil
 }
 
 // CaddyProber returns a Prober that checks an upstream by running a

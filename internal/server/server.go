@@ -14,6 +14,7 @@ import (
 	"github.com/base-al/basepod/internal/api"
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/config"
+	"github.com/base-al/basepod/internal/crypto"
 	"github.com/base-al/basepod/internal/deploy"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
@@ -84,7 +85,15 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: ensure caddy: %w", err)
 	}
 
-	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain)
+	encKey, err := crypto.LoadOrCreateKey(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("server: load encryption key: %w", err)
+	}
+	decrypt := func(sealed string) (string, error) {
+		return crypto.Open(encKey, sealed)
+	}
+
+	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt)
 
 	// Reconcile: the Caddy config file is rebuilt from DB truth on every
 	// boot, rather than trusting whatever current.json happened to

@@ -35,7 +35,8 @@
               "match": [
                 {
                   "host": [
-                    "wiki.apps.example.com"
+                    "wiki.apps.example.com",
+                    "wiki.custom.com"
                   ]
                 }
               ],
