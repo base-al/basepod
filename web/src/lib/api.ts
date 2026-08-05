@@ -42,6 +42,9 @@ export interface Deployment {
   status: DeploymentStatus
   error: string
   started_at: string
+  /** RFC3339, "" until terminal. Exposed but not yet rendered anywhere —
+   * DeploymentList.vue only shows a relative "Started" column for now;
+   * this is here for a future deploy-duration display. */
   finished_at: string
 }
 

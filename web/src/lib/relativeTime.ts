@@ -14,7 +14,11 @@ export function relativeTime(iso: string): string {
   if (Number.isNaN(then)) return ''
 
   const deltaSeconds = Math.round((Date.now() - then) / 1000)
-  if (deltaSeconds < 5) return 'just now'
+  // Must be Math.abs here, not deltaSeconds directly: a future timestamp
+  // makes deltaSeconds negative, and an unguarded `< 5` would swallow
+  // every future delta (any negative number is < 5), never reaching the
+  // "in N units" branch below.
+  if (Math.abs(deltaSeconds) < 5) return 'just now'
 
   const units: [string, number][] = [
     ['year', 31536000],

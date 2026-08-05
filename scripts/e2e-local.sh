@@ -2,15 +2,20 @@
 # shellcheck disable=SC2329 # several functions below are only invoked
 # indirectly, by name, via wait_for() or the EXIT trap.
 #
-# scripts/e2e-local.sh — BasePod v0.1 end-to-end smoke test.
+# scripts/e2e-local.sh — BasePod end-to-end smoke test.
 #
 # Builds the basepod binary, runs `setup` + `server` against throwaway temp
 # dirs and ports, then drives the full API flow (login -> create app ->
-# deploy -> HTTPS fetch -> redeploy -> delete) exactly as described in the
-# v0.1 walking-skeleton exit criteria. Safe to run repeatedly on a dev
-# machine or in CI (GitHub Actions ubuntu-24.04 runner with rootless
-# podman); requires a reachable podman socket (`podman machine start` on
-# macOS, `systemctl --user enable --now podman.socket` on Linux).
+# deploy -> HTTPS fetch -> redeploy -> delete) as described in the v0.1
+# walking-skeleton exit criteria, plus (added in v0.2) env vars (PUT/GET
+# masking, redeploy-injects-into-container via podman inspect), custom
+# domains (POST/DELETE against the rendered Caddy config), log streaming
+# (finite SSE fetch, query-token auth scoped to the logs route only), and
+# the dashboard's static asset pipeline (hashed asset + immutable
+# Cache-Control). Safe to run repeatedly on a dev machine or in CI
+# (GitHub Actions ubuntu-24.04 runner with rootless podman); requires a
+# reachable podman socket (`podman machine start` on macOS,
+# `systemctl --user enable --now podman.socket` on Linux).
 #
 # Compatible with bash 3.2 (macOS's default /bin/bash): no associative
 # arrays, no mapfile, no `readlink -f`.
