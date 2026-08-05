@@ -11,7 +11,15 @@
 // The token travels in the URL because that is the only channel a native
 // EventSource has — treat it accordingly: this module never logs the URL
 // or the token, and callers must not either (see LogViewer.vue).
+//
+// One consequence of EventSource hiding HTTP status from JS: if the
+// session token dies (expired/revoked) while a stream is open, every
+// reconnect attempt fails exactly the same way a network blip would —
+// there's no 401 to see, just an endless "reconnecting" chip, while every
+// *other* 401 in the app immediately clears the session and bounces to
+// /login. See maybeProbeSession below for how this module closes that gap.
 
+import { api, ApiError } from './api'
 import { useAuthStore } from '../stores/auth'
 
 export type SseState = 'connecting' | 'open' | 'reconnecting' | 'closed'
@@ -47,6 +55,35 @@ export interface SseConnection {
 const INITIAL_RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 30000
 
+// After this many *consecutive* failures (errors with no successful open
+// in between), pause the backoff loop and check whether the session
+// itself is still valid before trying again — see maybeProbeSession.
+const FAILURE_PROBE_THRESHOLD = 3
+
+/**
+ * Calls the existing authenticated GET /auth/me (Bearer header via
+ * fetch, not the query string — this never puts the token anywhere an
+ * EventSource-style URL would) to find out whether repeated stream
+ * failures are a dead session or just a network blip:
+ *
+ *  - 401 means the session is actually gone. api.me() already ran
+ *    through request()'s single 401-interception point by the time it
+ *    rejects, so the auth store is already cleared and the app already
+ *    redirected to /login — this function just reports that so the
+ *    caller can stop retrying a stream nothing will ever reauthenticate.
+ *  - Any other outcome (success, or a non-401 failure — e.g. the probe
+ *    itself hit a network blip) means the session might still be good,
+ *    so the reconnect loop should keep going.
+ */
+async function probeSessionIsAlive(): Promise<boolean> {
+  try {
+    await api.me()
+    return true
+  } catch (err) {
+    return !(err instanceof ApiError && err.status === 401)
+  }
+}
+
 /**
  * Opens (and, unless `retry` is false, keeps re-opening through backoff)
  * an EventSource against `url`. The current session token is appended as
@@ -64,12 +101,29 @@ export function connect(url: string, options: SseOptions): SseConnection {
   let reconnectDelay = INITIAL_RECONNECT_DELAY_MS
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let closed = false
+  let consecutiveFailures = 0
+  let probing = false
 
   function clearReconnectTimer() {
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
+  }
+
+  function permanentlyClose() {
+    closed = true
+    clearReconnectTimer()
+    source?.close()
+    source = null
+    options.onStateChange('closed')
+  }
+
+  function scheduleReconnect() {
+    options.onStateChange('reconnecting')
+    const delay = reconnectDelay
+    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY_MS)
+    reconnectTimer = setTimeout(open, delay)
   }
 
   function open() {
@@ -82,9 +136,11 @@ export function connect(url: string, options: SseOptions): SseConnection {
 
     es.onopen = () => {
       // A successful open proves the round trip works end to end — reset
-      // backoff so a later drop starts retrying fast again rather than
-      // inheriting whatever delay a previous flaky stretch grew to.
+      // backoff and the failure streak so a later drop starts retrying
+      // fast again rather than inheriting whatever delay/streak a
+      // previous flaky stretch grew to.
       reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+      consecutiveFailures = 0
       options.onStateChange('open')
     }
 
@@ -102,17 +158,43 @@ export function connect(url: string, options: SseOptions): SseConnection {
       es.close()
       if (source === es) source = null
 
-      if (closed) return
+      if (closed || probing) return
 
       if (!shouldRetry) {
         options.onStateChange('closed')
         return
       }
 
+      consecutiveFailures += 1
+
+      if (consecutiveFailures < FAILURE_PROBE_THRESHOLD) {
+        scheduleReconnect()
+        return
+      }
+
+      // Three-plus failures in a row with no successful open between them
+      // — indistinguishable from a dead session by EventSource alone.
+      // Pause the backoff loop and ask an endpoint that *can* see a 401.
+      probing = true
       options.onStateChange('reconnecting')
-      const delay = reconnectDelay
-      reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY_MS)
-      reconnectTimer = setTimeout(open, delay)
+      void probeSessionIsAlive().then((alive) => {
+        probing = false
+        if (closed) return
+
+        if (!alive) {
+          // The session is confirmed gone (and api.me() already cleared
+          // it / redirected to /login) — retrying this stream can never
+          // succeed, so stop for good instead of spinning forever.
+          permanentlyClose()
+          return
+        }
+
+        // Session's still good — this was a real network blip, not a
+        // dead token. Reset the streak so the next probe only fires
+        // after another run of failures, and keep going.
+        consecutiveFailures = 0
+        scheduleReconnect()
+      })
     }
   }
 
@@ -121,11 +203,7 @@ export function connect(url: string, options: SseOptions): SseConnection {
   return {
     close() {
       if (closed) return
-      closed = true
-      clearReconnectTimer()
-      source?.close()
-      source = null
-      options.onStateChange('closed')
+      permanentlyClose()
     },
   }
 }

@@ -112,14 +112,23 @@ function restartStream() {
 watch(tail, restartStream)
 watch(follow, restartStream)
 
+// Bumped on every initialize() call so a preflight response that lands
+// after a newer one was already kicked off (e.g. the slug changed again,
+// or retry() was clicked twice) is recognized as stale and ignored rather
+// than clobbering phase/connection state that a later call already set up.
+let initializeRequestId = 0
+
 async function initialize() {
+  const requestId = ++initializeRequestId
   phase.value = 'loading'
   errorMessage.value = ''
   try {
     await api.logsPreflight(props.slug)
+    if (requestId !== initializeRequestId) return
     phase.value = 'ready'
     startStream()
   } catch (err) {
+    if (requestId !== initializeRequestId) return
     if (err instanceof ApiError && err.code === 'not_running') {
       phase.value = 'not-running'
     } else {
@@ -136,6 +145,24 @@ function retry() {
   stopStream()
   void initialize()
 }
+
+// AppDetail keeps one LogViewer instance mounted across route-param
+// changes for the same route (e.g. navigating from one app's logs
+// straight to another's without the tab itself remounting), so a slug
+// change has to be handled explicitly rather than relying on
+// onMounted/onUnmounted to fire again — otherwise the viewer would keep
+// streaming the *previous* app's logs under the new slug's tab.
+watch(
+  () => props.slug,
+  () => {
+    stopStream()
+    lines.value = []
+    pending.value = []
+    paused.value = false
+    autoScroll.value = true
+    void initialize()
+  },
+)
 
 async function scrollToBottom() {
   await nextTick()
