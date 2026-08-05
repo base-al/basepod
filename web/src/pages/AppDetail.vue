@@ -10,6 +10,7 @@ import StatusBadge from '../components/StatusBadge.vue'
 import ImageRef from '../components/ImageRef.vue'
 import DeploymentList from '../components/DeploymentList.vue'
 import ConfirmDanger from '../components/ConfirmDanger.vue'
+import LogViewer from '../components/LogViewer.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -50,7 +51,7 @@ const activeTab = ref('overview')
 const tabItems: TabsItem[] = [
   { label: 'Overview', value: 'overview' },
   { label: 'Deployments', value: 'deployments' },
-  { label: 'Logs', value: 'logs', disabled: true },
+  { label: 'Logs', value: 'logs' },
   { label: 'Environment', value: 'environment', disabled: true },
   { label: 'Domains', value: 'domains', disabled: true },
   { label: 'Settings', value: 'settings', disabled: true },
@@ -271,6 +272,15 @@ const deleteMutation = useMutation({
 
         <div v-else-if="activeTab === 'deployments'">
           <DeploymentList :deployments="app.deployments" />
+        </div>
+
+        <!-- v-if (not v-show): the log stream must actually tear down —
+             not just hide — when the tab is left, so LogViewer's
+             onUnmounted call to sse.ts's close() runs and the EventSource
+             (and its reconnect loop) doesn't keep running in the
+             background for a tab the user can no longer see. -->
+        <div v-else-if="activeTab === 'logs'">
+          <LogViewer :slug="slug" @deploy-hint="activeTab = 'overview'" />
         </div>
       </template>
     </main>

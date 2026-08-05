@@ -11,7 +11,9 @@ import { useAuthStore } from '../stores/auth'
 import { router } from '../router'
 import type { AppStatus, DeploymentStatus } from '../theme'
 
-const BASE_URL = '/api/v1'
+// Exported (not just module-local) so sse.ts / LogViewer.vue can build the
+// live-stream URL from the same root rather than duplicating it.
+export const BASE_URL = '/api/v1'
 
 export interface User {
   email: string
@@ -118,6 +120,51 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await res.json()) as T
 }
 
+/**
+ * Checks whether GET .../logs would succeed, without actually opening a
+ * stream. This exists only because EventSource (used for the live viewer,
+ * see sse.ts) gives JS no access to the response's HTTP status or body on
+ * failure — so there is no way to distinguish "app not running" (409) from
+ * a network blip from inside an EventSource error handler. A plain fetch
+ * can see that, so LogViewer.vue calls this once before handing off to
+ * sse.connect() for the real stream, using follow=0/tail=1 to keep it
+ * cheap. Reuses the same auth-header + 401-handling path as request(),
+ * but skips JSON decoding since a successful response here is
+ * text/event-stream, not JSON — the body is discarded either way.
+ */
+async function logsPreflight(slug: string): Promise<void> {
+  const auth = useAuthStore()
+  const headers = new Headers()
+  if (auth.token) {
+    headers.set('Authorization', `Bearer ${auth.token}`)
+  }
+
+  const res = await fetch(`${BASE_URL}/apps/${slug}/logs?follow=0&tail=1`, { headers })
+
+  if (!res.ok) {
+    let code = 'unknown'
+    let message = res.statusText || 'request failed'
+    try {
+      const body = (await res.json()) as ErrorEnvelope
+      code = body.error?.code ?? code
+      message = body.error?.message ?? message
+    } catch {
+      // Non-JSON error body — keep the statusText fallback above.
+    }
+
+    if (res.status === 401) {
+      auth.clearSession()
+      if (router.currentRoute.value.name !== 'login') {
+        void router.push({ name: 'login' })
+      }
+    }
+
+    throw new ApiError(res.status, code, message)
+  }
+
+  await res.body?.cancel()
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<LoginResponse>('/auth/login', {
@@ -152,4 +199,6 @@ export const api = {
   domains: (slug: string) => request<DomainsList>(`/apps/${slug}/domains`),
 
   system: () => request<SystemInfo>('/system'),
+
+  logsPreflight,
 }
