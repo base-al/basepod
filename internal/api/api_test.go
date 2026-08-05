@@ -829,3 +829,63 @@ func TestDomainDeleteRollsBackOnRoutesFailure(t *testing.T) {
 		t.Fatalf("expected the failed delete to be rolled back, got status=%d body=%+v", resp.StatusCode, list)
 	}
 }
+
+// TestCreateAppCustomDomainCollision proves handleCreateApp rejects a slug
+// whose generated hostname collides with an existing custom domain.
+func TestCreateAppCustomDomainCollision(t *testing.T) {
+	srv, _, token, _, _ := setupEnvDomainsTest(t)
+
+	// Create a second app and add a custom domain to it with the name
+	// that will collide with the slug we'll try to create later.
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "First App", Image: "nginx:alpine", Port: 80}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create first app: got status %d, want 201", resp.StatusCode)
+	}
+
+	// Add a custom domain "taken.example.com" to the first app.
+	resp = doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/first-app/domains", token,
+		addDomainRequest{Hostname: "taken.example.com"}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("add domain: got status %d, want 201", resp.StatusCode)
+	}
+
+	// Try to create an app with slug "taken", whose generated hostname
+	// would be "taken.example.com", colliding with the custom domain.
+	var errBody errorResponse
+	resp = doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "Taken", Image: "nginx:alpine", Port: 81}, &errBody)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("collision with custom domain: got status %d, want 422", resp.StatusCode)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+}
+
+// TestEnvDuplicateKey proves handlePutEnv rejects a payload containing
+// duplicate keys (case-sensitive exact matches).
+func TestEnvDuplicateKey(t *testing.T) {
+	srv, _, token, _, _ := setupEnvDomainsTest(t)
+
+	// Submit a payload with the same key twice
+	resp := doJSON(t, http.MethodPut, srv.URL+"/api/v1/apps/my-blog/env", token,
+		[]envVarResponse{
+			{Key: "FOO", Value: "first", IsSecret: false},
+			{Key: "FOO", Value: "second", IsSecret: false},
+		}, nil)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("duplicate key: got status %d, want 422", resp.StatusCode)
+	}
+
+	var errBody errorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&errBody); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+	if !strings.Contains(errBody.Error.Message, "FOO") {
+		t.Fatalf("expected error message to name the duplicated key, got %+v", errBody)
+	}
+}

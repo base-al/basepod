@@ -115,6 +115,17 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Check for duplicate keys within the payload (case-sensitive exact matches)
+	seenKeys := make(map[string]bool, len(req))
+	for _, ev := range req {
+		if seenKeys[ev.Key] {
+			writeError(w, http.StatusUnprocessableEntity, "validation",
+				"duplicate env var key \""+ev.Key+"\"")
+			return
+		}
+		seenKeys[ev.Key] = true
+	}
+
 	before, err := a.effectiveEnv(app.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to load existing env vars")

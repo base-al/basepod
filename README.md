@@ -47,6 +47,15 @@ Caddy container serves apps on ports 80/443 (override with
 `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` if those clash on your
 machine).
 
+### Backup
+
+Back up **three files together** to preserve your BasePod instance:
+- `basepod.db` (the SQLite database in `<data-dir>`)
+- `secret.key` (env-var encryption key in `<data-dir>`) — **losing this file makes stored environment variables unrecoverable and apps undeployable until re-entered**
+- `<data-dir>/caddy-data` (Caddy's TLS certificates)
+
+Restore by copying all three to the same locations in your new instance.
+
 ### Dashboard
 
 Once the server is running, open **http://localhost:3080** and sign in

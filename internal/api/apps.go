@@ -111,6 +111,17 @@ func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for bidirectional hostname collision: reject if the generated
+	// hostname (slug + "." + root_domain) matches an existing custom domain.
+	generatedHostname := slug + "." + rootDomain
+	if _, err := a.st.DomainByHostname(generatedHostname); err == nil {
+		writeError(w, http.StatusUnprocessableEntity, "validation", "app slug's generated hostname collides with an existing custom domain")
+		return
+	} else if !errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to check for hostname collision")
+		return
+	}
+
 	if _, err := a.st.AppBySlug(slug); err == nil {
 		writeError(w, http.StatusConflict, "app_exists", "an app with this name already exists")
 		return
