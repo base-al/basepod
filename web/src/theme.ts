@@ -1,0 +1,50 @@
+/**
+ * BasePod visual system.
+ *
+ * Design language (binding, see plan's Global Constraints): a dense-but-calm
+ * ops dashboard. Dark mode is the default with a light toggle; surfaces are
+ * neutral slate; emerald is the accent for healthy states and primary
+ * actions; amber flags in-progress/deploying states; red flags errors.
+ * Slugs, image refs, and hostnames render in a monospace stack. No
+ * drop-shadow "card wall" look, no default component-library template feel.
+ *
+ * This module is imported from both vite.config.ts (to configure the
+ * @nuxt/ui Vite plugin's semantic color mapping at build time) and from
+ * runtime code (status badge styling, shared constants) — keep it free of
+ * Vue/DOM imports so it stays usable in both contexts.
+ */
+
+/** Semantic color -> Tailwind color name mapping handed to the @nuxt/ui Vite plugin. */
+export const uiColors = {
+  primary: 'emerald',
+  secondary: 'slate',
+  success: 'emerald',
+  warning: 'amber',
+  error: 'red',
+  info: 'sky',
+  neutral: 'slate',
+} as const
+
+/** ui-monospace stack used for slugs, image refs, hostnames, and tokens. */
+export const fontMono =
+  "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
+
+export type AppStatus = 'created' | 'deploying' | 'running' | 'stopped' | 'error'
+
+/** Badge styling per app status, per the design language's color semantics. */
+export const statusStyles: Record<
+  AppStatus,
+  { label: string; color: 'neutral' | 'warning' | 'success' | 'error'; dotClass: string; pulse: boolean }
+> = {
+  created: { label: 'Created', color: 'neutral', dotClass: 'bg-slate-400', pulse: false },
+  deploying: { label: 'Deploying', color: 'warning', dotClass: 'bg-amber-400', pulse: true },
+  running: { label: 'Running', color: 'success', dotClass: 'bg-emerald-400', pulse: false },
+  stopped: { label: 'Stopped', color: 'neutral', dotClass: 'bg-slate-400', pulse: false },
+  error: { label: 'Error', color: 'error', dotClass: 'bg-red-400', pulse: false },
+}
+
+/** localStorage keys used across the app — centralized to avoid typos/drift. */
+export const storageKeys = {
+  token: 'basepod.token',
+  colorMode: 'basepod.color-mode',
+} as const

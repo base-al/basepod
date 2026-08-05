@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BasePod</title>
+    <script>
+      // Apply the persisted color-mode preference before first paint to
+      // avoid a flash of the wrong theme. Default is dark (class already
+      // set above); this only overrides to light if explicitly stored.
+      try {
+        if (localStorage.getItem('basepod.color-mode') === 'light') {
+          document.documentElement.classList.remove('dark')
+          document.documentElement.classList.add('light')
+        }
+      } catch (e) {
+        /* localStorage unavailable (private mode, etc.) — dark stays default */
+      }
+    </script>
+  </head>
+  <body class="bg-slate-950">
+    <div id="app" class="isolate"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
