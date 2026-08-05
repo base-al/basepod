@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/base-al/basepod/internal/caddy"
@@ -36,6 +37,26 @@ type Engine struct {
 	router     Router
 	probe      Prober
 	rootDomain string
+
+	// routesMu serializes every route render+apply critical section: the
+	// Routes() DB read paired with the router.Apply call that renders it,
+	// across ApplyRoutes (called directly by the API layer on domain
+	// add/delete, and internally by Deploy's cutover) and RemoveApp's
+	// filtered apply. These can run concurrently — e.g. a domain-add HTTP
+	// handler racing an in-flight deploy's cutover — and both write the
+	// same current.json.tmp (internal/caddy/manager.go writeFileAtomic),
+	// so an unserialized interleaving can splice two writers' output into
+	// a corrupt config, hit an ENOENT rename race that 502s a live
+	// request, or apply a stale route set that silently drops a
+	// just-added hostname. The lock must be held across the DB read too,
+	// not just the Apply call: "last write wins" here has to mean
+	// "rendered from the latest DB state at the time it ran", not just
+	// "the last Apply call physically completed last" — a Routes() read
+	// taken outside the lock could be stale by the time its Apply runs.
+	// It must NOT wrap all of Deploy: pulls and probes are slow and must
+	// not serialize with unrelated domain adds, so only the route-apply
+	// step is under this lock.
+	routesMu sync.Mutex
 
 	// decrypt turns an EnvVar.ValueEncrypted into its plaintext value.
 	// nil disables env injection entirely: Deploy fails rather than ship
@@ -314,6 +335,15 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 		}
 	}
 
+	// See the routesMu field comment: this Routes()+filter+Apply sequence
+	// must run as one atomic critical section relative to ApplyRoutes
+	// (including Deploy's cutover, which calls it), so a concurrent
+	// deploy's cutover can never read a Routes() snapshot from before
+	// this removal, or write over the route set this call is about to
+	// apply.
+	e.routesMu.Lock()
+	defer e.routesMu.Unlock()
+
 	routes, err := e.Routes()
 	if err != nil {
 		return fmt.Errorf("deploy: compute routes: %w", err)
@@ -380,6 +410,13 @@ func (e *Engine) Routes() ([]caddy.AppRoute, error) {
 // layer can trigger a route refresh directly (e.g. after a domain is
 // added or removed) without going through a deploy.
 func (e *Engine) ApplyRoutes(ctx context.Context) error {
+	// See the routesMu field comment: the DB read (Routes) and the apply
+	// (router.Apply) must run as one atomic critical section relative to
+	// RemoveApp's and any other ApplyRoutes call's own Routes()+Apply
+	// pair.
+	e.routesMu.Lock()
+	defer e.routesMu.Unlock()
+
 	routes, err := e.Routes()
 	if err != nil {
 		return fmt.Errorf("deploy: compute routes: %w", err)

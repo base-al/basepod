@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,6 +205,74 @@ func (f *fakeRouter) Apply(ctx context.Context, routes []caddy.AppRoute) error {
 	f.calls++
 	f.lastRoutes = routes
 	return f.applyErr
+}
+
+// blockingRouter is a test double for Router whose Apply blocks until
+// release() is called, and tracks how many Apply calls are concurrently
+// in flight. It exists to prove routesMu serializes the Routes()+Apply
+// critical section: entered fires the instant a call is inside Apply
+// (i.e. holding routesMu), and maxInFlight() reports whether any two
+// Apply calls were ever in flight at once — see
+// TestApplyRoutesSerializesConcurrentCalls (I1).
+type blockingRouter struct {
+	mu       sync.Mutex
+	inFlight int
+	maxSeen  int
+	calls    [][]caddy.AppRoute
+
+	entered chan struct{}
+	block   chan struct{}
+}
+
+func newBlockingRouter() *blockingRouter {
+	return &blockingRouter{
+		entered: make(chan struct{}, 4),
+		block:   make(chan struct{}),
+	}
+}
+
+func (r *blockingRouter) Apply(ctx context.Context, routes []caddy.AppRoute) error {
+	r.mu.Lock()
+	r.inFlight++
+	if r.inFlight > r.maxSeen {
+		r.maxSeen = r.inFlight
+	}
+	r.mu.Unlock()
+
+	r.entered <- struct{}{}
+	<-r.block // released by the test once it's done setting up the race
+
+	r.mu.Lock()
+	r.inFlight--
+	// Copy: the caller (ApplyRoutes) owns routes's backing array and
+	// nothing here should alias it past this call.
+	cp := append([]caddy.AppRoute(nil), routes...)
+	r.calls = append(r.calls, cp)
+	r.mu.Unlock()
+	return nil
+}
+
+// release unblocks every Apply call currently (or later) parked on
+// <-r.block. It's called once, after the race is set up, which is safe
+// because closing a channel unblocks all current and future receivers.
+func (r *blockingRouter) release() { close(r.block) }
+
+func (r *blockingRouter) maxInFlight() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxSeen
+}
+
+func (r *blockingRouter) callAt(i int) []caddy.AppRoute {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[i]
+}
+
+func (r *blockingRouter) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
 }
 
 // fakeProber is a test double for Prober. failUpstream, if non-empty,
@@ -744,6 +813,104 @@ func TestRemoveAppBestEffortTeardown(t *testing.T) {
 				t.Errorf("router.lastRoutes still contains removed app's hostname: %+v", router.lastRoutes)
 			}
 		}
+	}
+}
+
+// TestApplyRoutesSerializesConcurrentCalls is a regression test for I1: two
+// concurrent route-apply callers (e.g. a domain-add HTTP handler racing an
+// in-flight deploy's cutover) must never interleave their Routes() DB read
+// with their router.Apply call, since both write the same current.json.tmp
+// (internal/caddy/manager.go writeFileAtomic). It uses a blockingRouter to
+// force the interleaving deterministically: the first ApplyRoutes call is
+// parked inside Apply (proven by <-router.entered, which only fires once
+// Apply — and therefore routesMu — has been entered) while a new domain is
+// inserted and a second ApplyRoutes call is started. Because the first
+// call still holds routesMu, the second's own Lock() call blocks until the
+// first releases it via router.release() — Go's mutex semantics guarantee
+// this ordering regardless of goroutine scheduling, so the test needs no
+// sleeps to be deterministic. The assertions then confirm: (1)
+// maxInFlight() never exceeded 1, i.e. the two Apply calls never
+// overlapped; and (2) the second call's applied route set includes the
+// domain inserted after the first call had already read Routes() — which
+// only holds if the second call re-read Routes() under the lock rather
+// than reusing a stale snapshot.
+func TestApplyRoutesSerializesConcurrentCalls(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppStatus(app.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+
+	router := newBlockingRouter()
+	eng.router = router
+
+	// First call: acquires routesMu, reads Routes() (blog only, no custom
+	// domain yet), and parks inside Apply holding the lock.
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- eng.ApplyRoutes(ctx)
+	}()
+	<-router.entered // first call is now inside Apply, holding routesMu
+
+	// Insert a new domain while the first call is blocked mid-Apply,
+	// still holding routesMu.
+	if _, err := st.AddDomain(app.ID, "new.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second call: its Lock() must block behind the first (routesMu is
+	// still held), so it cannot read Routes() until after the first call
+	// has fully returned.
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- eng.ApplyRoutes(ctx)
+	}()
+
+	// Release the first call. Because closing router.block unblocks all
+	// current and future receivers, this is safe even though the second
+	// call may not have reached its own <-r.block yet (it can't have —
+	// it's still blocked on routesMu.Lock() — but even if scheduling
+	// changed that, the close is still correct).
+	router.release()
+
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first ApplyRoutes: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second ApplyRoutes: %v", err)
+	}
+
+	if max := router.maxInFlight(); max > 1 {
+		t.Fatalf("router.Apply had %d calls in flight simultaneously, want at most 1: routesMu did not serialize ApplyRoutes", max)
+	}
+
+	if got := router.callCount(); got != 2 {
+		t.Fatalf("router.Apply called %d times, want 2", got)
+	}
+
+	firstRoutes := router.callAt(0)
+	if len(firstRoutes) != 1 || len(firstRoutes[0].Hostnames) != 1 {
+		t.Errorf("first call's applied routes = %+v, want just blog.apps.localhost (new.example.com was added after this call's Routes() read)", firstRoutes)
+	}
+
+	secondRoutes := router.callAt(1)
+	if len(secondRoutes) != 1 {
+		t.Fatalf("second call's applied routes = %+v, want 1 route", secondRoutes)
+	}
+	found := false
+	for _, h := range secondRoutes[0].Hostnames {
+		if h == "new.example.com" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("second call's applied Hostnames = %v, want it to include new.example.com (its Routes() read must happen under routesMu, after the domain was added, not before)", secondRoutes[0].Hostnames)
 	}
 }
 
