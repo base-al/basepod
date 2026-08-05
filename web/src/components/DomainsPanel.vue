@@ -91,12 +91,16 @@ const deleteMutation = useMutation({
     await invalidate()
     toast.add({ title: 'Domain removed', color: 'success', icon: 'i-lucide-check' })
   },
-  onError: (err) => {
-    // 502 routes_failed (server rolled the domain back into place) or any
-    // other failure: the row stays exactly where it is — no optimistic
-    // removal happened — just surface why via toast.
+  onError: async (err) => {
+    // No optimistic removal happened, so the row was never pulled from
+    // the list — but on a 502 routes_failed the server re-adds the
+    // domain under a NEW id (see handleDeleteDomain's rollback in
+    // internal/api/domains.go), which the stale cached row doesn't know
+    // about. Refetch so any retry acts on the current id instead of a
+    // now-404ing one.
     confirmOpenId.value = null
     deletingId.value = null
+    await invalidate()
     toast.add({
       title: 'Could not remove domain',
       description: err instanceof ApiError ? err.message : 'Something went wrong — try again',

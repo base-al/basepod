@@ -37,17 +37,41 @@ interface EnvRow {
    * hasn't been "replaced" yet — render dots + an affordance instead of
    * an editable input. */
   masked: boolean
+  /** The key this row had at last server sync, or null if it was added
+   * client-side and has never been saved. Distinguishes "blank key on a
+   * row that isn't backed by anything yet" (fine, just dropped from the
+   * save payload) from "blank key on a row that IS backed by a stored
+   * var" (must be a blocking error — silently dropping it from the PUT
+   * payload would delete that var on save with no warning). */
+  originalKey: string | null
+  /** True if, at last server sync, THIS row's stored value was a secret
+   * — independent of the current isSecret/masked toggle state. Used to
+   * require a fresh typed value when the user demotes a masked secret to
+   * public, instead of silently sealing an empty public value over it. */
+  hadStoredSecret: boolean
 }
 
 let nextId = 0
 const rows = ref<EnvRow[]>([])
-// Deep-ish snapshot of the last loaded/saved state, used for dirty
-// tracking — compared structurally (key/value/isSecret/masked), not by
-// reference, since rows.value is mutated in place.
-let savedSnapshot: Omit<EnvRow, 'id'>[] = []
+// Snapshot of the last loaded/saved state, in the same *effective payload*
+// shape a save would submit — used for dirty tracking. Comparing effective
+// payloads (not raw row/UI state) means UI-only churn that doesn't change
+// what would actually be saved — clicking "Replace value" and abandoning
+// it, adding then not filling in a blank row — doesn't falsely read as
+// unsaved changes.
+let savedSnapshot: EnvVar[] = []
 
-function comparable(list: EnvRow[]): Omit<EnvRow, 'id'>[] {
-  return list.map(({ key, value, isSecret, masked }) => ({ key, value, isSecret, masked }))
+/** The exact wire entry a row would contribute to a PUT payload. A still-
+ * masked row always submits value:"" — the API's keep-on-empty-secret
+ * rule preserves whatever is already sealed for that key. */
+function toPayloadEntry(r: EnvRow): EnvVar {
+  return { key: r.key.trim(), value: r.masked ? '' : r.value, is_secret: r.isSecret }
+}
+
+/** Rows with no key and no value are untouched "Add row" placeholders —
+ * dropped rather than submitted or counted toward dirty state. */
+function effectivePayload(list: EnvRow[]): EnvVar[] {
+  return list.filter((r) => r.key.trim() !== '' || r.value !== '').map(toPayloadEntry)
 }
 
 function loadFromServer(data: EnvVar[]) {
@@ -57,8 +81,10 @@ function loadFromServer(data: EnvVar[]) {
     value: v.value,
     isSecret: v.is_secret,
     masked: v.is_secret,
+    originalKey: v.key,
+    hadStoredSecret: v.is_secret,
   }))
-  savedSnapshot = comparable(rows.value)
+  savedSnapshot = effectivePayload(rows.value)
 }
 
 // vue-query deeply unwraps refs inside queryKey (MaybeRefDeep) — wrap the
@@ -131,14 +157,13 @@ function parseEnvText(text: string): Map<string, string> {
   return out
 }
 
-/** Applying bulk text replaces every non-secret row with what the text
- * now says, and keeps existing secret rows untouched UNLESS the user
- * typed that secret's key into the bulk text themselves — doing so is
- * read as "I want to take this key over as a plain value", so it demotes
- * that row to a public one with the given value rather than silently
- * ignoring it. */
-function applyBulk() {
-  const parsed = parseEnvText(bulkText.value)
+// Bulk-apply that would demote an existing secret to a plain value (see
+// applyBulk below) is confirmed first, listing exactly which keys — set
+// by applyBulk, read/cleared by the confirm modal in the template.
+const bulkDemoteConfirmOpen = ref(false)
+const bulkDemoteKeys = ref<string[]>([])
+
+function performBulkApply(parsed: Map<string, string>) {
   const keptSecrets = rows.value.filter((r) => r.isSecret && !parsed.has(r.key))
   const newPublicRows: EnvRow[] = [...parsed.entries()].map(([key, value]) => ({
     id: nextId++,
@@ -146,18 +171,55 @@ function applyBulk() {
     value,
     isSecret: false,
     masked: false,
+    originalKey: null,
+    hadStoredSecret: false,
   }))
   rows.value = [...keptSecrets, ...newPublicRows]
   bulkMode.value = false
   bulkText.value = ''
+  bulkDemoteConfirmOpen.value = false
+  bulkDemoteKeys.value = []
+}
+
+/** Applying bulk text replaces every non-secret row with what the text
+ * now says, and keeps existing secret rows untouched UNLESS the user
+ * typed that secret's key into the bulk text themselves — doing so is
+ * read as "I want to take this key over as a plain value", so it demotes
+ * that row to a public one with the given value rather than silently
+ * ignoring it. Any such demotion is confirmed first, by name, since it's
+ * otherwise an easy way to lose a secret without meaning to. */
+function applyBulk() {
+  const parsed = parseEnvText(bulkText.value)
+  const demoted = rows.value.filter((r) => r.isSecret && parsed.has(r.key)).map((r) => r.key)
+  if (demoted.length) {
+    bulkDemoteKeys.value = demoted
+    bulkDemoteConfirmOpen.value = true
+    return
+  }
+  performBulkApply(parsed)
+}
+
+function confirmBulkDemote() {
+  performBulkApply(parseEnvText(bulkText.value))
+}
+
+function cancelBulkDemote() {
+  bulkDemoteConfirmOpen.value = false
+  bulkDemoteKeys.value = []
 }
 
 function addRow() {
-  rows.value.push({ id: nextId++, key: '', value: '', isSecret: false, masked: false })
+  rows.value.push({ id: nextId++, key: '', value: '', isSecret: false, masked: false, originalKey: null, hadStoredSecret: false })
 }
+
+// Rows backed by a stored var (originalKey !== null) get a small confirm
+// before removal — deleting them is a real, save-triggered data loss, not
+// just discarding an in-progress row. Never-saved rows remove immediately.
+const confirmRemoveId = ref<number | null>(null)
 
 function removeRow(id: number) {
   rows.value = rows.value.filter((r) => r.id !== id)
+  if (confirmRemoveId.value === id) confirmRemoveId.value = null
 }
 
 function replaceValue(row: EnvRow) {
@@ -166,24 +228,40 @@ function replaceValue(row: EnvRow) {
 }
 
 function onToggleSecret(row: EnvRow, value: boolean) {
-  row.isSecret = value
-  // Turning secret protection OFF on a still-masked row: we never have
-  // the plaintext to reveal, so the only honest move is to drop the mask
-  // and make the user re-enter a value (same as clicking "Replace").
-  if (!value && row.masked) {
+  if (value) {
+    if (row.hadStoredSecret && !row.masked && row.value === '') {
+      // Nothing was typed after a Replace/demote — cleanly restore the
+      // masked view of the still-stored secret rather than treating this
+      // as "seal a fresh empty secret value" on save.
+      row.masked = true
+    }
+    row.isSecret = true
+    return
+  }
+  row.isSecret = false
+  if (row.masked) {
+    // We never have the plaintext to reveal, so the only honest move is
+    // to drop the mask and make the user re-enter a value (same as
+    // clicking "Replace value").
     row.masked = false
     row.value = ''
   }
 }
 
-// Per-row key error: empty message means valid. Blank key + blank value
-// (an untouched "Add row") is not an error — it's just dropped from the
-// save payload rather than forcing the user to delete it manually.
+// Per-row key error: empty message means valid.
 function keyError(row: EnvRow, allRows: EnvRow[]): string {
   const key = row.key.trim()
   if (!key) {
-    // A blank key with a blank value is just an untouched "Add row" —
-    // silently dropped from the save payload rather than flagged.
+    if (row.originalKey !== null) {
+      // Blanking the key of a row backed by a stored var would silently
+      // drop it from the save payload — the server would then delete
+      // that var on save with zero warning. Removal must go through the
+      // (confirmed) remove button instead.
+      return 'Key is required — use the remove button to delete this variable'
+    }
+    // A blank key with a blank value on a never-saved row is just an
+    // untouched "Add row" — silently dropped from the save payload
+    // rather than flagged.
     return row.value !== '' ? 'Key is required' : ''
   }
   if (!KEY_PATTERN.test(key)) {
@@ -192,6 +270,13 @@ function keyError(row: EnvRow, allRows: EnvRow[]): string {
   const dupes = allRows.filter((r) => r.key.trim() === key)
   if (dupes.length > 1) {
     return 'Duplicate key'
+  }
+  if (row.hadStoredSecret && !row.isSecret && !row.masked && row.value === '') {
+    // Demoted a masked secret to public and left the value empty: saving
+    // this would seal an empty PUBLIC value over the stored secret,
+    // silently destroying it (unlike leaving is_secret:true+value:"",
+    // which the API's keep-on-empty-secret rule preserves).
+    return 'Enter a value, or re-enable Secret to keep the stored one'
   }
   return ''
 }
@@ -207,7 +292,7 @@ const rowErrors = computed(() => {
 
 const hasErrors = computed(() => rowErrors.value.size > 0)
 
-const isRowsDirty = computed(() => JSON.stringify(comparable(rows.value)) !== JSON.stringify(savedSnapshot))
+const isRowsDirty = computed(() => JSON.stringify(effectivePayload(rows.value)) !== JSON.stringify(savedSnapshot))
 const isBulkDirty = computed(() => bulkMode.value && bulkText.value !== bulkSnapshot)
 const isDirty = computed(() => isRowsDirty.value || isBulkDirty.value)
 
@@ -215,25 +300,10 @@ const isDirty = computed(() => isRowsDirty.value || isBulkDirty.value)
 // there are unsaved edits.
 defineExpose({ isDirty })
 
-function buildPayload(): EnvVar[] {
-  return rows.value
-    .filter((r) => r.key.trim() !== '' || r.value !== '')
-    .map((r) => ({
-      key: r.key.trim(),
-      // A still-masked row always submits value:"" — the API's
-      // keep-on-empty-secret rule preserves whatever is already sealed
-      // for that key. A row the user explicitly replaced (masked=false)
-      // submits exactly what they typed, even if that's empty (which,
-      // for a key with no prior secret, just seals an empty value).
-      value: r.masked ? '' : r.value,
-      is_secret: r.isSecret,
-    }))
-}
-
 const generalError = ref('')
 
 const saveMutation = useMutation({
-  mutationFn: () => api.putEnv(props.slug, buildPayload()),
+  mutationFn: () => api.putEnv(props.slug, effectivePayload(rows.value)),
   onSuccess: ({ vars, redeployRequired }) => {
     generalError.value = ''
     loadFromServer(vars)
@@ -354,7 +424,30 @@ function save() {
 
             <USwitch :model-value="row.isSecret" label="Secret" class="shrink-0" @update:model-value="(v: boolean) => onToggleSecret(row, v)" />
 
-            <UButton size="sm" color="error" variant="ghost" square icon="i-lucide-trash-2" aria-label="Remove variable" @click="removeRow(row.id)" />
+            <UButton
+              v-if="row.originalKey === null"
+              size="sm"
+              color="error"
+              variant="ghost"
+              square
+              icon="i-lucide-trash-2"
+              aria-label="Remove variable"
+              @click="removeRow(row.id)"
+            />
+            <UPopover v-else :open="confirmRemoveId === row.id" @update:open="(v: boolean) => (confirmRemoveId = v ? row.id : null)">
+              <UButton size="sm" color="error" variant="ghost" square icon="i-lucide-trash-2" :aria-label="`Remove ${row.originalKey}`" />
+              <template #content>
+                <div class="flex flex-col gap-2 p-3">
+                  <p class="max-w-56 text-xs text-slate-300">
+                    Remove <span class="font-mono">{{ row.originalKey }}</span>? Its stored value will be deleted on save.
+                  </p>
+                  <div class="flex justify-end gap-2">
+                    <UButton size="xs" color="neutral" variant="ghost" @click="confirmRemoveId = null">Cancel</UButton>
+                    <UButton size="xs" color="error" @click="removeRow(row.id)">Remove</UButton>
+                  </div>
+                </div>
+              </template>
+            </UPopover>
           </div>
           <p v-if="rowErrors.get(row.id)" class="pl-1 text-xs text-red-400">{{ rowErrors.get(row.id) }}</p>
         </div>
@@ -377,4 +470,25 @@ function save() {
       </div>
     </template>
   </div>
+
+  <UModal :open="bulkDemoteConfirmOpen" title="Demote secrets to plain values?" @update:open="(v: boolean) => (v ? undefined : cancelBulkDemote())">
+    <template #body>
+      <div class="flex flex-col gap-3">
+        <p class="text-sm text-slate-400">
+          The bulk text includes {{ bulkDemoteKeys.length === 1 ? 'a key' : 'keys' }} currently stored as secrets. Applying
+          will replace {{ bulkDemoteKeys.length === 1 ? 'it' : 'them' }} with the plain value typed in the textarea:
+        </p>
+        <ul class="flex flex-col gap-1">
+          <li v-for="key in bulkDemoteKeys" :key="key" class="font-mono text-sm text-amber-400">{{ key }}</li>
+        </ul>
+      </div>
+    </template>
+
+    <template #footer>
+      <div class="flex w-full justify-end gap-2">
+        <UButton color="neutral" variant="ghost" @click="cancelBulkDemote">Cancel</UButton>
+        <UButton color="warning" @click="confirmBulkDemote">Demote and apply</UButton>
+      </div>
+    </template>
+  </UModal>
 </template>
