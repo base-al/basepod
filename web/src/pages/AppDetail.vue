@@ -11,6 +11,8 @@ import ImageRef from '../components/ImageRef.vue'
 import DeploymentList from '../components/DeploymentList.vue'
 import ConfirmDanger from '../components/ConfirmDanger.vue'
 import LogViewer from '../components/LogViewer.vue'
+import EnvEditor from '../components/EnvEditor.vue'
+import DomainsPanel from '../components/DomainsPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -35,27 +37,56 @@ const appQuery = useQuery({
 
 // The generated domain is derived from slug + a server-side root domain
 // that doesn't change at runtime, so one fetch (no polling) is enough.
+// This shares its query key with DomainsPanel's own domains fetch — an
+// add/delete there invalidates the same cache entry, keeping this
+// header's generated-domain link in sync for free.
 const domainsQuery = useQuery({
   queryKey: ['app-domains', slug],
-  queryFn: () => api.domains(slug.value),
+  queryFn: () => api.getDomains(slug.value),
 })
 
 const app = computed(() => appQuery.data.value)
 const generatedDomain = computed(() => domainsQuery.data.value?.generated)
+
+// True once a PUT to /env reports X-Basepod-Redeploy-Required: true, and
+// cleared once a redeploy actually lands — drives both EnvEditor's own
+// persistent banner (passed down as a prop) and the small dot on the
+// Environment tab label below (kept at this level since the tab bar
+// itself is owned here, not by EnvEditor).
+const envRedeployRequired = ref(false)
 
 // UTabs' modelValue type is `string | number` (generic over its items),
 // which is wider than a closed literal union — keep this a plain string
 // ref so v-model assignment type-checks; the tab panels below just
 // compare it against the item values used in tabItems.
 const activeTab = ref('overview')
-const tabItems: TabsItem[] = [
+const envEditorRef = ref<InstanceType<typeof EnvEditor> | null>(null)
+
+const tabItems = computed<TabsItem[]>(() => [
   { label: 'Overview', value: 'overview' },
   { label: 'Deployments', value: 'deployments' },
   { label: 'Logs', value: 'logs' },
-  { label: 'Environment', value: 'environment', disabled: true },
-  { label: 'Domains', value: 'domains', disabled: true },
-  { label: 'Settings', value: 'settings', disabled: true },
-]
+  {
+    label: 'Environment',
+    value: 'environment',
+    badge: envRedeployRequired.value ? { color: 'warning', variant: 'solid', class: 'h-2 w-2 rounded-full p-0 ring-0' } : undefined,
+  },
+  { label: 'Domains', value: 'domains' },
+  { label: 'Settings', value: 'settings' },
+])
+
+// Switching tabs is intercepted (rather than bound via plain v-model) so
+// leaving the Environment tab with unsaved edits can be guarded with a
+// confirm — UTabs' v-model would otherwise just swap panels immediately
+// with no chance to ask first.
+function onTabChange(value: string | number) {
+  if (activeTab.value === 'environment' && value !== 'environment' && envEditorRef.value?.isDirty) {
+    if (!window.confirm('You have unsaved environment variable changes. Leave without saving?')) {
+      return
+    }
+  }
+  activeTab.value = String(value)
+}
 
 const deployError = ref('')
 
@@ -63,6 +94,9 @@ const deployMutation = useMutation({
   mutationFn: (image?: string) => api.deploy(slug.value, image),
   onSuccess: () => {
     deployError.value = ''
+    // A landed deploy picks up whatever env vars are currently stored,
+    // so any pending "redeploy to apply" state is now resolved.
+    envRedeployRequired.value = false
     void queryClient.invalidateQueries({ queryKey: ['app', slug.value] })
   },
   onError: (err) => {
@@ -184,7 +218,7 @@ const deleteMutation = useMutation({
       </div>
 
       <template v-else-if="app">
-        <UTabs :items="tabItems" v-model="activeTab" :content="false" variant="link" class="mb-6" />
+        <UTabs :items="tabItems" :model-value="activeTab" :content="false" variant="link" class="mb-6" @update:model-value="onTabChange" />
 
         <div v-if="activeTab === 'overview'" class="flex flex-col gap-6">
           <UAlert v-if="deployError" color="error" variant="subtle" title="Deploy failed" :description="deployError" icon="i-lucide-alert-circle" />
@@ -281,6 +315,64 @@ const deleteMutation = useMutation({
              background for a tab the user can no longer see. -->
         <div v-else-if="activeTab === 'logs'">
           <LogViewer :slug="slug" @deploy-hint="activeTab = 'overview'" />
+        </div>
+
+        <div v-else-if="activeTab === 'environment'">
+          <EnvEditor
+            ref="envEditorRef"
+            :slug="slug"
+            :redeploy-required="envRedeployRequired"
+            :deploying="isDeploying"
+            @update:redeploy-required="(value) => (envRedeployRequired = value)"
+            @redeploy="deployLatest"
+          />
+        </div>
+
+        <div v-else-if="activeTab === 'domains'">
+          <DomainsPanel :slug="slug" />
+        </div>
+
+        <div v-else-if="activeTab === 'settings'" class="flex flex-col gap-6">
+          <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+            <template #header>
+              <h2 class="text-sm font-medium text-slate-400">App facts</h2>
+            </template>
+
+            <dl class="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
+              <div>
+                <dt class="text-xs text-slate-500">Slug</dt>
+                <dd class="mt-1 font-mono text-sm text-slate-300">{{ app.slug }}</dd>
+              </div>
+              <div class="min-w-0">
+                <dt class="text-xs text-slate-500">Image</dt>
+                <dd class="mt-1"><ImageRef :value="app.image" /></dd>
+              </div>
+              <div>
+                <dt class="text-xs text-slate-500">Port</dt>
+                <dd class="mt-1 font-mono text-sm text-slate-300">{{ app.port }}</dd>
+              </div>
+              <div>
+                <dt class="text-xs text-slate-500">Internal hostname</dt>
+                <dd class="mt-1 font-mono text-sm text-slate-300">bp-{{ app.slug }}</dd>
+              </div>
+            </dl>
+          </UCard>
+
+          <UCard variant="subtle" :ui="{ root: 'ring-red-900/60' }">
+            <template #header>
+              <h2 class="text-sm font-medium text-red-400">Danger zone</h2>
+            </template>
+
+            <div class="flex items-center justify-between gap-4">
+              <p class="text-sm text-slate-400">
+                Stops and removes this app's containers and routes, and deletes its deployment history. This cannot be
+                undone.
+              </p>
+              <UButton color="error" variant="soft" icon="i-lucide-trash-2" :disabled="isDeploying" @click="deleteModalOpen = true">
+                Delete app
+              </UButton>
+            </div>
+          </UCard>
         </div>
       </template>
     </main>

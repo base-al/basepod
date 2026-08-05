@@ -57,6 +57,22 @@ export interface DomainsList {
   custom: Domain[]
 }
 
+/** One environment variable, in the exact wire shape internal/api/env.go
+ * returns/accepts — kept snake_case (is_secret) to match the JSON tag
+ * directly rather than introduce a camelCase transform layer. Secret
+ * entries always report value:"" from GET; see api.putEnv for the
+ * keep-on-empty-secret PUT semantics. */
+export interface EnvVar {
+  key: string
+  value: string
+  is_secret: boolean
+}
+
+export interface PutEnvResult {
+  vars: EnvVar[]
+  redeployRequired: boolean
+}
+
 export interface SystemInfo {
   version: string
   podman: string
@@ -81,7 +97,11 @@ interface ErrorEnvelope {
   error?: { code?: string; message?: string }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/** Shared fetch + auth-header + 401-interception + error-envelope logic,
+ * returning the raw Response so callers that need something beyond the
+ * parsed JSON body (putEnv needs the X-Basepod-Redeploy-Required response
+ * header) aren't forced through request()'s JSON-only return type. */
+async function requestRaw(path: string, init: RequestInit = {}): Promise<Response> {
   const auth = useAuthStore()
 
   const headers = new Headers(init.headers)
@@ -114,6 +134,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new ApiError(res.status, code, message)
   }
 
+  return res
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await requestRaw(path, init)
   if (res.status === 204) {
     return undefined as T
   }
@@ -196,7 +221,33 @@ export const api = {
 
   deleteApp: (slug: string) => request<void>(`/apps/${slug}`, { method: 'DELETE' }),
 
-  domains: (slug: string) => request<DomainsList>(`/apps/${slug}/domains`),
+  getEnv: (slug: string) => request<EnvVar[]>(`/apps/${slug}/env`),
+
+  /** Full replace of an app's env var set. See internal/api/env.go's
+   * handlePutEnv: an entry with is_secret=true and value:"" keeps
+   * whatever secret is already stored for that key rather than
+   * overwriting it with an empty one. The response carries the new GET
+   * shape plus the X-Basepod-Redeploy-Required header, which is "true"
+   * only when the effective (decrypted) env set actually changed — env
+   * changes don't auto-redeploy a running container. */
+  putEnv: async (slug: string, vars: EnvVar[]): Promise<PutEnvResult> => {
+    const res = await requestRaw(`/apps/${slug}/env`, {
+      method: 'PUT',
+      body: JSON.stringify(vars),
+    })
+    const data = (await res.json()) as EnvVar[]
+    return { vars: data, redeployRequired: res.headers.get('X-Basepod-Redeploy-Required') === 'true' }
+  },
+
+  getDomains: (slug: string) => request<DomainsList>(`/apps/${slug}/domains`),
+
+  addDomain: (slug: string, hostname: string) =>
+    request<Domain>(`/apps/${slug}/domains`, {
+      method: 'POST',
+      body: JSON.stringify({ hostname }),
+    }),
+
+  deleteDomain: (slug: string, id: number) => request<void>(`/apps/${slug}/domains/${id}`, { method: 'DELETE' }),
 
   system: () => request<SystemInfo>('/system'),
 
