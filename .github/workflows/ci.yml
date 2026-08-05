@@ -1,0 +1,25 @@
+name: ci
+on:
+  push: {branches: [main, "feat/**"]}
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version: 'stable'}
+      - run: go vet ./...
+      - run: CGO_ENABLED=0 go build ./...
+      - run: go test ./... -count=1
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version: 'stable'}
+      - run: podman version   # preinstalled on ubuntu-24.04 runners
+      - run: systemctl --user enable --now podman.socket
+      - run: ./scripts/e2e-local.sh

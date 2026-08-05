@@ -1,0 +1,59 @@
+{
+  "admin": {
+    "listen": "unix//var/run/caddy/admin.sock"
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "main": {
+          "listen": [
+            ":80",
+            ":443"
+          ],
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": [
+                    "blog.apps.example.com"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "bp-blog:8080"
+                    }
+                  ]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "match": [
+                {
+                  "host": [
+                    "wiki.apps.example.com"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "bp-wiki:3000"
+                    }
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}
