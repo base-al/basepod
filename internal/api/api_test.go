@@ -91,6 +91,15 @@ type fakeDeployer struct {
 	deployBuildCalled  bool
 	deployBuildBody    []byte // the full gzTar body read, for tests to assert on
 	deployBuildBuilder *build.Builder
+
+	// rollbackErr, if set, is returned by Rollback as-is (mirroring how
+	// deployErr/deployBuildErr script Deploy/DeployBuild) — tests script
+	// this to deploy's typed rollback errors (or a generic error) to
+	// exercise handleRollback's status/error-code mapping.
+	rollbackErr error
+
+	rollbackCalledApp    string
+	rollbackCalledNumber int
 }
 
 func (f *fakeDeployer) Deploy(ctx context.Context, app *store.App, imageRef string) (*store.Deployment, error) {
@@ -140,6 +149,34 @@ func (f *fakeDeployer) DeployBuild(ctx context.Context, app *store.App, gzTar io
 	dep.Status = "healthy"
 	dep.ImageRef = tag
 	dep.BuildLogPath = logPath
+	return dep, nil
+}
+
+// Rollback is a lightweight stand-in for deploy.Engine.Rollback: like
+// DeployBuild above, it persists a real deployment row through the store
+// (copying the target deployment's own image/source, as the real engine
+// does) rather than exercising any rollout logic — internal/deploy already
+// covers Rollback's own behavior (pull-vs-skip, retention, typed errors)
+// with its own fakes, so this only needs to prove the API layer's
+// plumbing (request -> Rollback call -> response/error mapping) is wired
+// correctly.
+func (f *fakeDeployer) Rollback(ctx context.Context, app *store.App, targetNumber int) (*store.Deployment, error) {
+	f.rollbackCalledApp = app.Slug
+	f.rollbackCalledNumber = targetNumber
+	if f.rollbackErr != nil {
+		return nil, f.rollbackErr
+	}
+
+	target, err := f.st.DeploymentByNumber(app.ID, targetNumber)
+	if err != nil {
+		return nil, err
+	}
+	dep, err := f.st.CreateDeploymentFull(app.ID, target.ImageRef, target.Source, "rollback")
+	if err != nil {
+		return nil, err
+	}
+	_ = f.st.FinishDeployment(dep.ID, "healthy", "")
+	dep.Status = "healthy"
 	return dep, nil
 }
 

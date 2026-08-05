@@ -436,6 +436,88 @@ func (c *Client) BuildImage(ctx context.Context, tag, dockerfile string, context
 	return streamErr
 }
 
+// ImageExists reports whether ref is present in the local image store, via
+// libpod's GET /images/{ref}/exists: a 204 response means yes, a 404 means
+// no (reported as ok=false, not an error — "the image isn't there" is an
+// expected outcome for this call, not a failure).
+func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/images/"+ref+"/exists", nil)
+	if err != nil {
+		return false, fmt.Errorf("podman: checking image %q exists: %w", ref, err)
+	}
+	if status == http.StatusNotFound {
+		return false, nil
+	}
+	if status < 300 {
+		return true, nil
+	}
+	return false, apiError(status, data)
+}
+
+// RemoveImage removes an image by reference. force also removes an image
+// referenced by a stopped container. Removing an already-gone image (404)
+// is treated as success, mirroring RemoveContainer.
+func (c *Client) RemoveImage(ctx context.Context, ref string, force bool) error {
+	path := "/images/" + ref
+	if force {
+		path += "?force=true"
+	}
+	status, data, err := c.request(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return fmt.Errorf("podman: removing image %q: %w", ref, err)
+	}
+	if status == http.StatusNotFound || status < 300 {
+		return nil
+	}
+	return apiError(status, data)
+}
+
+// imageListEntry is one element of libpod's GET /images/json response —
+// only RepoTags is needed by ListImageTags.
+type imageListEntry struct {
+	RepoTags []string `json:"RepoTags"`
+}
+
+// ListImageTags returns every locally-present image tag matching
+// "<repoPrefix>:*" (e.g. "localhost/basepod/blog:*"), used by the deploy
+// engine's built-image retention to enumerate an app's built tags. The
+// query already filters server-side by reference; the RepoTags prefix
+// check below is a belt-and-suspenders filter against any entry the
+// daemon returns whose tags don't actually match (e.g. a shared image ID
+// also tagged under an unrelated repo).
+func (c *Client) ListImageTags(ctx context.Context, repoPrefix string) ([]string, error) {
+	filters, err := json.Marshal(map[string][]string{"reference": {repoPrefix + ":*"}})
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{}
+	q.Set("filters", string(filters))
+
+	status, data, err := c.request(ctx, http.MethodGet, "/images/json?"+q.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("podman: listing images for %q: %w", repoPrefix, err)
+	}
+	if status >= 300 {
+		return nil, apiError(status, data)
+	}
+
+	var raw []imageListEntry
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("podman: decoding image list response: %w", err)
+	}
+
+	prefix := repoPrefix + ":"
+	var tags []string
+	for _, entry := range raw {
+		for _, rt := range entry.RepoTags {
+			if strings.HasPrefix(rt, prefix) {
+				tags = append(tags, rt)
+			}
+		}
+	}
+	return tags, nil
+}
+
 // EnsureNetwork makes sure a network named name exists, creating it
 // (labeled basepod.managed=true) if it doesn't. If it already exists, it
 // self-heals a DNS-disabled network (see selfHealNetworkDNS) — a state

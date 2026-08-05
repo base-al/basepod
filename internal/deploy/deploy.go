@@ -30,6 +30,36 @@ import (
 // or its last deploy failed before any container reached "running").
 var ErrNotRunning = errors.New("deploy: app has no running container")
 
+// Rollback's typed failure modes — the API layer (see
+// internal/api/apps.go's writeRollbackError) maps each to its own HTTP
+// status/error code, so these must stay distinguishable via errors.Is
+// rather than collapsed into a single generic error.
+var (
+	// ErrRollbackTargetNotFound is returned when the requested deployment
+	// number doesn't exist for the app.
+	ErrRollbackTargetNotFound = errors.New("deploy: rollback target not found")
+	// ErrRollbackTargetUnhealthy is returned when the requested deployment
+	// exists but its Status isn't "healthy" (e.g. it failed, or never
+	// finished) — there is nothing known-good to roll back to.
+	ErrRollbackTargetUnhealthy = errors.New("deploy: rollback target is not healthy")
+	// ErrRollbackImageMissing is returned when the target deployment's
+	// image is a local build tag ("localhost/basepod/<slug>:<n>") that is
+	// no longer present in the local image store (e.g. pruned by
+	// retention, or removed out-of-band) — unlike a registry ref, it can
+	// never be re-fetched by a pull.
+	ErrRollbackImageMissing = errors.New("deploy: rollback image is no longer available locally")
+)
+
+// localImagePrefix marks an image ref as a BasePod-built local tag (see
+// internal/build.Builder) rather than a registry reference: it can never
+// be pulled, so both Rollback and pruneBuiltImages treat it specially.
+const localImagePrefix = "localhost/"
+
+// retainBuiltImages is how many of an app's built image tags
+// (localhost/basepod/<slug>:<n>) pruneBuiltImages keeps, newest-numbered
+// first, after every successful rollout.
+const retainBuiltImages = 5
+
 // Engine drives app deployments: pull, create, start, probe, cut traffic
 // over, and tear down the previous container generation.
 type Engine struct {
@@ -180,6 +210,62 @@ func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reade
 	return e.runRollout(ctx, app, dep, tag)
 }
 
+// Rollback redeploys app to an earlier deployment's exact image:
+// targetNumber must name an existing deployment (ErrRollbackTargetNotFound
+// otherwise) whose Status is "healthy" (ErrRollbackTargetUnhealthy
+// otherwise) — there is nothing else safe to roll back to.
+//
+// The target's image is resolved by reference (target.ImageRef), which
+// works uniformly for both a locally-built tag
+// ("localhost/basepod/<slug>:<n>") and a registry ref: if it's no longer
+// present in the local image store, a registry ref is re-pulled (mirroring
+// Deploy's own pull-then-rollout shape) but a local build tag fails
+// outright with ErrRollbackImageMissing, since a "localhost/..." tag can
+// never be fetched from anywhere else.
+//
+// On success this creates a new deployment row (source: the target's own
+// Source, trigger_kind "rollback") and runs the normal rollout pipeline
+// against it — so a rollback shows up in history as its own numbered
+// deployment, not a mutation of the one it targets.
+func (e *Engine) Rollback(ctx context.Context, app *store.App, targetNumber int) (*store.Deployment, error) {
+	target, err := e.st.DeploymentByNumber(app.ID, targetNumber)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, ErrRollbackTargetNotFound
+		}
+		return nil, fmt.Errorf("deploy: rollback: look up deployment %d: %w", targetNumber, err)
+	}
+	if target.Status != "healthy" {
+		return nil, ErrRollbackTargetUnhealthy
+	}
+
+	image := target.ImageRef
+	isLocalBuildTag := strings.HasPrefix(image, localImagePrefix)
+
+	exists, err := e.rt.ImageExists(ctx, image)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: rollback: checking image %s: %w", image, err)
+	}
+	if !exists {
+		if isLocalBuildTag {
+			return nil, ErrRollbackImageMissing
+		}
+		if err := e.rt.PullImage(ctx, image); err != nil {
+			return nil, fmt.Errorf("deploy: rollback: pull %s: %w", image, err)
+		}
+	}
+
+	dep, err := e.st.CreateDeploymentFull(app.ID, image, target.Source, "rollback")
+	if err != nil {
+		return nil, fmt.Errorf("deploy: rollback: create deployment: %w", err)
+	}
+	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: rollback: mark deploying: %w", err))
+	}
+
+	return e.runRollout(ctx, app, dep, image)
+}
+
 // runRollout is the shared back half of a deploy — create+start a new
 // container, probe it, cut traffic over, and remove the previous
 // container generation — used by both Deploy (after a successful pull)
@@ -258,6 +344,13 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 	// Traffic is now on the new container's alias; only past this point
 	// is it safe to tear down the previous generation.
 	e.removeOldContainers(ctx, app.Slug, dep.Number)
+
+	// Every successful rollout is a good point to prune old built images:
+	// this deployment (or an earlier one, for an app that's since moved to
+	// a registry ref) may have left retainBuiltImages+ tags on disk. This
+	// no-ops harmlessly for an app with no local build tags at all (its
+	// ListImageTags query simply returns none).
+	e.pruneBuiltImages(ctx, app.Slug)
 
 	if err := e.st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
 		fmt.Fprintf(e.log, "deploy: finish deployment %d: %v\n", dep.ID, err)
@@ -343,6 +436,75 @@ func (e *Engine) removeOldContainers(ctx context.Context, slug string, keepNumbe
 		}
 		if err := e.rt.RemoveContainer(cleanupCtx, c.ID, false); err != nil {
 			fmt.Fprintf(e.log, "deploy: remove old container %s: %v\n", c.Name, err)
+		}
+	}
+}
+
+// builtImageRepo returns the local image repository BasePod's build
+// pipeline tags slug's built images under (see internal/build.Builder),
+// without the ":<n>" tag suffix — the prefix pruneBuiltImages and
+// Rollback's local-tag check both key off.
+func builtImageRepo(slug string) string {
+	return "localhost/basepod/" + slug
+}
+
+// pruneBuiltImages keeps the retainBuiltImages highest-numbered
+// "localhost/basepod/<slug>:<n>" image tags and removes the rest, via
+// e.rt.ListImageTags + RemoveImage. It's the back half of built-image
+// retention, called after every successful rollout (see runRollout) so a
+// long-lived app that redeploys frequently from tarball uploads doesn't
+// accumulate an unbounded number of local image layers.
+//
+// Only tags whose suffix parses as a plain non-negative integer are
+// considered "numbered" and eligible for this ordering; anything else
+// (e.g. a stray "latest" tag) is left alone entirely — pruneBuiltImages
+// has no way to know if it's still wanted, so removing it isn't safe to do
+// automatically. A RemoveImage failure for one tag is logged and skipped
+// rather than aborting the rest, mirroring removeOldContainers's
+// best-effort teardown: by the time this runs, the deploy has already
+// succeeded, so a stray old image is a disk-space nuisance, not a
+// correctness problem.
+//
+// Runs on a context detached from ctx's cancellation (like
+// removeOldContainers's cleanupCtx), since it happens after the deploy has
+// already succeeded and must not be skipped just because the caller's
+// request context is about to expire.
+func (e *Engine) pruneBuiltImages(ctx context.Context, slug string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+
+	repo := builtImageRepo(slug)
+	tags, err := e.rt.ListImageTags(cleanupCtx, repo)
+	if err != nil {
+		fmt.Fprintf(e.log, "deploy: retention: list image tags for %s: %v\n", repo, err)
+		return
+	}
+
+	type numberedTag struct {
+		number int
+		tag    string
+	}
+	prefix := repo + ":"
+	var numbered []numberedTag
+	for _, tag := range tags {
+		suffix, ok := strings.CutPrefix(tag, prefix)
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(suffix)
+		if err != nil {
+			continue // non-numeric tag (e.g. "latest") — never touched
+		}
+		numbered = append(numbered, numberedTag{number: n, tag: tag})
+	}
+	if len(numbered) <= retainBuiltImages {
+		return
+	}
+
+	sort.Slice(numbered, func(i, j int) bool { return numbered[i].number > numbered[j].number })
+	for _, nt := range numbered[retainBuiltImages:] {
+		if err := e.rt.RemoveImage(cleanupCtx, nt.tag, false); err != nil {
+			fmt.Fprintf(e.log, "deploy: retention: remove image %s: %v\n", nt.tag, err)
 		}
 	}
 }

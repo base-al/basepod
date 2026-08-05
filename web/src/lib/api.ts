@@ -46,6 +46,13 @@ export interface Deployment {
    * DeploymentList.vue only shows a relative "Started" column for now;
    * this is here for a future deploy-duration display. */
   finished_at: string
+  /** "image" (registry pull) or "tarball" (build-from-upload). */
+  source: string
+  /** What initiated this deploy: "api" or "rollback". */
+  trigger: string
+  /** Whether a build log is available for GET .../deployments/{number}/log
+   * (true for tarball-sourced deployments only). */
+  has_build_log: boolean
 }
 
 export interface AppDetail extends App {
@@ -227,6 +234,16 @@ export const api = {
     request<Deployment>(`/apps/${slug}/deploy`, {
       method: 'POST',
       body: JSON.stringify(image ? { image } : {}),
+    }),
+
+  /** Rolls the app back to an earlier deployment's exact image. This call
+   * runs the same synchronous, potentially-minutes-long rollout as
+   * deploy() (see internal/api/apps.go's handleRollback) — no client-side
+   * timeout here either. */
+  rollbackApp: (slug: string, number: number) =>
+    request<Deployment>(`/apps/${slug}/rollback`, {
+      method: 'POST',
+      body: JSON.stringify({ number }),
     }),
 
   deleteApp: (slug: string) => request<void>(`/apps/${slug}`, { method: 'DELETE' }),

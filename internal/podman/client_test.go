@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -265,6 +266,139 @@ func TestBuildImageNon2xxStatus(t *testing.T) {
 	err := c.BuildImage(context.Background(), "x:1", "Containerfile", strings.NewReader(""), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "internal build error") {
 		t.Fatalf("err = %v, want it to contain %q", err, "internal build error")
+	}
+}
+
+// TestImageExistsTrue proves ImageExists reports true on a 204 response
+// from libpod's GET /images/{ref}/exists.
+func TestImageExistsTrue(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/images/localhost/basepod/blog:3/exists", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(204)
+	})
+	c := fakeDaemon(t, mux)
+	ok, err := c.ImageExists(context.Background(), "localhost/basepod/blog:3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("ImageExists = false, want true")
+	}
+}
+
+// TestImageExistsFalse proves ImageExists reports false (not an error) on
+// a 404 response.
+func TestImageExistsFalse(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/images/example.com/missing:latest/exists", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(404)
+	})
+	c := fakeDaemon(t, mux)
+	ok, err := c.ImageExists(context.Background(), "example.com/missing:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("ImageExists = true, want false")
+	}
+}
+
+// TestImageExistsErrorStatus proves a non-204/404 status surfaces as an
+// error rather than being silently treated as true/false.
+func TestImageExistsErrorStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/images/x/exists", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"message": "boom"})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.ImageExists(context.Background(), "x"); err == nil {
+		t.Fatal("expected an error for a 500 response")
+	}
+}
+
+// TestRemoveImageAlreadyGoneIsSuccess proves RemoveImage treats a 404
+// (image already gone) as success, mirroring RemoveContainer.
+func TestRemoveImageAlreadyGoneIsSuccess(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v5.0.0/libpod/images/localhost/basepod/blog:1", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]any{"cause": "no such image", "message": "no such image", "response": 404})
+	})
+	c := fakeDaemon(t, mux)
+	if err := c.RemoveImage(context.Background(), "localhost/basepod/blog:1", false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRemoveImageForceQueryParam proves force=true is sent as a query
+// param when requested.
+func TestRemoveImageForceQueryParam(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v5.0.0/libpod/images/localhost/basepod/blog:1", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+	})
+	c := fakeDaemon(t, mux)
+	if err := c.RemoveImage(context.Background(), "localhost/basepod/blog:1", true); err != nil {
+		t.Fatal(err)
+	}
+	if gotQuery != "force=true" {
+		t.Fatalf("query = %q, want force=true", gotQuery)
+	}
+}
+
+// TestListImageTagsFiltersByPrefix proves ListImageTags sends a
+// reference filter for "<repoPrefix>:*" and collects only the RepoTags
+// actually matching that prefix out of the response.
+func TestListImageTagsFiltersByPrefix(t *testing.T) {
+	var gotFilters string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/images/json", func(w http.ResponseWriter, r *http.Request) {
+		gotFilters = r.URL.Query().Get("filters")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"Id": "i1", "RepoTags": []string{"localhost/basepod/blog:1", "localhost/basepod/blog:2"}},
+			{"Id": "i2", "RepoTags": []string{"localhost/basepod/blog:3"}},
+			{"Id": "i3", "RepoTags": []string{"localhost/basepod/other:1"}}, // must be excluded
+			{"Id": "i4", "RepoTags": []string{"<none>:<none>"}},             // dangling, must be excluded
+		})
+	})
+	c := fakeDaemon(t, mux)
+	tags, err := c.ListImageTags(context.Background(), "localhost/basepod/blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filtersDecoded map[string][]string
+	if err := json.Unmarshal([]byte(gotFilters), &filtersDecoded); err != nil {
+		t.Fatalf("decoding sent filters: %v", err)
+	}
+	if len(filtersDecoded["reference"]) != 1 || filtersDecoded["reference"][0] != "localhost/basepod/blog:*" {
+		t.Fatalf("filters = %v, want reference=[localhost/basepod/blog:*]", filtersDecoded)
+	}
+	want := []string{"localhost/basepod/blog:1", "localhost/basepod/blog:2", "localhost/basepod/blog:3"}
+	sort.Strings(tags)
+	if !reflect.DeepEqual(tags, want) {
+		t.Fatalf("tags = %v, want %v", tags, want)
+	}
+}
+
+// TestListImageTagsEmpty proves an empty result list decodes to an empty
+// (not nil-panicking) slice.
+func TestListImageTagsEmpty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/images/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	c := fakeDaemon(t, mux)
+	tags, err := c.ListImageTags(context.Background(), "localhost/basepod/blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 0 {
+		t.Fatalf("tags = %v, want none", tags)
 	}
 }
 

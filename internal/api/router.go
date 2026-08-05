@@ -36,6 +36,12 @@ type Deployer interface {
 	// so the API layer owns configuring build concurrency without
 	// changing deploy.New's signature.
 	DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error)
+	// Rollback redeploys app to an earlier deployment's exact image. See
+	// deploy.Engine.Rollback's doc comment for its typed failure modes
+	// (deploy.ErrRollbackTargetNotFound / ErrRollbackTargetUnhealthy /
+	// ErrRollbackImageMissing), which handleRollback maps to specific HTTP
+	// status/error codes — see writeRollbackError in apps.go.
+	Rollback(ctx context.Context, app *store.App, targetNumber int) (*store.Deployment, error)
 	RemoveApp(ctx context.Context, app *store.App) error
 }
 
@@ -162,6 +168,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 			r.Get("/apps", a.handleListApps)
 			r.Get("/apps/{slug}", a.handleGetApp)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
+			r.Post("/apps/{slug}/rollback", a.handleRollback)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)
 			r.Get("/apps/{slug}/env", a.handleGetEnv)
 			r.Put("/apps/{slug}/env", a.handlePutEnv)

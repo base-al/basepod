@@ -45,6 +45,22 @@ type fakeRuntime struct {
 	// teardown fail while the rest succeed.
 	removeErrIDs map[string]error
 
+	// images is an in-memory set of image refs "present" in this fake's
+	// local image store: ImageExists reports whether a ref is a member,
+	// PullImage adds one on success (mirroring a real pull leaving the
+	// image locally present), and RemoveImage deletes one. Tests can also
+	// seed it directly to simulate images already on disk from a prior
+	// build/pull.
+	images map[string]bool
+
+	imageExistsErr   error
+	removeImageErr   error
+	listImageTagsErr error
+
+	// removedImages records every RemoveImage call's ref, in call order —
+	// used by retention tests to assert exactly which tags were pruned.
+	removedImages []string
+
 	// createdSpecs records the full CreateSpec passed to CreateContainer,
 	// keyed by container name, so tests can assert on fields (like Env)
 	// that ContainerInfo doesn't carry.
@@ -65,7 +81,7 @@ type loggedCall struct {
 }
 
 func newFakeRuntime(ops *[]string) *fakeRuntime {
-	return &fakeRuntime{ops: ops, containers: map[string]podman.ContainerInfo{}}
+	return &fakeRuntime{ops: ops, containers: map[string]podman.ContainerInfo{}, images: map[string]bool{}}
 }
 
 func (f *fakeRuntime) record(s string) { *f.ops = append(*f.ops, s) }
@@ -75,7 +91,55 @@ func (f *fakeRuntime) PullImage(ctx context.Context, ref string) error {
 		return err
 	}
 	f.record("pull:" + ref)
-	return f.pullErr
+	if f.pullErr != nil {
+		return f.pullErr
+	}
+	if f.images == nil {
+		f.images = map[string]bool{}
+	}
+	f.images[ref] = true
+	return nil
+}
+
+func (f *fakeRuntime) ImageExists(ctx context.Context, ref string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	f.record("image-exists:" + ref)
+	if f.imageExistsErr != nil {
+		return false, f.imageExistsErr
+	}
+	return f.images[ref], nil
+}
+
+func (f *fakeRuntime) RemoveImage(ctx context.Context, ref string, force bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.record("remove-image:" + ref)
+	f.removedImages = append(f.removedImages, ref)
+	if f.removeImageErr != nil {
+		return f.removeImageErr
+	}
+	delete(f.images, ref)
+	return nil
+}
+
+func (f *fakeRuntime) ListImageTags(ctx context.Context, repoPrefix string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.listImageTagsErr != nil {
+		return nil, f.listImageTagsErr
+	}
+	prefix := repoPrefix + ":"
+	var tags []string
+	for ref := range f.images {
+		if strings.HasPrefix(ref, prefix) {
+			tags = append(tags, ref)
+		}
+	}
+	return tags, nil
 }
 
 func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error) {
@@ -1606,5 +1670,333 @@ func TestDeployBuildFailureKeepsOldContainerRunning(t *testing.T) {
 	}
 	if gotApp.ImageRef != "nginx:v1" {
 		t.Fatalf("app.ImageRef = %q, want unchanged nginx:v1", gotApp.ImageRef)
+	}
+}
+
+// TestRollbackHappyPathLocalBuiltTagSkipsPull proves Rollback to an
+// earlier, still-healthy, locally-built deployment never calls PullImage
+// (a "localhost/..." tag is never fetchable from a registry), runs the
+// normal rollout (new container created, probed, routed, old removed),
+// and records the new deployment with trigger_kind "rollback" and the
+// target's own source ("tarball").
+func TestRollbackHappyPathLocalBuiltTagSkipsPull(t *testing.T) {
+	st := openStore(t)
+	eng, rt, router, prober, ops := newTestEngine(t, st)
+	buildRt := &fakeBuildRuntime{}
+	builder := build.New(buildRt, t.TempDir(), 2)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dep1, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder)
+	if err != nil {
+		t.Fatalf("first DeployBuild: %v", err)
+	}
+	rt.images[dep1.ImageRef] = true // simulate the built image landing on disk
+
+	dep2, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder)
+	if err != nil {
+		t.Fatalf("second DeployBuild: %v", err)
+	}
+	rt.images[dep2.ImageRef] = true
+
+	*ops = nil // only care about ops during the rollback itself
+	router.calls = 0
+	prober.calls = nil
+
+	dep3, err := eng.Rollback(ctx, app, dep1.Number)
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if dep3.Status != "healthy" {
+		t.Fatalf("dep3.Status = %q, want healthy", dep3.Status)
+	}
+	if dep3.TriggerKind != "rollback" {
+		t.Fatalf("dep3.TriggerKind = %q, want rollback", dep3.TriggerKind)
+	}
+	if dep3.Source != "tarball" {
+		t.Fatalf("dep3.Source = %q, want tarball (the rolled-back-to deployment's own source)", dep3.Source)
+	}
+	if dep3.ImageRef != dep1.ImageRef {
+		t.Fatalf("dep3.ImageRef = %q, want %q (dep1's image)", dep3.ImageRef, dep1.ImageRef)
+	}
+	if dep3.Number != 3 {
+		t.Fatalf("dep3.Number = %d, want 3", dep3.Number)
+	}
+
+	for _, op := range *ops {
+		if strings.HasPrefix(op, "pull:") {
+			t.Fatalf("ops contains a pull op %q — rollback to a local built tag must never pull: %v", op, *ops)
+		}
+	}
+	if router.calls != 1 {
+		t.Fatalf("router.calls = %d, want 1", router.calls)
+	}
+	if len(prober.calls) != 1 {
+		t.Fatalf("prober.calls = %v, want 1 call", prober.calls)
+	}
+
+	var found *podman.ContainerInfo
+	for _, c := range rt.containers {
+		if c.Name == "bp-blog-3" {
+			cc := c
+			found = &cc
+		}
+	}
+	if found == nil || found.State != "running" {
+		t.Fatalf("bp-blog-3 = %+v, want a running container", found)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.ImageRef != dep1.ImageRef {
+		t.Fatalf("app.ImageRef = %q, want %q", gotApp.ImageRef, dep1.ImageRef)
+	}
+}
+
+// TestRollbackPullsWhenRegistryImageAbsent proves that when the rollback
+// target is a registry-sourced deployment ("image" source, not a
+// "localhost/..." build tag) whose image is no longer present locally,
+// Rollback pulls it before rolling out rather than failing outright.
+func TestRollbackPullsWhenRegistryImageAbsent(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, ops := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep1, err := eng.Deploy(ctx, app, "nginx:v1")
+	if err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v2"); err != nil {
+		t.Fatalf("second Deploy: %v", err)
+	}
+
+	// Simulate the v1 image having since been pruned/removed from the
+	// local image store (e.g. an out-of-band `podman image prune`).
+	delete(rt.images, "nginx:v1")
+	*ops = nil
+
+	dep3, err := eng.Rollback(ctx, app, dep1.Number)
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if dep3.ImageRef != "nginx:v1" {
+		t.Fatalf("dep3.ImageRef = %q, want nginx:v1", dep3.ImageRef)
+	}
+	if dep3.TriggerKind != "rollback" {
+		t.Fatalf("dep3.TriggerKind = %q, want rollback", dep3.TriggerKind)
+	}
+
+	found := false
+	for _, op := range *ops {
+		if op == "pull:nginx:v1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ops = %v, want a pull:nginx:v1 op (image was absent locally)", *ops)
+	}
+}
+
+// TestRollbackTargetNotFound proves rolling back to a deployment number
+// that doesn't exist for the app returns ErrRollbackTargetNotFound.
+func TestRollbackTargetNotFound(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dep, err := eng.Rollback(ctx, app, 99)
+	if !errors.Is(err, ErrRollbackTargetNotFound) {
+		t.Fatalf("err = %v, want ErrRollbackTargetNotFound", err)
+	}
+	if dep != nil {
+		t.Fatalf("dep = %+v, want nil", dep)
+	}
+}
+
+// TestRollbackTargetUnhealthy proves rolling back to a deployment whose
+// Status isn't "healthy" (e.g. it failed) returns ErrRollbackTargetUnhealthy
+// without creating any new deployment row.
+func TestRollbackTargetUnhealthy(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedDep, err := st.CreateDeployment(app.ID, "nginx:bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(failedDep.ID, "failed", "boom"); err != nil {
+		t.Fatal(err)
+	}
+
+	dep, err := eng.Rollback(ctx, app, failedDep.Number)
+	if !errors.Is(err, ErrRollbackTargetUnhealthy) {
+		t.Fatalf("err = %v, want ErrRollbackTargetUnhealthy", err)
+	}
+	if dep != nil {
+		t.Fatalf("dep = %+v, want nil", dep)
+	}
+
+	deps, err := st.ListDeployments(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("deployments = %+v, want still just the one failed deployment (no rollback row created)", deps)
+	}
+}
+
+// TestRollbackImageMissingLocalBuiltTag proves that when the rollback
+// target is a locally-built tag ("localhost/basepod/<slug>:<n>") that no
+// longer exists in the local image store (pruned by retention or removed
+// out-of-band), Rollback fails with the typed ErrRollbackImageMissing
+// rather than attempting (and failing) a pull — a localhost/ tag can never
+// be fetched from a registry — and creates no new deployment row.
+func TestRollbackImageMissingLocalBuiltTag(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeploymentFull(app.ID, "localhost/basepod/blog:1", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+	// rt.images has no entry for this tag — it's "gone".
+
+	got, err := eng.Rollback(ctx, app, dep.Number)
+	if !errors.Is(err, ErrRollbackImageMissing) {
+		t.Fatalf("err = %v, want ErrRollbackImageMissing", err)
+	}
+	if got != nil {
+		t.Fatalf("dep = %+v, want nil", got)
+	}
+
+	deps, err := st.ListDeployments(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("deployments = %+v, want still just the one deployment (no rollback row created)", deps)
+	}
+}
+
+// TestPruneBuiltImagesKeepsTop5NumericTagsIgnoresNonNumeric proves
+// pruneBuiltImages keeps the 5 highest-numbered "localhost/basepod/<slug>:*"
+// tags, removes the rest, and leaves any non-numeric tag (e.g. a stray
+// "latest") untouched entirely — it's not part of the numbered ordering at
+// all.
+func TestPruneBuiltImagesKeepsTop5NumericTagsIgnoresNonNumeric(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	for n := 1; n <= 7; n++ {
+		rt.images[fmt.Sprintf("localhost/basepod/blog:%d", n)] = true
+	}
+	rt.images["localhost/basepod/blog:latest"] = true
+	rt.images["localhost/basepod/other:9"] = true // different app, must never be touched
+
+	eng.pruneBuiltImages(ctx, "blog")
+
+	sort.Strings(rt.removedImages)
+	wantRemoved := []string{"localhost/basepod/blog:1", "localhost/basepod/blog:2"}
+	if !reflect.DeepEqual(rt.removedImages, wantRemoved) {
+		t.Fatalf("removedImages = %v, want %v", rt.removedImages, wantRemoved)
+	}
+
+	for n := 3; n <= 7; n++ {
+		ref := fmt.Sprintf("localhost/basepod/blog:%d", n)
+		if !rt.images[ref] {
+			t.Errorf("%s should have been kept (top 5), was removed", ref)
+		}
+	}
+	if !rt.images["localhost/basepod/blog:latest"] {
+		t.Error("localhost/basepod/blog:latest should never be touched (not a numeric tag)")
+	}
+	if !rt.images["localhost/basepod/other:9"] {
+		t.Error("localhost/basepod/other:9 should never be touched (different app's tag)")
+	}
+}
+
+// TestPruneBuiltImagesNoopUnderRetentionLimit proves pruneBuiltImages does
+// nothing (no RemoveImage calls) when there are retainBuiltImages or fewer
+// numbered tags.
+func TestPruneBuiltImagesNoopUnderRetentionLimit(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	for n := 1; n <= retainBuiltImages; n++ {
+		rt.images[fmt.Sprintf("localhost/basepod/blog:%d", n)] = true
+	}
+
+	eng.pruneBuiltImages(ctx, "blog")
+
+	if len(rt.removedImages) != 0 {
+		t.Fatalf("removedImages = %v, want none", rt.removedImages)
+	}
+}
+
+// TestDeployBuildTriggersRetentionAfterSuccess is an integration-level
+// regression test proving pruneBuiltImages is actually wired into
+// runRollout's success path: with more than retainBuiltImages built tags
+// already present in the local image store (as if left over from before
+// retention ever ran), a single successful DeployBuild prunes the oldest
+// down to retainBuiltImages automatically — the caller doesn't have to
+// invoke retention itself.
+func TestDeployBuildTriggersRetentionAfterSuccess(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	buildRt := &fakeBuildRuntime{}
+	builder := build.New(buildRt, t.TempDir(), 2)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for n := 1; n <= 6; n++ {
+		rt.images[fmt.Sprintf("localhost/basepod/blog:%d", n)] = true
+	}
+
+	if _, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder); err != nil {
+		t.Fatalf("DeployBuild: %v", err)
+	}
+
+	if len(rt.removedImages) != 1 {
+		t.Fatalf("removedImages = %v, want exactly 1 (retention pruned automatically after the successful rollout)", rt.removedImages)
+	}
+	if rt.removedImages[0] != "localhost/basepod/blog:1" {
+		t.Fatalf("removedImages = %v, want [localhost/basepod/blog:1] (the oldest)", rt.removedImages)
+	}
+	if len(rt.images) != retainBuiltImages {
+		t.Fatalf("images remaining = %d (%v), want exactly %d", len(rt.images), rt.images, retainBuiltImages)
 	}
 }

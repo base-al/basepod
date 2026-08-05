@@ -305,7 +305,7 @@ const deleteMutation = useMutation({
         </div>
 
         <div v-else-if="activeTab === 'deployments'">
-          <DeploymentList :deployments="app.deployments" />
+          <DeploymentList :slug="slug" :deployments="app.deployments" />
         </div>
 
         <!-- v-if (not v-show): the log stream must actually tear down —

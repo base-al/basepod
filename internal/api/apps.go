@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/base-al/basepod/internal/build"
+	"github.com/base-al/basepod/internal/deploy"
 	"github.com/base-al/basepod/internal/store"
 )
 
@@ -250,6 +251,56 @@ func (a *api) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
+}
+
+type rollbackRequest struct {
+	Number int `json:"number"`
+}
+
+// handleRollback triggers a synchronous rollback of an app to an earlier
+// deployment's exact image (body: {"number": N}). Bounded by the same
+// deployTimeout as handleDeploy, since — like a normal deploy — it may
+// pull an image and runs the same probe-gated rollout.
+func (a *api) handleRollback(w http.ResponseWriter, r *http.Request) {
+	app, ok := a.appBySlugOrNotFound(w, r)
+	if !ok {
+		return
+	}
+
+	var req rollbackRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), deployTimeout)
+	defer cancel()
+
+	dep, err := a.dep.Rollback(ctx, app, req.Number)
+	if err != nil {
+		writeRollbackError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
+}
+
+// writeRollbackError maps a Rollback failure to the documented
+// status/error code: deploy_engine's typed pre-flight errors (target
+// missing/unhealthy, or a local build image no longer available) each get
+// their own 404/409 code; anything else (a rollout failure past that
+// point, e.g. a failed pull or probe) falls through to the same generic
+// 502 "deploy_failed" handleDeploy's own catch-all uses.
+func writeRollbackError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, deploy.ErrRollbackTargetNotFound):
+		writeError(w, http.StatusNotFound, "rollback_target_not_found", err.Error())
+	case errors.Is(err, deploy.ErrRollbackTargetUnhealthy):
+		writeError(w, http.StatusConflict, "rollback_target_unhealthy", err.Error())
+	case errors.Is(err, deploy.ErrRollbackImageMissing):
+		writeError(w, http.StatusConflict, "rollback_image_missing", err.Error())
+	default:
+		writeError(w, http.StatusBadGateway, "deploy_failed", err.Error())
+	}
 }
 
 // maxTarballBody caps a tarball deploy upload at 256 MiB — generously
