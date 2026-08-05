@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -197,5 +198,60 @@ func TestLoadOrCreateKeyCreatesMissingParent(t *testing.T) {
 	mode := info.Mode().Perm()
 	if mode != 0o600 {
 		t.Errorf("Key file should have 0600 permissions, got %o", mode)
+	}
+}
+
+// TestOpenWithTooShortDecodedData verifies that Open rejects valid base64 that
+// decodes to fewer than 24 bytes (insufficient for nonce) without panicking.
+func TestOpenWithTooShortDecodedData(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	// Create valid base64 that decodes to only 3 bytes (< 24 required for nonce)
+	shortData := []byte("abc")
+	shortBase64 := base64.RawStdEncoding.EncodeToString(shortData)
+
+	_, err := Open(key, shortBase64)
+	if err == nil {
+		t.Error("Open with too-short decoded data should error, not panic")
+	}
+}
+
+// TestSealWithWrongKeyLength verifies that Seal rejects keys that are not 32 bytes.
+func TestSealWithWrongKeyLength(t *testing.T) {
+	shortKey := make([]byte, 16) // Too short
+	for i := range shortKey {
+		shortKey[i] = byte(i)
+	}
+
+	_, err := Seal(shortKey, "plaintext")
+	if err == nil {
+		t.Error("Seal with wrong-length key should error")
+	}
+}
+
+// TestOpenWithWrongKeyLength verifies that Open rejects keys that are not 32 bytes.
+func TestOpenWithWrongKeyLength(t *testing.T) {
+	rightKey := make([]byte, 32)
+	for i := range rightKey {
+		rightKey[i] = byte(i)
+	}
+
+	plaintext := "secret"
+	sealed, err := Seal(rightKey, plaintext)
+	if err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	wrongKey := make([]byte, 24) // Wrong size
+	for i := range wrongKey {
+		wrongKey[i] = byte(i)
+	}
+
+	_, err = Open(wrongKey, sealed)
+	if err == nil {
+		t.Error("Open with wrong-length key should error")
 	}
 }
