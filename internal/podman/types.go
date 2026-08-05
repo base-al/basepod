@@ -56,9 +56,24 @@ type specGen struct {
 	Env           map[string]string            `json:"env,omitempty"`
 	Command       []string                     `json:"command,omitempty"`
 	Networks      map[string]perNetworkOptions `json:"Networks,omitempty"`
+	NetNS         *namespace                   `json:"netns,omitempty"`
 	PortMappings  []PortMapping                `json:"portmappings,omitempty"`
 	Mounts        []specMount                  `json:"mounts,omitempty"`
 	RestartPolicy string                       `json:"restart_policy,omitempty"`
+}
+
+// namespace is libpod SpecGenerator's Namespace type, used here only for
+// netns. NSMode must be set to "bridge" explicitly whenever Networks is
+// non-empty: unlike the `podman` CLI (which infers bridge mode from
+// `--network <name>` and fills this in for you), the raw API validates
+// Networks against whatever netns mode is already set — and its
+// unset/zero value is not bridge mode on every podman version (observed:
+// podman 4.9.3 rejects a populated Networks map outright with "networks
+// and static ip/mac address can only be used with Bridge mode
+// networking" when netns is left unset, even though the exact same
+// request works on podman 5.x, which apparently infers it).
+type namespace struct {
+	NSMode string `json:"nsmode,omitempty"`
 }
 
 // perNetworkOptions configures how a container joins a given network

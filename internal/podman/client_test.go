@@ -74,6 +74,42 @@ func TestCreateContainerSpec(t *testing.T) {
 	if got["restart_policy"] != "always" {
 		t.Fatalf("restart policy: %v", got)
 	}
+	// netns must be explicitly set to bridge mode alongside a populated
+	// Networks map: some podman versions (observed: 4.9.3, as shipped on
+	// GitHub Actions' ubuntu-24.04 runners) reject the request otherwise
+	// ("networks and static ip/mac address can only be used with Bridge
+	// mode networking"), even though the CLI infers it automatically.
+	netns, ok := got["netns"].(map[string]any)
+	if !ok {
+		t.Fatalf("netns missing: %v", got)
+	}
+	if netns["nsmode"] != "bridge" {
+		t.Fatalf("netns.nsmode = %v, want %q", netns["nsmode"], "bridge")
+	}
+}
+
+// TestCreateContainerNoNetworkOmitsNetNS covers the other branch: a
+// container created without NetworkName (none exist in BasePod today, but
+// nothing should break if one is ever added) must not send a netns
+// override, since there is no Networks map for it to accompany.
+func TestCreateContainerNoNetworkOmitsNetNS(t *testing.T) {
+	var got map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(map[string]string{"Id": "abc123"})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.CreateContainer(context.Background(), CreateSpec{Name: "x", Image: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["netns"]; ok {
+		t.Fatalf("netns should be omitted when NetworkName is empty: %v", got)
+	}
+	if _, ok := got["Networks"]; ok {
+		t.Fatalf("Networks should be omitted when NetworkName is empty: %v", got)
+	}
 }
 
 func TestStopAlreadyStoppedIsSuccess(t *testing.T) {

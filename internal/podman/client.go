@@ -365,6 +365,9 @@ func (c *Client) CreateContainer(ctx context.Context, spec CreateSpec) (string, 
 		sg.Networks = map[string]perNetworkOptions{
 			spec.NetworkName: {Aliases: spec.NetworkAliases},
 		}
+		// Must be explicit: see the comment on the namespace type in
+		// types.go for why the API doesn't infer this the way the CLI does.
+		sg.NetNS = &namespace{NSMode: "bridge"}
 	}
 	for _, m := range spec.Mounts {
 		sm := specMount{
