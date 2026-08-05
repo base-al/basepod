@@ -59,6 +59,33 @@ does, without curl.
 > [docs/plan/07 — Web Dashboard](docs/plan/07.dashboard.md) for what's
 > shipped in this milestone versus deferred to later ones.
 
+### Remote access
+
+On a remote box (a VPS, a home server, anything not `localhost`), BasePod
+serves the dashboard itself, automatically, over HTTPS — no SSH tunnel
+required.
+
+At boot, BasePod discovers the gateway IP of its own `basepod` Podman
+network and binds a second internal listener there, then adds a route for
+it to Caddy at **`https://basepod.<root-domain>`** (e.g.
+`https://basepod.apps.example.com`), alongside your deployed apps'
+routes. The hostname comes from the `dashboard_domain` setting: unset by
+default (BasePod computes and stores `basepod.<root-domain>` the first
+time it boots), or set it to any hostname you prefer, or to the literal
+value `off` to disable the dashboard route entirely.
+
+This works out of the box on **Linux** hosts (rootless Podman). On
+**macOS**, `podman machine`'s VM boundary prevents binding that gateway
+address from the host, so BasePod logs a warning and disables the
+dashboard route there — the dashboard is still reachable locally at
+`http://localhost:3080` (see [Dashboard](#dashboard) above), or remotely
+via an SSH tunnel as a fallback:
+
+```bash
+ssh -L 3080:localhost:3080 user@your-server
+# then open http://localhost:3080 locally
+```
+
 ### API
 
 Everything the dashboard does is also available directly over the REST

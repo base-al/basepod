@@ -25,10 +25,10 @@ type Runtime interface {
 // network) is answering.
 type Prober func(ctx context.Context, upstream string) error
 
-// Router applies a full route set to the reverse proxy (satisfied by
-// *caddy.Manager).
+// Router applies a full route set (plus an optional dashboard route — see
+// caddy.DashboardRoute) to the reverse proxy (satisfied by *caddy.Manager).
 type Router interface {
-	Apply(ctx context.Context, routes []caddy.AppRoute) error
+	Apply(ctx context.Context, routes []caddy.AppRoute, dashboard *caddy.DashboardRoute) error
 }
 
 // Compile-time checks that the production implementations satisfy the

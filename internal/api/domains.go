@@ -103,6 +103,20 @@ func (a *api) handleAddDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	dashboardDomain, err := a.st.Setting("dashboard_domain")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to read dashboard domain")
+		return
+	}
+	// "" (unset) and the literal "off" both mean the dashboard route isn't
+	// actually routed anywhere, so neither is a real collision — only an
+	// operator-set (or auto-computed-and-persisted, see
+	// server.resolveDashboardDomain) concrete hostname is.
+	if dashboardDomain != "" && dashboardDomain != "off" && hostname == dashboardDomain {
+		writeError(w, http.StatusUnprocessableEntity, "validation", "hostname collides with the dashboard domain")
+		return
+	}
+
 	domain, err := a.st.AddDomain(app.ID, hostname)
 	if err != nil {
 		if isUniqueConstraintErr(err) {

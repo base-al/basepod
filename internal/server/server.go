@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -131,6 +132,74 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: ensure caddy: %w", err)
 	}
 
+	dashboardSetting, err := st.Setting("dashboard_domain")
+	if err != nil {
+		return fmt.Errorf("server: read dashboard_domain setting: %w", err)
+	}
+	dashboardDomain, writeDefaultDashboardDomain := resolveDashboardDomain(dashboardSetting, rootDomain)
+	if writeDefaultDashboardDomain {
+		// First boot (or an operator cleared the setting): persist the
+		// computed default so it shows up in the settings table for an
+		// operator to later find, override, or set to "off" — see
+		// resolveDashboardDomain's doc comment.
+		if err := st.SetSetting("dashboard_domain", dashboardDomain); err != nil {
+			return fmt.Errorf("server: write default dashboard_domain setting: %w", err)
+		}
+	}
+
+	// dashboardRoute and gatewayListener are only set when the dashboard
+	// route is actually usable: the setting isn't "off", the "basepod"
+	// network reports a gateway address, and a second listener bound to
+	// it (gateway:3080) actually succeeds. Any of those failing disables
+	// the dashboard route (nil) rather than failing boot — Caddy must
+	// never be pointed at a dead upstream.
+	var dashboardRoute *caddy.DashboardRoute
+	var gatewayListener net.Listener
+	if dashboardDomain != "" {
+		netInfo, err := pc.InspectNetwork(ctx, caddy.NetworkName)
+		if err != nil {
+			// Best-effort, like the gateway-bind failure below: the
+			// dashboard route is a convenience on top of a control plane
+			// that's otherwise fully up (mgr.Ensure already succeeded, so
+			// the network exists) — it must never be the reason boot
+			// fails outright.
+			log.Printf("basepod: dashboard: could not inspect %q network, dashboard route disabled: %v", caddy.NetworkName, err)
+		} else if netInfo.Gateway == "" {
+			log.Printf("basepod: dashboard: network %q has no gateway address — dashboard route disabled", caddy.NetworkName)
+		} else {
+			gatewayAddr := netInfo.Gateway + ":3080"
+			l, err := net.Listen("tcp", gatewayAddr)
+			if err != nil {
+				// Expected on macOS podman machine: the gateway address
+				// lives inside the podman-machine VM's own network
+				// namespace and isn't bindable from the host — the
+				// dashboard route is Linux-first for that reason; macOS
+				// operators keep using http://localhost:3080 (or an SSH
+				// tunnel to a remote box) instead. Warn and continue
+				// rather than failing boot, or leaving Caddy pointed at a
+				// listener that was never actually opened.
+				log.Printf(
+					"basepod: dashboard: could not bind gateway listener %s, dashboard route disabled "+
+						"(expected on macOS podman-machine — the VM boundary prevents binding its internal "+
+						"gateway IP from the host; see README's Remote access section): %v",
+					gatewayAddr, err,
+				)
+			} else {
+				gatewayListener = l
+				dashboardRoute = &caddy.DashboardRoute{Hostname: dashboardDomain, Upstream: gatewayAddr}
+			}
+		}
+	}
+	// http.Server.Shutdown closes every listener passed to Serve, so this
+	// is only a backstop for an error return before that point (e.g.
+	// mgr.Apply below failing after the listener was already bound); a
+	// second Close() past that point is a harmless no-op error, ignored.
+	defer func() {
+		if gatewayListener != nil {
+			_ = gatewayListener.Close()
+		}
+	}()
+
 	encKey, err := crypto.LoadOrCreateKey(cfg.DataDir)
 	if err != nil {
 		return fmt.Errorf("server: load encryption key: %w", err)
@@ -142,7 +211,7 @@ func Run(ctx context.Context, cfgPath string) error {
 		return crypto.Seal(encKey, plaintext)
 	}
 
-	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt)
+	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt, dashboardRoute)
 
 	// Orphan GC: remove containers left behind by a previous crash or
 	// interrupted deploy (unknown app slug, or a stale non-current
@@ -163,7 +232,7 @@ func Run(ctx context.Context, cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("server: compute routes: %w", err)
 	}
-	if err := mgr.Apply(ctx, routes); err != nil {
+	if err := mgr.Apply(ctx, routes, dashboardRoute); err != nil {
 		return fmt.Errorf("server: apply routes: %w", err)
 	}
 
@@ -172,10 +241,17 @@ func Run(ctx context.Context, cfgPath string) error {
 	log.Printf("basepod: listening on %s", cfg.Listen)
 	log.Printf("basepod: root domain %s", rootDomain)
 	log.Printf("basepod: data dir %s", cfg.DataDir)
+	if dashboardRoute != nil {
+		log.Printf("basepod: dashboard: serving https://%s (proxied by Caddy to %s)", dashboardRoute.Hostname, dashboardRoute.Upstream)
+	}
 
 	go pruneSessions(ctx, st, pruneInitialDelay, pruneInterval)
 
-	serveErr := make(chan error, 1)
+	// serveErr is sized for both listeners (the main cfg.Listen one, always
+	// started, plus the optional gateway one) — each of up to two goroutines
+	// below sends exactly one value, and the buffer means neither can block
+	// trying to send after the other has already caused Run to return.
+	serveErr := make(chan error, 2)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
@@ -183,6 +259,16 @@ func Run(ctx context.Context, cfgPath string) error {
 		}
 		serveErr <- nil
 	}()
+
+	if gatewayListener != nil {
+		go func() {
+			if err := srv.Serve(gatewayListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serveErr <- err
+				return
+			}
+			serveErr <- nil
+		}()
+	}
 
 	select {
 	case err := <-serveErr:
@@ -255,6 +341,37 @@ func pruneSessions(ctx context.Context, st *store.Store, initialDelay, interval 
 			}
 			timer.Reset(interval)
 		}
+	}
+}
+
+// resolveDashboardDomain interprets the raw dashboard_domain setting value
+// (current, exactly as read from the store — "" if never set) against
+// rootDomain, returning the effective dashboard hostname to route through
+// Caddy and whether the caller must persist a newly-computed default back
+// to the store.
+//
+// "" (unset — the common case, before any operator has touched the
+// setting) computes a default of "basepod.<rootDomain>" and reports
+// writeDefault=true, so Run persists it: an operator can then find (and
+// later override, or clear back to "" to pick up a rootDomain change, or
+// set to "off") the value BasePod chose, in the settings table. The
+// literal value "off" disables the dashboard route outright (domain ""
+// with writeDefault=false — Run treats an empty returned domain as
+// "don't route the dashboard at all", regardless of why). Any other value
+// is an operator-chosen hostname, used as-is.
+//
+// This is its own function — called from Run right after mgr.Ensure, but
+// not itself doing any I/O — so tests can exercise the resolution logic
+// directly against literal setting values, without needing to run all of
+// Run against a fake podman daemon (see TestResolveDashboardDomain).
+func resolveDashboardDomain(current, rootDomain string) (domain string, writeDefault bool) {
+	switch current {
+	case "":
+		return "basepod." + rootDomain, true
+	case "off":
+		return "", false
+	default:
+		return current, false
 	}
 }
 

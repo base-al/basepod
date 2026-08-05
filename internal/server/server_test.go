@@ -152,6 +152,34 @@ func TestPruneSessionsRemovesExpired(t *testing.T) {
 	}
 }
 
+// TestResolveDashboardDomain proves the dashboard_domain setting's three
+// meaningful shapes are interpreted correctly: unset ("") computes and
+// requests persisting a "basepod.<rootDomain>" default, the literal "off"
+// disables the route (empty domain, nothing to persist), and any other
+// value passes through unchanged as an operator override.
+func TestResolveDashboardDomain(t *testing.T) {
+	cases := []struct {
+		name          string
+		current       string
+		rootDomain    string
+		wantDomain    string
+		wantWriteFlag bool
+	}{
+		{"unset computes default", "", "apps.example.com", "basepod.apps.example.com", true},
+		{"off disables", "off", "apps.example.com", "", false},
+		{"explicit override passes through", "dash.example.net", "apps.example.com", "dash.example.net", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotDomain, gotWrite := resolveDashboardDomain(tc.current, tc.rootDomain)
+			if gotDomain != tc.wantDomain || gotWrite != tc.wantWriteFlag {
+				t.Errorf("resolveDashboardDomain(%q, %q) = (%q, %v), want (%q, %v)",
+					tc.current, tc.rootDomain, gotDomain, gotWrite, tc.wantDomain, tc.wantWriteFlag)
+			}
+		})
+	}
+}
+
 // TestCheckPodmanVersionUnparseable proves a malformed version string
 // (not even a dotted major.minor) is reported as an error rather than
 // panicking or silently passing the gate.

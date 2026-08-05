@@ -661,6 +661,84 @@ func TestDomainGeneratedCollision(t *testing.T) {
 	}
 }
 
+// TestDomainDashboardCollision proves handleAddDomain rejects a custom
+// domain hostname that equals the dashboard_domain setting — the dashboard
+// route is prepended terminal-first in the rendered Caddy config (see
+// caddy.Render), so a custom app domain with the same hostname would never
+// actually reach the app.
+func TestDomainDashboardCollision(t *testing.T) {
+	srv, st, token, _, _ := setupEnvDomainsTest(t)
+	if err := st.SetSetting("dashboard_domain", "basepod.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	var errBody errorResponse
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/my-blog/domains", token,
+		addDomainRequest{Hostname: "basepod.example.com"}, &errBody)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("collision with dashboard domain: got status %d, want 422", resp.StatusCode)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+}
+
+// TestDomainDashboardOffOrUnsetNoCollision proves a dashboard_domain of ""
+// (unset) or the literal "off" never blocks a custom domain add — neither
+// value is actually routed anywhere, so there's nothing to collide with.
+func TestDomainDashboardOffOrUnsetNoCollision(t *testing.T) {
+	for _, dashboardDomain := range []string{"", "off"} {
+		t.Run("dashboard_domain="+dashboardDomain, func(t *testing.T) {
+			srv, st, token, _, _ := setupEnvDomainsTest(t)
+			if dashboardDomain != "" {
+				if err := st.SetSetting("dashboard_domain", dashboardDomain); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/my-blog/domains", token,
+				addDomainRequest{Hostname: "not-a-real-collision.example.com"}, nil)
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("got status %d, want 201", resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestCreateAppDashboardCollision proves handleCreateApp rejects a slug
+// whose generated hostname (slug.rootDomain) equals the dashboard_domain
+// setting.
+func TestCreateAppDashboardCollision(t *testing.T) {
+	st := newTestStore(t)
+	if err := st.SetSetting("root_domain", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSetting("dashboard_domain", "basepod.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+	token := session.Token
+
+	var errBody errorResponse
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "Basepod", Image: "nginx:alpine", Port: 80}, &errBody)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("collision with dashboard domain: got status %d, want 422", resp.StatusCode)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+
+	// A non-colliding slug still succeeds with the same dashboard_domain
+	// setting in place.
+	resp = doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "My Blog", Image: "nginx:alpine", Port: 80}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("non-colliding slug: got status %d, want 201", resp.StatusCode)
+	}
+}
+
 func TestDomainCrossAppDelete(t *testing.T) {
 	srv, _, token, _, _ := setupEnvDomainsTest(t)
 

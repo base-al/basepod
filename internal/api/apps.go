@@ -93,6 +93,24 @@ func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rootDomain, err := a.st.Setting("root_domain")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to read root domain")
+		return
+	}
+	dashboardDomain, err := a.st.Setting("dashboard_domain")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to read dashboard domain")
+		return
+	}
+	// See the matching check in domains.go's handleAddDomain: "" (unset)
+	// and the literal "off" both mean the dashboard isn't actually routed
+	// anywhere, so neither is a real collision.
+	if dashboardDomain != "" && dashboardDomain != "off" && slug+"."+rootDomain == dashboardDomain {
+		writeError(w, http.StatusUnprocessableEntity, "validation", "app slug's generated hostname collides with the dashboard domain")
+		return
+	}
+
 	if _, err := a.st.AppBySlug(slug); err == nil {
 		writeError(w, http.StatusConflict, "app_exists", "an app with this name already exists")
 		return

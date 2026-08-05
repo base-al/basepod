@@ -10,9 +10,12 @@
 # walking-skeleton exit criteria, plus (added in v0.2) env vars (PUT/GET
 # masking, redeploy-injects-into-container via podman inspect), custom
 # domains (POST/DELETE against the rendered Caddy config), log streaming
-# (finite SSE fetch, query-token auth scoped to the logs route only), and
-# the dashboard's static asset pipeline (hashed asset + immutable
-# Cache-Control). Safe to run repeatedly on a dev machine or in CI
+# (finite SSE fetch, query-token auth scoped to the logs route only), the
+# dashboard's static asset pipeline (hashed asset + immutable
+# Cache-Control), and (added in v0.3) the dashboard being served remotely
+# through Caddy over HTTPS at basepod.<root-domain> (its own listener on
+# the "basepod" network's gateway address — Linux-first, see README).
+# Safe to run repeatedly on a dev machine or in CI
 # (GitHub Actions ubuntu-24.04 runner with rootless podman); requires a
 # reachable podman socket (`podman machine start` on macOS,
 # `systemctl --user enable --now podman.socket` on Linux).
@@ -202,6 +205,32 @@ printf '%s' "${asset_headers}" | grep -qi '^HTTP/[0-9.]* 200' || fail "asset ${a
 printf '%s' "${asset_headers}" | grep -qi '^Cache-Control:.*immutable' || fail "asset ${asset_path} missing immutable Cache-Control: ${asset_headers}"
 
 # ---------------------------------------------------------------------------
+# Dashboard — served automatically by Caddy at https://basepod.<root-domain>
+# once the server discovers the "basepod" network's gateway IP and binds its
+# second (gateway-facing) listener there at boot (see
+# internal/server.Run and resolveDashboardDomain). This is Linux-first:
+# this CI runner (ubuntu-24.04 rootless podman) can bind the gateway
+# address directly, but macOS podman-machine cannot (the gateway lives
+# inside the VM's own network namespace) — see README's Remote access
+# section for the macOS fallback.
+# ---------------------------------------------------------------------------
+DASHBOARD_DOMAIN="basepod.${ROOT_DOMAIN}"
+CADDY_CONFIG="${DATA_DIR}/caddy/current.json"
+
+log "verifying the dashboard route landed in caddy's config..."
+[ -f "${CADDY_CONFIG}" ] || fail "caddy config not found at ${CADDY_CONFIG}"
+grep -q "${DASHBOARD_DOMAIN}" "${CADDY_CONFIG}" || fail "caddy config does not contain the dashboard hostname ${DASHBOARD_DOMAIN}"
+
+dashboard_up() {
+	curl -sk --max-time 5 \
+		--resolve "${DASHBOARD_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
+		"https://${DASHBOARD_DOMAIN}:${HTTPS_PORT}/" 2>/dev/null | grep -q '<div id="app"'
+}
+if ! wait_for "dashboard reachable over HTTPS at ${DASHBOARD_DOMAIN}" "${MAX_WAIT}" dashboard_up; then
+	fail "dashboard not reachable via HTTPS at ${DASHBOARD_DOMAIN} within ${MAX_WAIT}s"
+fi
+
+# ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
 log "logging in..."
@@ -315,9 +344,9 @@ get_secret_value=$(printf '%s' "${env_get_resp}" | jq -r '.[] | select(.key=="E2
 
 # ---------------------------------------------------------------------------
 # Domains — a custom hostname must land in Caddy's rendered config on
-# POST, and disappear from it on DELETE.
+# POST, and disappear from it on DELETE. (CADDY_CONFIG is set above, in the
+# Dashboard section.)
 # ---------------------------------------------------------------------------
-CADDY_CONFIG="${DATA_DIR}/caddy/current.json"
 CUSTOM_DOMAIN=e2e-custom.example.com
 
 log "adding custom domain '${CUSTOM_DOMAIN}'..."

@@ -370,7 +370,7 @@ func TestApplyWritesAndReloads(t *testing.T) {
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
 	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
-	if err := mgr.Apply(context.Background(), routes); err != nil {
+	if err := mgr.Apply(context.Background(), routes, nil); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -387,6 +387,37 @@ func TestApplyWritesAndReloads(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fe.calls, wantCalls) {
 		t.Fatalf("exec calls = %v, want %v", fe.calls, wantCalls)
+	}
+}
+
+// TestApplyWritesDashboardRoute proves a non-nil dashboard argument lands
+// in the written current.json alongside the app routes.
+func TestApplyWritesDashboardRoute(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := &fakeRuntime{}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
+	dashboard := &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: "10.89.2.1:3080"}
+	if err := mgr.Apply(context.Background(), routes, dashboard); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(configDir, "current.json"))
+	if err != nil {
+		t.Fatalf("reading current.json: %v", err)
+	}
+	if !strings.Contains(string(got), "basepod.apps.example.com") {
+		t.Errorf("current.json missing dashboard hostname, got: %s", got)
+	}
+	if !strings.Contains(string(got), "10.89.2.1:3080") {
+		t.Errorf("current.json missing dashboard upstream, got: %s", got)
 	}
 }
 
@@ -413,7 +444,7 @@ func TestApplyRetriesReloadOnTransientFailure(t *testing.T) {
 	fe := &fakeExecer{errSequence: []error{transient, transient, nil}}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
-	if err := mgr.Apply(context.Background(), nil); err != nil {
+	if err := mgr.Apply(context.Background(), nil, nil); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if len(fe.calls) != 3 {
@@ -440,7 +471,7 @@ func TestApplyFailsAfterExhaustingReloadRetries(t *testing.T) {
 	fe := &fakeExecer{err: persistent}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
-	err := mgr.Apply(context.Background(), nil)
+	err := mgr.Apply(context.Background(), nil, nil)
 	if err == nil {
 		t.Fatal("Apply: expected error, got nil")
 	}

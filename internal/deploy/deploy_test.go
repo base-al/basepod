@@ -194,16 +194,18 @@ func (f *fakeRuntime) ContainerLogs(ctx context.Context, nameOrID string, follow
 
 // fakeRouter is a test double for Router.
 type fakeRouter struct {
-	ops        *[]string
-	applyErr   error
-	lastRoutes []caddy.AppRoute
-	calls      int
+	ops           *[]string
+	applyErr      error
+	lastRoutes    []caddy.AppRoute
+	lastDashboard *caddy.DashboardRoute
+	calls         int
 }
 
-func (f *fakeRouter) Apply(ctx context.Context, routes []caddy.AppRoute) error {
+func (f *fakeRouter) Apply(ctx context.Context, routes []caddy.AppRoute, dashboard *caddy.DashboardRoute) error {
 	*f.ops = append(*f.ops, "apply-routes")
 	f.calls++
 	f.lastRoutes = routes
+	f.lastDashboard = dashboard
 	return f.applyErr
 }
 
@@ -231,7 +233,7 @@ func newBlockingRouter() *blockingRouter {
 	}
 }
 
-func (r *blockingRouter) Apply(ctx context.Context, routes []caddy.AppRoute) error {
+func (r *blockingRouter) Apply(ctx context.Context, routes []caddy.AppRoute, dashboard *caddy.DashboardRoute) error {
 	r.mu.Lock()
 	r.inFlight++
 	if r.inFlight > r.maxSeen {
@@ -315,7 +317,7 @@ func newTestEngine(t *testing.T, st *store.Store) (*Engine, *fakeRuntime, *fakeR
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	return eng, rt, router, prober, ops
@@ -548,7 +550,7 @@ func TestDeployInjectsDecryptedEnv(t *testing.T) {
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
 	decrypt := func(s string) (string, error) { return "plain-" + s, nil }
-	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -589,7 +591,7 @@ func TestDeployFailsOnDecryptError(t *testing.T) {
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
 	decrypt := func(s string) (string, error) { return "", errors.New("bad key") }
-	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -659,7 +661,7 @@ func TestDeployFailsWhenEnvInjectionDisabled(t *testing.T) {
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil) // decrypt disabled
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil) // decrypt disabled
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -749,6 +751,58 @@ func TestRoutesIncludeCustomDomains(t *testing.T) {
 	want := []string{"blog.apps.localhost", "aaa.example.com", "blog.example.com"}
 	if !reflect.DeepEqual(routes[0].Hostnames, want) {
 		t.Errorf("Hostnames = %v, want %v", routes[0].Hostnames, want)
+	}
+}
+
+// TestApplyRoutesPassesDashboardToRouter proves ApplyRoutes forwards the
+// Engine's dashboard route (set via New) through to every router.Apply
+// call unchanged, alongside the computed app route set.
+func TestApplyRoutesPassesDashboardToRouter(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: "10.89.2.1:3080"}
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, dashboard)
+	ctx := context.Background()
+
+	if err := eng.ApplyRoutes(ctx); err != nil {
+		t.Fatalf("ApplyRoutes: %v", err)
+	}
+	if router.lastDashboard != dashboard {
+		t.Errorf("router.lastDashboard = %+v, want the Engine's configured dashboard route %+v", router.lastDashboard, dashboard)
+	}
+}
+
+// TestRemoveAppPassesDashboardToRouter proves RemoveApp forwards the
+// Engine's dashboard route through to router.Apply unchanged, just like
+// ApplyRoutes — RemoveApp renders and applies its own filtered route set
+// rather than calling ApplyRoutes, so this is its own regression test
+// rather than being implied by the one above.
+func TestRemoveAppPassesDashboardToRouter(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: "10.89.2.1:3080"}
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, dashboard)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppStatus(app.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := eng.RemoveApp(ctx, app); err != nil {
+		t.Fatalf("RemoveApp: %v", err)
+	}
+	if router.lastDashboard != dashboard {
+		t.Errorf("router.lastDashboard = %+v, want the Engine's configured dashboard route %+v", router.lastDashboard, dashboard)
 	}
 }
 
@@ -939,7 +993,7 @@ func TestFailDetachesCleanupFromCancelledContext(t *testing.T) {
 		return pctx.Err()
 	}
 
-	eng := New(st, rt, router, probe, "apps.localhost", nil)
+	eng := New(st, rt, router, probe, "apps.localhost", nil, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 1
 

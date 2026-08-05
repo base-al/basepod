@@ -195,7 +195,7 @@ func (m *Manager) create(ctx context.Context) error {
 		return fmt.Errorf("caddy: create data dir %q: %w", dataDir, err)
 	}
 
-	initial, err := Render(nil)
+	initial, err := Render(nil, nil)
 	if err != nil {
 		return fmt.Errorf("caddy: render initial config: %w", err)
 	}
@@ -264,7 +264,8 @@ const reloadAttempts = 5
 
 var reloadBackoff = 100 * time.Millisecond
 
-// Apply renders routes into current.json (written atomically) and tells
+// Apply renders routes (plus dashboard, if non-nil — see
+// caddy.DashboardRoute) into current.json (written atomically) and tells
 // the running Caddy instance to reload it over its Unix-socket admin API.
 //
 // The reload exec is retried up to reloadAttempts times on failure.
@@ -278,8 +279,8 @@ var reloadBackoff = 100 * time.Millisecond
 // podman machine. A bare retry a few milliseconds later reliably
 // succeeds, and `caddy reload` is idempotent (it just re-reads and
 // re-applies the same file), so retrying here is safe.
-func (m *Manager) Apply(ctx context.Context, routes []AppRoute) error {
-	data, err := Render(routes)
+func (m *Manager) Apply(ctx context.Context, routes []AppRoute, dashboard *DashboardRoute) error {
+	data, err := Render(routes, dashboard)
 	if err != nil {
 		return fmt.Errorf("caddy: render config: %w", err)
 	}

@@ -38,6 +38,15 @@ type Engine struct {
 	probe      Prober
 	rootDomain string
 
+	// dashboard is the route (if any) BasePod's own web dashboard is
+	// reachable through Caddy on — resolved once at boot (see
+	// internal/server.Run) from the dashboard_domain setting and the
+	// "basepod" network's gateway address, and passed straight through
+	// into every router.Apply call alongside the app route set. It is nil
+	// when the dashboard route is disabled (setting "off", or the gateway
+	// listener failed to bind — see server.Run).
+	dashboard *caddy.DashboardRoute
+
 	// routesMu serializes every route render+apply critical section: the
 	// Routes() DB read paired with the router.Apply call that renders it,
 	// across ApplyRoutes (called directly by the API layer on domain
@@ -78,8 +87,10 @@ type Engine struct {
 // its hostname (e.g. rootDomain "apps.example.com" -> "blog.apps.example.com").
 // decrypt turns a stored EnvVar's encrypted value into plaintext; pass nil
 // to disable env injection (Deploy then fails rather than silently
-// omitting configured env vars).
-func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(string) (string, error)) *Engine {
+// omitting configured env vars). dashboard is the dashboard route (or nil
+// to disable it) every router.Apply call made through this Engine carries
+// alongside the app route set — see the dashboard field's doc comment.
+func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(string) (string, error), dashboard *caddy.DashboardRoute) *Engine {
 	return &Engine{
 		st:            st,
 		rt:            rt,
@@ -87,6 +98,7 @@ func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain st
 		probe:         probe,
 		rootDomain:    rootDomain,
 		decrypt:       decrypt,
+		dashboard:     dashboard,
 		probeInterval: time.Second,
 		probeAttempts: 30,
 		log:           os.Stderr,
@@ -360,7 +372,7 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 		}
 		filtered = append(filtered, r)
 	}
-	if err := e.router.Apply(ctx, filtered); err != nil {
+	if err := e.router.Apply(ctx, filtered, e.dashboard); err != nil {
 		return fmt.Errorf("deploy: apply routes: %w", err)
 	}
 	return nil
@@ -421,7 +433,7 @@ func (e *Engine) ApplyRoutes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("deploy: compute routes: %w", err)
 	}
-	if err := e.router.Apply(ctx, routes); err != nil {
+	if err := e.router.Apply(ctx, routes, e.dashboard); err != nil {
 		return fmt.Errorf("deploy: apply routes: %w", err)
 	}
 	return nil
