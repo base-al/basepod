@@ -271,13 +271,27 @@ func TestBuildImageNon2xxStatus(t *testing.T) {
 
 // TestImageExistsTrue proves ImageExists reports true on a 204 response
 // from libpod's GET /images/{ref}/exists.
+// TestImageExistsTrue registers a catch-all handler (rather than a
+// literal multi-segment ServeMux pattern) because ref contains a '/':
+// ImageExists now escapes the whole ref (see its doc comment and
+// TestImageExistsEscapesRefPathSegment), so it no longer arrives as
+// several literal path segments a plain pattern could match — the handler
+// instead asserts on the exact escaped request path it received, proving
+// this 204 really did come from the request ImageExists sent (not from
+// falling through to ServeMux's own default 404, which would have made a
+// "not found" assertion pass vacuously).
 func TestImageExistsTrue(t *testing.T) {
+	ref := "localhost/basepod/blog:3"
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v5.0.0/libpod/images/localhost/basepod/blog:3/exists", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		want := "/v5.0.0/libpod/images/" + url.PathEscape(ref) + "/exists"
+		if r.URL.EscapedPath() != want {
+			t.Errorf("request path = %q, want %q", r.URL.EscapedPath(), want)
+		}
 		w.WriteHeader(204)
 	})
 	c := fakeDaemon(t, mux)
-	ok, err := c.ImageExists(context.Background(), "localhost/basepod/blog:3")
+	ok, err := c.ImageExists(context.Background(), ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,14 +301,20 @@ func TestImageExistsTrue(t *testing.T) {
 }
 
 // TestImageExistsFalse proves ImageExists reports false (not an error) on
-// a 404 response.
+// a 404 response. See TestImageExistsTrue for why this uses a catch-all
+// handler asserting on the escaped path rather than a literal pattern.
 func TestImageExistsFalse(t *testing.T) {
+	ref := "example.com/missing:latest"
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v5.0.0/libpod/images/example.com/missing:latest/exists", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		want := "/v5.0.0/libpod/images/" + url.PathEscape(ref) + "/exists"
+		if r.URL.EscapedPath() != want {
+			t.Errorf("request path = %q, want %q", r.URL.EscapedPath(), want)
+		}
 		w.WriteHeader(404)
 	})
 	c := fakeDaemon(t, mux)
-	ok, err := c.ImageExists(context.Background(), "example.com/missing:latest")
+	ok, err := c.ImageExists(context.Background(), ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,15 +338,22 @@ func TestImageExistsErrorStatus(t *testing.T) {
 }
 
 // TestRemoveImageAlreadyGoneIsSuccess proves RemoveImage treats a 404
-// (image already gone) as success, mirroring RemoveContainer.
+// (image already gone) as success, mirroring RemoveContainer. Uses a
+// catch-all handler asserting on the escaped path (see TestImageExistsTrue
+// for why) rather than a literal ServeMux pattern.
 func TestRemoveImageAlreadyGoneIsSuccess(t *testing.T) {
+	ref := "localhost/basepod/blog:1"
 	mux := http.NewServeMux()
-	mux.HandleFunc("DELETE /v5.0.0/libpod/images/localhost/basepod/blog:1", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		want := "/v5.0.0/libpod/images/" + url.PathEscape(ref)
+		if r.URL.EscapedPath() != want {
+			t.Errorf("request path = %q, want %q", r.URL.EscapedPath(), want)
+		}
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]any{"cause": "no such image", "message": "no such image", "response": 404})
 	})
 	c := fakeDaemon(t, mux)
-	if err := c.RemoveImage(context.Background(), "localhost/basepod/blog:1", false); err != nil {
+	if err := c.RemoveImage(context.Background(), ref, false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -334,18 +361,154 @@ func TestRemoveImageAlreadyGoneIsSuccess(t *testing.T) {
 // TestRemoveImageForceQueryParam proves force=true is sent as a query
 // param when requested.
 func TestRemoveImageForceQueryParam(t *testing.T) {
+	ref := "localhost/basepod/blog:1"
 	var gotQuery string
 	mux := http.NewServeMux()
-	mux.HandleFunc("DELETE /v5.0.0/libpod/images/localhost/basepod/blog:1", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		want := "/v5.0.0/libpod/images/" + url.PathEscape(ref)
+		if r.URL.EscapedPath() != want {
+			t.Errorf("request path = %q, want %q", r.URL.EscapedPath(), want)
+		}
 		gotQuery = r.URL.RawQuery
 		w.WriteHeader(200)
 	})
 	c := fakeDaemon(t, mux)
-	if err := c.RemoveImage(context.Background(), "localhost/basepod/blog:1", true); err != nil {
+	if err := c.RemoveImage(context.Background(), ref, true); err != nil {
 		t.Fatal(err)
 	}
 	if gotQuery != "force=true" {
 		t.Fatalf("query = %q, want force=true", gotQuery)
+	}
+}
+
+// TestImageExistsEscapesRefPathSegment proves ImageExists percent-encodes
+// the whole ref before splicing it into the URL path — matching every
+// other method in this file that takes a name/ref (see
+// CreateContainer/InspectContainer/EnsureNetwork's url.PathEscape calls) —
+// so a ref containing '/' or ':' travels as one opaque, unambiguous path
+// segment rather than as raw text an HTTP client's own URL parsing could
+// misinterpret. Checked via the raw (still-escaped) request line, since
+// Go's URL parsing auto-decodes r.URL.Path for a receiving handler
+// regardless of how the client encoded it.
+func TestImageExistsEscapesRefPathSegment(t *testing.T) {
+	var gotRawPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotRawPath = r.URL.EscapedPath()
+		w.WriteHeader(204)
+	})
+	c := fakeDaemon(t, mux)
+	ref := "docker.io/lib/x:1"
+	if _, err := c.ImageExists(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	want := "/v5.0.0/libpod/images/" + url.PathEscape(ref) + "/exists"
+	if gotRawPath != want {
+		t.Fatalf("raw request path = %q, want %q", gotRawPath, want)
+	}
+}
+
+// TestImageExistsHostileRefCannotInjectQueryOrRetargetRoute proves a ref
+// crafted to look like a path-traversal + query-injection payload
+// ("evil/../networks/basepod?x=") cannot make ImageExists's request land
+// on a different libpod endpoint (the networks route) or leak a literal
+// '?' into the actual query string. Before url.PathEscape, string-
+// concatenating this ref straight into the request URL split it at the
+// unescaped '?': everything from "?" onward (including the intended
+// "/exists" suffix) became the query string instead of path — verified
+// directly against net/http's own URL parsing, independent of this fake.
+// Escaping the whole ref first closes that off: the literal '?' becomes
+// "%3F", which is never treated as a query delimiter.
+func TestImageExistsHostileRefCannotInjectQueryOrRetargetRoute(t *testing.T) {
+	hitNetworks := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
+		hitNetworks = true
+		w.WriteHeader(204)
+	})
+	var gotRawPath, gotRawQuery string
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotRawPath = r.URL.EscapedPath()
+		gotRawQuery = r.URL.RawQuery
+		w.WriteHeader(404) // this daemon has no route for the (escaped, opaque) hostile ref
+	})
+	c := fakeDaemon(t, mux)
+
+	ref := "evil/../networks/basepod?x="
+	ok, err := c.ImageExists(context.Background(), ref)
+	if hitNetworks {
+		t.Fatal("hostile ref reached the /networks/basepod route — the image ref leaked into request routing")
+	}
+	if err != nil {
+		t.Fatalf("ImageExists: %v (want a clean false, not an error, for the fake's 404)", err)
+	}
+	if ok {
+		t.Fatal("ImageExists reported true against a 404 response")
+	}
+	if gotRawQuery != "" {
+		t.Fatalf("raw query = %q, want empty — the ref's literal '?' must never be interpreted as a query delimiter", gotRawQuery)
+	}
+	want := "/v5.0.0/libpod/images/" + url.PathEscape(ref) + "/exists"
+	if gotRawPath != want {
+		t.Fatalf("raw request path = %q, want %q", gotRawPath, want)
+	}
+}
+
+// TestRemoveImageEscapesRefPathSegment mirrors
+// TestImageExistsEscapesRefPathSegment for RemoveImage, additionally
+// proving the "?force=true" query suffix is still appended correctly
+// after the escaped ref.
+func TestRemoveImageEscapesRefPathSegment(t *testing.T) {
+	var gotRawPath, gotRawQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotRawPath = r.URL.EscapedPath()
+		gotRawQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+	})
+	c := fakeDaemon(t, mux)
+	ref := "docker.io/lib/x:1"
+	if err := c.RemoveImage(context.Background(), ref, true); err != nil {
+		t.Fatal(err)
+	}
+	want := "/v5.0.0/libpod/images/" + url.PathEscape(ref)
+	if gotRawPath != want {
+		t.Fatalf("raw request path = %q, want %q", gotRawPath, want)
+	}
+	if gotRawQuery != "force=true" {
+		t.Fatalf("raw query = %q, want force=true", gotRawQuery)
+	}
+}
+
+// TestRemoveImageHostileRefCannotInjectQueryOrRetargetRoute mirrors
+// TestImageExistsHostileRefCannotInjectQueryOrRetargetRoute for
+// RemoveImage.
+func TestRemoveImageHostileRefCannotInjectQueryOrRetargetRoute(t *testing.T) {
+	hitNetworks := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v5.0.0/libpod/networks/basepod", func(w http.ResponseWriter, _ *http.Request) {
+		hitNetworks = true
+		w.WriteHeader(200)
+	})
+	var gotRawQuery string
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		w.WriteHeader(404)
+	})
+	c := fakeDaemon(t, mux)
+
+	ref := "evil/../networks/basepod?x="
+	err := c.RemoveImage(context.Background(), ref, false)
+	if hitNetworks {
+		t.Fatal("hostile ref reached the /networks/basepod route — the image ref leaked into request routing")
+	}
+	// A 404 is treated as success by RemoveImage (already-gone image), so
+	// this must return nil, not an error.
+	if err != nil {
+		t.Fatalf("RemoveImage: %v (want nil — a 404 is treated as success)", err)
+	}
+	if gotRawQuery != "" {
+		t.Fatalf("raw query = %q, want empty — the ref's literal '?' must never be interpreted as a query delimiter", gotRawQuery)
 	}
 }
 

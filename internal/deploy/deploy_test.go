@@ -112,15 +112,29 @@ func (f *fakeRuntime) ImageExists(ctx context.Context, ref string) (bool, error)
 	return f.images[ref], nil
 }
 
+// RemoveImage mirrors real podman's own safety behavior: without force, an
+// image referenced by any currently-known container (running or not)
+// fails to remove — a fake that let force=false silently "succeed" against
+// an in-use image would hide exactly the class of bug this file's
+// TestPruneBuiltImagesProtectsCurrentlyRunningImage regression-tests, so
+// any future retention/rollback bug that tries to remove the live image
+// trips this check loudly rather than passing by accident.
 func (f *fakeRuntime) RemoveImage(ctx context.Context, ref string, force bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	f.record("remove-image:" + ref)
-	f.removedImages = append(f.removedImages, ref)
+	if !force {
+		for _, c := range f.containers {
+			if c.Image == ref {
+				return fmt.Errorf("fakeRuntime: RemoveImage: image %q is in use by container %q (force=false)", ref, c.Name)
+			}
+		}
+	}
 	if f.removeImageErr != nil {
 		return f.removeImageErr
 	}
+	f.removedImages = append(f.removedImages, ref)
 	delete(f.images, ref)
 	return nil
 }
@@ -154,7 +168,7 @@ func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpe
 	id := fmt.Sprintf("c%d", f.nextID)
 	labels := map[string]string{}
 	maps.Copy(labels, spec.Labels)
-	f.containers[id] = podman.ContainerInfo{ID: id, Name: spec.Name, State: "created", Labels: labels}
+	f.containers[id] = podman.ContainerInfo{ID: id, Name: spec.Name, State: "created", Labels: labels, Image: spec.Image}
 	if f.createdSpecs == nil {
 		f.createdSpecs = map[string]podman.CreateSpec{}
 	}
@@ -1922,7 +1936,12 @@ func TestPruneBuiltImagesKeepsTop5NumericTagsIgnoresNonNumeric(t *testing.T) {
 	rt.images["localhost/basepod/blog:latest"] = true
 	rt.images["localhost/basepod/other:9"] = true // different app, must never be touched
 
-	eng.pruneBuiltImages(ctx, "blog")
+	// currentImageRef deliberately doesn't match any seeded tag, so this
+	// test exercises pure numeric-ranking behavior without the
+	// current-image protection (covered separately by
+	// TestPruneBuiltImagesProtectsCurrentlyRunningImage) changing which
+	// tags survive.
+	eng.pruneBuiltImages(ctx, "blog", "localhost/basepod/blog:not-a-seeded-tag")
 
 	sort.Strings(rt.removedImages)
 	wantRemoved := []string{"localhost/basepod/blog:1", "localhost/basepod/blog:2"}
@@ -1956,7 +1975,7 @@ func TestPruneBuiltImagesNoopUnderRetentionLimit(t *testing.T) {
 		rt.images[fmt.Sprintf("localhost/basepod/blog:%d", n)] = true
 	}
 
-	eng.pruneBuiltImages(ctx, "blog")
+	eng.pruneBuiltImages(ctx, "blog", "localhost/basepod/blog:not-a-seeded-tag")
 
 	if len(rt.removedImages) != 0 {
 		t.Fatalf("removedImages = %v, want none", rt.removedImages)
@@ -1982,7 +2001,15 @@ func TestDeployBuildTriggersRetentionAfterSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for n := 1; n <= 6; n++ {
+	// Pre-seed 6 older built tags, deliberately numbered well above the
+	// deployment number this DeployBuild call will actually produce
+	// (which will be 1, for a fresh app's first deployment) — the
+	// pruning mechanism this test exercises only cares about a tag's
+	// numeric suffix, not real deployment numbering, and choosing
+	// non-colliding numbers avoids the just-built tag's own retention
+	// protection (see TestPruneBuiltImagesProtectsCurrentlyRunningImage)
+	// from being the thing keeping any of these old tags alive.
+	for _, n := range []int{10, 11, 12, 13, 14, 15} {
 		rt.images[fmt.Sprintf("localhost/basepod/blog:%d", n)] = true
 	}
 
@@ -1993,10 +2020,162 @@ func TestDeployBuildTriggersRetentionAfterSuccess(t *testing.T) {
 	if len(rt.removedImages) != 1 {
 		t.Fatalf("removedImages = %v, want exactly 1 (retention pruned automatically after the successful rollout)", rt.removedImages)
 	}
-	if rt.removedImages[0] != "localhost/basepod/blog:1" {
-		t.Fatalf("removedImages = %v, want [localhost/basepod/blog:1] (the oldest)", rt.removedImages)
+	if rt.removedImages[0] != "localhost/basepod/blog:10" {
+		t.Fatalf("removedImages = %v, want [localhost/basepod/blog:10] (the oldest)", rt.removedImages)
 	}
 	if len(rt.images) != retainBuiltImages {
 		t.Fatalf("images remaining = %d (%v), want exactly %d", len(rt.images), rt.images, retainBuiltImages)
+	}
+}
+
+// TestPruneBuiltImagesProtectsCurrentlyRunningImage is a regression test
+// for a review finding: pruneBuiltImages used to rank purely by numeric
+// tag, so after a Rollback to an old tag with more than retainBuiltImages
+// newer tags still on disk, the just-rolled-back-to (now currently
+// running) image could fall outside the numeric top-5 and get handed to
+// RemoveImage — even though a live container references it. Protection
+// must key off the actual current image, not tag recency.
+func TestPruneBuiltImagesProtectsCurrentlyRunningImage(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 7 healthy deployments, tags 1-7: tag 1 is the old one about to be
+	// rolled back to; tags 2-7 are newer builds still present on disk —
+	// tags 3-7 are the numeric top-5, so a naive "keep top 5" prune would
+	// remove both 1 and 2, even after rolling back to 1.
+	for n := 1; n <= 7; n++ {
+		ref := fmt.Sprintf("localhost/basepod/blog:%d", n)
+		rt.images[ref] = true
+		dep, err := st.CreateDeploymentFull(app.ID, ref, "tarball", "api")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := eng.Rollback(ctx, app, 1)
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if got.ImageRef != "localhost/basepod/blog:1" {
+		t.Fatalf("got.ImageRef = %q, want localhost/basepod/blog:1", got.ImageRef)
+	}
+
+	for _, removed := range rt.removedImages {
+		if removed == "localhost/basepod/blog:1" {
+			t.Fatalf("removedImages = %v, must never include the just-rolled-back-to (currently running) image", rt.removedImages)
+		}
+	}
+	if !rt.images["localhost/basepod/blog:1"] {
+		t.Fatal("localhost/basepod/blog:1 should still be present after retention (it's the current image)")
+	}
+	// Pin the exact outcome down, not just "tag 1 survived": the
+	// protected set is {current} ∪ {top-5 by number} = {1,3,4,5,6,7}, so
+	// tag 2 is the only one actually outside it.
+	if len(rt.removedImages) != 1 || rt.removedImages[0] != "localhost/basepod/blog:2" {
+		t.Fatalf("removedImages = %v, want exactly [localhost/basepod/blog:2]", rt.removedImages)
+	}
+}
+
+// TestPruneBuiltImagesProtectsCurrentImageEvenWithoutAContainer isolates
+// pruneBuiltImages's own protected-set logic from fakeRuntime.RemoveImage's
+// separate in-use-container safety net (see that method's doc comment):
+// no container exists at all here, so if currentImageRef still survives
+// retention, it can only be because pruneBuiltImages itself excluded it —
+// not because the fake happened to reject an in-use removal. This is what
+// actually pins down the production fix for the review finding
+// TestPruneBuiltImagesProtectsCurrentlyRunningImage exercises end-to-end;
+// without it, that other test would pass even if the protected-set logic
+// were accidentally removed, purely by riding on the fake's in-use check.
+func TestPruneBuiltImagesProtectsCurrentImageEvenWithoutAContainer(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	for n := 1; n <= 7; n++ {
+		rt.images[fmt.Sprintf("localhost/basepod/blog:%d", n)] = true
+	}
+	eng.pruneBuiltImages(ctx, "blog", "localhost/basepod/blog:1")
+
+	for _, removed := range rt.removedImages {
+		if removed == "localhost/basepod/blog:1" {
+			t.Fatalf("removedImages = %v, must never include currentImageRef even without a container in-use rejection to fall back on", rt.removedImages)
+		}
+	}
+	if len(rt.removedImages) != 1 || rt.removedImages[0] != "localhost/basepod/blog:2" {
+		t.Fatalf("removedImages = %v, want exactly [localhost/basepod/blog:2]", rt.removedImages)
+	}
+}
+
+// TestDeployBuildRemovesOrphanImageWhenRolloutFails proves that when a
+// build succeeds (producing a local image tag) but the rollout that
+// follows it fails (e.g. a failed health probe), the now-unreachable
+// freshly-built tag is removed rather than left as a permanent orphan —
+// runRollout's own retention (pruneBuiltImages) only runs on a
+// *successful* rollout, so without this cleanup a string of failed builds
+// would leave one dead tag behind per attempt, forever. The old, still
+// healthy container from a prior deploy must be left completely
+// untouched.
+func TestDeployBuildRemovesOrphanImageWhenRolloutFails(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, prober, _ := newTestEngine(t, st)
+	buildRt := &fakeBuildRuntime{}
+	builder := build.New(buildRt, t.TempDir(), 2)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+
+	prober.failUpstream = "bp-blog-2:80"
+
+	dep, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder)
+	if err == nil {
+		t.Fatal("expected an error from the failed probe")
+	}
+	if dep.Status != "failed" {
+		t.Fatalf("dep.Status = %q, want failed", dep.Status)
+	}
+	wantTag := "localhost/basepod/blog:2"
+	if dep.ImageRef != wantTag {
+		t.Fatalf("dep.ImageRef = %q, want %q", dep.ImageRef, wantTag)
+	}
+
+	found := false
+	for _, removed := range rt.removedImages {
+		if removed == wantTag {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("removedImages = %v, want it to include the orphaned build tag %q", rt.removedImages, wantTag)
+	}
+
+	var oldID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			oldID = id
+		}
+		if c.Name == "bp-blog-2" {
+			t.Errorf("bp-blog-2 (the failed new container) should have been removed by fail()'s own cleanup, still present: %+v", c)
+		}
+	}
+	if oldID == "" {
+		t.Fatal("bp-blog-1 (old, healthy) should still exist")
+	}
+	if got := rt.containers[oldID]; got.State != "running" {
+		t.Errorf("bp-blog-1 state = %q, want still running (untouched)", got.State)
 	}
 }

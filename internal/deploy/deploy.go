@@ -181,6 +181,14 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 // "localhost/basepod/..." tag, and pulling a localhost/ tag from a
 // registry would either fail outright or (worse) silently pull the wrong
 // thing.
+//
+// If the build succeeds but the rollout that follows it fails (a failed
+// probe, a container that won't start, ...), the freshly-built tag never
+// becomes a running deployment's image and is removed as an orphan (see
+// removeOrphanBuildImage) — runRollout's own retention (pruneBuiltImages)
+// only prunes on a *successful* rollout, so without this a string of
+// repeated failed builds would leave one dead tag behind per attempt,
+// forever.
 func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
 	dep, err := e.st.CreateDeploymentFull(app.ID, "", "tarball", "api")
 	if err != nil {
@@ -207,7 +215,28 @@ func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reade
 	}
 	dep.ImageRef = tag
 
-	return e.runRollout(ctx, app, dep, tag)
+	result, rollErr := e.runRollout(ctx, app, dep, tag)
+	if rollErr != nil {
+		e.removeOrphanBuildImage(ctx, tag)
+	}
+	return result, rollErr
+}
+
+// removeOrphanBuildImage best-effort removes a freshly-built local image
+// tag whose rollout failed before it ever became a running deployment's
+// image — called by DeployBuild only when runRollout returns an error
+// (see its doc comment). Logged and skipped on failure, like every other
+// post-deploy cleanup step in this file: a stray failed-build tag is a
+// disk-space nuisance, not a correctness problem. Runs on a context
+// detached from ctx's cancellation, matching fail's/pruneBuiltImages's own
+// cleanupCtx pattern, since this cleanup must happen even if the caller's
+// request context is about to expire.
+func (e *Engine) removeOrphanBuildImage(ctx context.Context, tag string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+	if err := e.rt.RemoveImage(cleanupCtx, tag, false); err != nil {
+		fmt.Fprintf(e.log, "deploy: cleanup orphaned build image %s: %v\n", tag, err)
+	}
 }
 
 // Rollback redeploys app to an earlier deployment's exact image:
@@ -345,12 +374,16 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 	// is it safe to tear down the previous generation.
 	e.removeOldContainers(ctx, app.Slug, dep.Number)
 
-	// Every successful rollout is a good point to prune old built images:
-	// this deployment (or an earlier one, for an app that's since moved to
-	// a registry ref) may have left retainBuiltImages+ tags on disk. This
-	// no-ops harmlessly for an app with no local build tags at all (its
-	// ListImageTags query simply returns none).
-	e.pruneBuiltImages(ctx, app.Slug)
+	// Every successful rollout is a good point to prune old built images —
+	// except when this deployment is registry-sourced ("image"): it can
+	// never have produced a "localhost/basepod/<slug>:<n>" tag, so there's
+	// nothing to prune and it's not worth the ListImageTags round trip.
+	// imageRef (the image this rollout just cut traffic over to) is
+	// threaded through as the protected "currently running" image — see
+	// pruneBuiltImages's doc comment for why that matters.
+	if dep.Source != "image" {
+		e.pruneBuiltImages(ctx, app.Slug, imageRef)
+	}
 
 	if err := e.st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
 		fmt.Fprintf(e.log, "deploy: finish deployment %d: %v\n", dep.ID, err)
@@ -455,6 +488,17 @@ func builtImageRepo(slug string) string {
 // long-lived app that redeploys frequently from tarball uploads doesn't
 // accumulate an unbounded number of local image layers.
 //
+// currentImageRef — the image the app is actually running right now (the
+// imageRef runRollout just cut traffic over to) — is always protected from
+// removal, regardless of where it ranks numerically. This matters because
+// a rollback can make an OLD, low-numbered tag the currently-running
+// image: ranking purely by tag number would then treat that live image as
+// one of the oldest and hand it straight to RemoveImage, deleting the
+// image a running container still references. The protected set is
+// therefore {currentImageRef} ∪ {the retainBuiltImages highest-numbered
+// tags}, which can hold up to retainBuiltImages+1 entries when
+// currentImageRef itself falls outside the numeric top N.
+//
 // Only tags whose suffix parses as a plain non-negative integer are
 // considered "numbered" and eligible for this ordering; anything else
 // (e.g. a stray "latest" tag) is left alone entirely — pruneBuiltImages
@@ -469,7 +513,7 @@ func builtImageRepo(slug string) string {
 // removeOldContainers's cleanupCtx), since it happens after the deploy has
 // already succeeded and must not be skipped just because the caller's
 // request context is about to expire.
-func (e *Engine) pruneBuiltImages(ctx context.Context, slug string) {
+func (e *Engine) pruneBuiltImages(ctx context.Context, slug, currentImageRef string) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancel()
 
@@ -502,7 +546,16 @@ func (e *Engine) pruneBuiltImages(ctx context.Context, slug string) {
 	}
 
 	sort.Slice(numbered, func(i, j int) bool { return numbered[i].number > numbered[j].number })
+
+	protected := map[string]bool{currentImageRef: true}
+	for _, nt := range numbered[:retainBuiltImages] {
+		protected[nt.tag] = true
+	}
+
 	for _, nt := range numbered[retainBuiltImages:] {
+		if protected[nt.tag] {
+			continue
+		}
 		if err := e.rt.RemoveImage(cleanupCtx, nt.tag, false); err != nil {
 			fmt.Fprintf(e.log, "deploy: retention: remove image %s: %v\n", nt.tag, err)
 		}

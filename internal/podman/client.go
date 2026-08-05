@@ -440,8 +440,21 @@ func (c *Client) BuildImage(ctx context.Context, tag, dockerfile string, context
 // libpod's GET /images/{ref}/exists: a 204 response means yes, a 404 means
 // no (reported as ok=false, not an error — "the image isn't there" is an
 // expected outcome for this call, not a failure).
+//
+// ref is url.PathEscape'd before being spliced into the path — like every
+// other name/ref this file puts into a URL (see CreateContainer,
+// InspectContainer, EnsureNetwork) — because an image ref routinely
+// contains '/' (a registry namespace) and could in principle contain other
+// reserved characters; splicing it in raw would let a literal '?' get
+// parsed as the start of the query string (silently truncating the path,
+// e.g. swallowing the "/exists" suffix into the query instead) and would
+// let unescaped '/'-delimited ".." segments be interpreted as real path
+// segments by anything that cleans/normalizes the path before routing.
+// libpod decodes the escaped path segment back to the real ref value
+// server-side, mirroring how this client already escapes container/network
+// names.
 func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
-	status, data, err := c.request(ctx, http.MethodGet, "/images/"+ref+"/exists", nil)
+	status, data, err := c.request(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/exists", nil)
 	if err != nil {
 		return false, fmt.Errorf("podman: checking image %q exists: %w", ref, err)
 	}
@@ -456,9 +469,11 @@ func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 
 // RemoveImage removes an image by reference. force also removes an image
 // referenced by a stopped container. Removing an already-gone image (404)
-// is treated as success, mirroring RemoveContainer.
+// is treated as success, mirroring RemoveContainer. ref is
+// url.PathEscape'd for the same reason as ImageExists (see its doc
+// comment).
 func (c *Client) RemoveImage(ctx context.Context, ref string, force bool) error {
-	path := "/images/" + ref
+	path := "/images/" + url.PathEscape(ref)
 	if force {
 		path += "?force=true"
 	}
