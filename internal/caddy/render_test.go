@@ -8,8 +8,8 @@ import (
 
 func TestRenderTwoAppsGolden(t *testing.T) {
 	got, err := Render([]AppRoute{
-		{Slug: "wiki", Hostname: "wiki.apps.example.com", Upstream: "bp-wiki:3000"},
-		{Slug: "blog", Hostname: "blog.apps.example.com", Upstream: "bp-blog:8080"},
+		{Slug: "wiki", Hostnames: []string{"wiki.apps.example.com", "wiki.custom.com"}, Upstream: "bp-wiki:3000"},
+		{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"},
 	})
 	if err != nil {
 		t.Fatal(err)

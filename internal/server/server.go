@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -14,10 +17,18 @@ import (
 	"github.com/base-al/basepod/internal/api"
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/config"
+	"github.com/base-al/basepod/internal/crypto"
 	"github.com/base-al/basepod/internal/deploy"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
+	"github.com/base-al/basepod/web"
 )
+
+// devUIEnv, when set, points at a local Vite dev server (e.g.
+// http://localhost:5173) that the root handler reverse-proxies to instead
+// of serving the embedded dashboard build — used for dashboard hot-reload
+// during development.
+const devUIEnv = "BASEPOD_DEV_UI"
 
 // Version is the running BasePod version, threaded into the REST API's
 // /system endpoint. cmd/basepod sets this from its own build-time Version
@@ -84,7 +95,18 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: ensure caddy: %w", err)
 	}
 
-	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain)
+	encKey, err := crypto.LoadOrCreateKey(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("server: load encryption key: %w", err)
+	}
+	decrypt := func(sealed string) (string, error) {
+		return crypto.Open(encKey, sealed)
+	}
+	encrypt := func(plaintext string) (string, error) {
+		return crypto.Seal(encKey, plaintext)
+	}
+
+	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt)
 
 	// Reconcile: the Caddy config file is rebuilt from DB truth on every
 	// boot, rather than trusting whatever current.json happened to
@@ -99,7 +121,7 @@ func Run(ctx context.Context, cfgPath string) error {
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
-		Handler: api.New(st, engine, pc.Ping, Version),
+		Handler: rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs)),
 	}
 
 	log.Printf("basepod: listening on %s", cfg.Listen)
@@ -126,4 +148,37 @@ func Run(ctx context.Context, cfgPath string) error {
 		}
 		return nil
 	}
+}
+
+// rootHandler composes the process's single HTTP server: apiHandler (as
+// returned by api.New, which routes everything under /api/v1 itself)
+// handles /api/*, and the dashboard handles everything else. The
+// dashboard is normally the embedded, built-in-the-binary web.Handler();
+// if BASEPOD_DEV_UI is set to a Vite dev server URL (e.g.
+// http://localhost:5173), requests to / are reverse-proxied there instead
+// so the dashboard can be edited with hot-reload against a real running
+// control plane.
+func rootHandler(apiHandler http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/api/", apiHandler)
+	mux.Handle("/", dashboardHandler())
+	return mux
+}
+
+// dashboardHandler returns the embedded dashboard, or a reverse proxy to
+// a local dev server when BASEPOD_DEV_UI is set.
+func dashboardHandler() http.Handler {
+	devUI := os.Getenv(devUIEnv)
+	if devUI == "" {
+		return web.Handler()
+	}
+
+	target, err := url.Parse(devUI)
+	if err != nil {
+		log.Printf("basepod: invalid %s=%q, serving the embedded dashboard instead: %v", devUIEnv, devUI, err)
+		return web.Handler()
+	}
+
+	log.Printf("basepod: %s set — proxying / to dev server %s", devUIEnv, target)
+	return httputil.NewSingleHostReverseProxy(target)
 }

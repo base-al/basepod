@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pressly/goose/v3"
@@ -40,14 +41,34 @@ type App struct {
 	Status   string
 }
 
-// Deployment is a single deploy attempt for an App.
+// Deployment is a single deploy attempt for an App. StartedAt is always
+// set (RFC3339 UTC); FinishedAt is "" until the deployment reaches a
+// terminal status (see FinishDeployment).
 type Deployment struct {
+	ID         int64
+	AppID      int64
+	Number     int
+	ImageRef   string
+	Status     string
+	Error      string
+	StartedAt  string
+	FinishedAt string
+}
+
+// EnvVar is an environment variable for an App.
+type EnvVar struct {
+	ID             int64
+	AppID          int64
+	Key            string
+	ValueEncrypted string
+	IsSecret       bool
+}
+
+// Domain is a hostname mapped to an App.
+type Domain struct {
 	ID       int64
 	AppID    int64
-	Number   int
-	ImageRef string
-	Status   string
-	Error    string
+	Hostname string
 }
 
 // Store wraps a SQLite database connection.
@@ -234,12 +255,17 @@ func (s *Store) DeleteApp(id int64) error {
 
 // CreateDeployment inserts a new deployment for appID. The Number is
 // per-app max+1 (starting at 1), and Status starts "deploying".
+// started_at is set explicitly (rather than left to the column's SQL
+// default) so the returned Deployment's StartedAt matches exactly what
+// was persisted.
 func (s *Store) CreateDeployment(appID int64, imageRef string) (*Deployment, error) {
 	var n int
 	if err := s.db.QueryRow(`SELECT COALESCE(MAX(number), 0) + 1 FROM deployments WHERE app_id = ?`, appID).Scan(&n); err != nil {
 		return nil, err
 	}
-	res, err := s.db.Exec(`INSERT INTO deployments(app_id, number, image_ref) VALUES(?, ?, ?)`, appID, n, imageRef)
+	startedAt := time.Now().UTC().Format(timeFormat)
+	res, err := s.db.Exec(`INSERT INTO deployments(app_id, number, image_ref, started_at) VALUES(?, ?, ?, ?)`,
+		appID, n, imageRef, startedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -247,7 +273,7 @@ func (s *Store) CreateDeployment(appID int64, imageRef string) (*Deployment, err
 	if err != nil {
 		return nil, err
 	}
-	return &Deployment{ID: id, AppID: appID, Number: n, ImageRef: imageRef, Status: "deploying"}, nil
+	return &Deployment{ID: id, AppID: appID, Number: n, ImageRef: imageRef, Status: "deploying", StartedAt: startedAt}, nil
 }
 
 // FinishDeployment sets a deployment's terminal status and error message,
@@ -260,7 +286,7 @@ func (s *Store) FinishDeployment(id int64, status, errMsg string) error {
 
 // ListDeployments returns all deployments for appID, newest first.
 func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
-	rows, err := s.db.Query(`SELECT id, app_id, number, image_ref, status, error
+	rows, err := s.db.Query(`SELECT id, app_id, number, image_ref, status, error, started_at, finished_at
 		FROM deployments WHERE app_id = ? ORDER BY number DESC`, appID)
 	if err != nil {
 		return nil, err
@@ -270,10 +296,182 @@ func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
 	var deployments []Deployment
 	for rows.Next() {
 		var d Deployment
-		if err := rows.Scan(&d.ID, &d.AppID, &d.Number, &d.ImageRef, &d.Status, &d.Error); err != nil {
+		var finishedAt sql.NullString
+		if err := rows.Scan(&d.ID, &d.AppID, &d.Number, &d.ImageRef, &d.Status, &d.Error, &d.StartedAt, &finishedAt); err != nil {
 			return nil, err
 		}
+		d.FinishedAt = finishedAt.String
 		deployments = append(deployments, d)
 	}
 	return deployments, rows.Err()
+}
+
+// UpsertEnvVar inserts or updates an environment variable for appID.
+func (s *Store) UpsertEnvVar(appID int64, key, valueEncrypted string, isSecret bool) error {
+	_, err := s.db.Exec(`INSERT INTO env_vars(app_id, key, value_encrypted, is_secret)
+		VALUES(?, ?, ?, ?) ON CONFLICT(app_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, is_secret = excluded.is_secret`,
+		appID, key, valueEncrypted, isSecret)
+	return err
+}
+
+// DeleteEnvVar removes an environment variable for appID by key.
+func (s *Store) DeleteEnvVar(appID int64, key string) error {
+	_, err := s.db.Exec(`DELETE FROM env_vars WHERE app_id = ? AND key = ?`, appID, key)
+	return err
+}
+
+// ReplaceEnvVars replaces appID's entire env var set in a single
+// transaction: every entry in vars is upserted, and every existing key
+// not present in vars is deleted. This is what backs a full-replace PUT
+// — doing the upserts and prunes as individual statements outside a
+// transaction would risk leaving a mix of old and new values if one of
+// them failed partway through.
+func (s *Store) ReplaceEnvVars(appID int64, vars []EnvVar) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT key FROM env_vars WHERE app_id = ?`, appID)
+	if err != nil {
+		return err
+	}
+	var existingKeys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			rows.Close()
+			return err
+		}
+		existingKeys = append(existingKeys, k)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	keep := make(map[string]bool, len(vars))
+	for _, v := range vars {
+		keep[v.Key] = true
+		if _, err := tx.Exec(`INSERT INTO env_vars(app_id, key, value_encrypted, is_secret)
+			VALUES(?, ?, ?, ?) ON CONFLICT(app_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, is_secret = excluded.is_secret`,
+			appID, v.Key, v.ValueEncrypted, v.IsSecret); err != nil {
+			return err
+		}
+	}
+
+	for _, k := range existingKeys {
+		if keep[k] {
+			continue
+		}
+		if _, err := tx.Exec(`DELETE FROM env_vars WHERE app_id = ? AND key = ?`, appID, k); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ListEnvVars returns all environment variables for appID, ordered by key.
+func (s *Store) ListEnvVars(appID int64) ([]EnvVar, error) {
+	rows, err := s.db.Query(`SELECT id, app_id, key, value_encrypted, is_secret
+		FROM env_vars WHERE app_id = ? ORDER BY key`, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var envVars []EnvVar
+	for rows.Next() {
+		var ev EnvVar
+		var isSecret int
+		if err := rows.Scan(&ev.ID, &ev.AppID, &ev.Key, &ev.ValueEncrypted, &isSecret); err != nil {
+			return nil, err
+		}
+		ev.IsSecret = isSecret != 0
+		envVars = append(envVars, ev)
+	}
+	return envVars, rows.Err()
+}
+
+func scanDomain(row *sql.Row) (*Domain, error) {
+	var d Domain
+	err := row.Scan(&d.ID, &d.AppID, &d.Hostname)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// AddDomain adds a domain for appID. Returns ErrNotFound if appID does not exist.
+// Returns an error if the hostname already exists (UNIQUE constraint).
+func (s *Store) AddDomain(appID int64, hostname string) (*Domain, error) {
+	res, err := s.db.Exec(`INSERT INTO domains(app_id, hostname) VALUES(?, ?)`, appID, hostname)
+	if err != nil {
+		// Map FOREIGN KEY constraint violation to ErrNotFound
+		if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &Domain{ID: id, AppID: appID, Hostname: hostname}, nil
+}
+
+// ListDomains returns all domains for appID.
+func (s *Store) ListDomains(appID int64) ([]Domain, error) {
+	rows, err := s.db.Query(`SELECT id, app_id, hostname FROM domains WHERE app_id = ?`, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var domains []Domain
+	for rows.Next() {
+		var d Domain
+		if err := rows.Scan(&d.ID, &d.AppID, &d.Hostname); err != nil {
+			return nil, err
+		}
+		domains = append(domains, d)
+	}
+	return domains, rows.Err()
+}
+
+// ListAllDomains returns all domains across all apps.
+func (s *Store) ListAllDomains() ([]Domain, error) {
+	rows, err := s.db.Query(`SELECT id, app_id, hostname FROM domains`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var domains []Domain
+	for rows.Next() {
+		var d Domain
+		if err := rows.Scan(&d.ID, &d.AppID, &d.Hostname); err != nil {
+			return nil, err
+		}
+		domains = append(domains, d)
+	}
+	return domains, rows.Err()
+}
+
+// DeleteDomain removes a domain by ID.
+func (s *Store) DeleteDomain(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM domains WHERE id = ?`, id)
+	return err
+}
+
+// DomainByHostname looks up a domain by hostname. Returns ErrNotFound if none exists.
+func (s *Store) DomainByHostname(hostname string) (*Domain, error) {
+	row := s.db.QueryRow(`SELECT id, app_id, hostname FROM domains WHERE hostname = ?`, hostname)
+	return scanDomain(row)
 }

@@ -4,7 +4,10 @@
 
 # frontend
 node_modules/
-web/dist/
+web/dist/*
+!web/dist/index.html
+web/auto-imports.d.ts
+web/components.d.ts
 
 # local state
 *.db

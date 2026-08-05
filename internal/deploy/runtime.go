@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"io"
 
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/podman"
@@ -17,6 +18,7 @@ type Runtime interface {
 	RemoveContainer(ctx context.Context, id string, force bool) error
 	InspectContainer(ctx context.Context, nameOrID string) (*podman.ContainerInfo, error)
 	ListContainers(ctx context.Context, labelFilters map[string]string) ([]podman.ContainerInfo, error)
+	ContainerLogs(ctx context.Context, nameOrID string, follow bool, tail int) (io.ReadCloser, error)
 }
 
 // Prober checks that an upstream ("host:port" reachable on the basepod

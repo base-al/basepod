@@ -220,7 +220,7 @@ func TestApplyWritesAndReloads(t *testing.T) {
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
-	routes := []AppRoute{{Slug: "blog", Hostname: "blog.apps.example.com", Upstream: "bp-blog:8080"}}
+	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
 	if err := mgr.Apply(context.Background(), routes); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

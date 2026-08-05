@@ -2,15 +2,20 @@
 # shellcheck disable=SC2329 # several functions below are only invoked
 # indirectly, by name, via wait_for() or the EXIT trap.
 #
-# scripts/e2e-local.sh — BasePod v0.1 end-to-end smoke test.
+# scripts/e2e-local.sh — BasePod end-to-end smoke test.
 #
 # Builds the basepod binary, runs `setup` + `server` against throwaway temp
 # dirs and ports, then drives the full API flow (login -> create app ->
-# deploy -> HTTPS fetch -> redeploy -> delete) exactly as described in the
-# v0.1 walking-skeleton exit criteria. Safe to run repeatedly on a dev
-# machine or in CI (GitHub Actions ubuntu-24.04 runner with rootless
-# podman); requires a reachable podman socket (`podman machine start` on
-# macOS, `systemctl --user enable --now podman.socket` on Linux).
+# deploy -> HTTPS fetch -> redeploy -> delete) as described in the v0.1
+# walking-skeleton exit criteria, plus (added in v0.2) env vars (PUT/GET
+# masking, redeploy-injects-into-container via podman inspect), custom
+# domains (POST/DELETE against the rendered Caddy config), log streaming
+# (finite SSE fetch, query-token auth scoped to the logs route only), and
+# the dashboard's static asset pipeline (hashed asset + immutable
+# Cache-Control). Safe to run repeatedly on a dev machine or in CI
+# (GitHub Actions ubuntu-24.04 runner with rootless podman); requires a
+# reachable podman socket (`podman machine start` on macOS,
+# `systemctl --user enable --now podman.socket` on Linux).
 #
 # Compatible with bash 3.2 (macOS's default /bin/bash): no associative
 # arrays, no mapfile, no `readlink -f`.
@@ -182,6 +187,20 @@ if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
 	fail "server process exited during startup — see log above"
 fi
 
+index_html=$(curl -s --max-time 10 "${API_BASE}/")
+printf '%s' "${index_html}" | grep -q '<div id="app"' || fail "dashboard shell not served at /"
+
+# One hashed /assets/* file referenced by the served shell must exist and
+# carry the long-lived immutable cache header (web/embed.go's
+# setCacheHeaders) — the SPA-shell check above only proves index.html
+# itself renders, not that its asset pipeline is wired up end-to-end.
+asset_path=$(printf '%s' "${index_html}" | grep -o 'src="/assets/[^"]*"' | head -n1 | sed 's/^src="//;s/"$//')
+[ -n "${asset_path}" ] || fail "could not find a hashed /assets/ path in served index.html"
+
+asset_headers=$(curl -s -D - -o /dev/null --max-time 10 "${API_BASE}${asset_path}")
+printf '%s' "${asset_headers}" | grep -qi '^HTTP/[0-9.]* 200' || fail "asset ${asset_path} did not return 200: ${asset_headers}"
+printf '%s' "${asset_headers}" | grep -qi '^Cache-Control:.*immutable' || fail "asset ${asset_path} missing immutable Cache-Control: ${asset_headers}"
+
 # ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
@@ -193,6 +212,16 @@ TOKEN=$(printf '%s' "${login_resp}" | jq -r '.token // empty')
 
 auth_curl() {
 	curl -s --max-time 10 -H "Authorization: Bearer ${TOKEN}" "$@"
+}
+
+# deploy_curl is auth_curl's variant for /deploy calls specifically: a
+# deploy pulls an image and polls health probes synchronously inside the
+# handler (bounded server-side by deployTimeout, 5 minutes — see
+# internal/api.deployTimeout), so it can legitimately take much longer
+# than the 10s budget every other call in this script gets, especially on
+# a loaded CI runner doing its second or third cutover in a row.
+deploy_curl() {
+	curl -s --max-time 90 -H "Authorization: Bearer ${TOKEN}" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -208,7 +237,7 @@ created_slug=$(printf '%s' "${create_resp}" | jq -r '.slug // empty')
 # First deploy
 # ---------------------------------------------------------------------------
 log "deploying (1st generation)..."
-deploy1_resp=$(auth_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
+deploy1_resp=$(deploy_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
 deploy1_status=$(printf '%s' "${deploy1_resp}" | jq -r '.status // empty')
 [ "${deploy1_status}" = "healthy" ] || fail "first deploy failed: ${deploy1_resp}"
 
@@ -228,7 +257,7 @@ gen1_names=$(podman ps --filter "label=basepod.app=${SLUG}" --format '{{.Names}}
 # Second deploy — same image, must cut over to bp-<slug>-2 and remove -1
 # ---------------------------------------------------------------------------
 log "deploying (2nd generation)..."
-deploy2_resp=$(auth_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
+deploy2_resp=$(deploy_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
 deploy2_status=$(printf '%s' "${deploy2_resp}" | jq -r '.status // empty')
 [ "${deploy2_status}" = "healthy" ] || fail "second deploy failed: ${deploy2_resp}"
 
@@ -244,6 +273,93 @@ fi
 if ! wait_for "whoami reachable over HTTPS after redeploy" "${MAX_WAIT}" whoami_up; then
 	fail "whoami app not reachable via HTTPS after redeploy within ${MAX_WAIT}s"
 fi
+
+# ---------------------------------------------------------------------------
+# Env vars — PUT masks secrets in its response, a redeploy actually injects
+# them into the new container, and GET keeps masking afterward. Run before
+# the app's final delete below (this section, domains, and logs all need a
+# live app).
+# ---------------------------------------------------------------------------
+log "setting env vars for '${SLUG}'..."
+env_put_resp=$(auth_curl -X PUT "${API_BASE}/api/v1/apps/${SLUG}/env" \
+	-d '[{"key":"E2E_FOO","value":"bar123","is_secret":false},{"key":"E2E_SECRET","value":"shh","is_secret":true}]')
+
+put_secret_value=$(printf '%s' "${env_put_resp}" | jq -r '.[] | select(.key=="E2E_SECRET") | .value')
+[ "${put_secret_value}" = "" ] || fail "PUT env: E2E_SECRET value not masked in response: ${env_put_resp}"
+put_foo_value=$(printf '%s' "${env_put_resp}" | jq -r '.[] | select(.key=="E2E_FOO") | .value')
+[ "${put_foo_value}" = "bar123" ] || fail "PUT env: E2E_FOO value wrong in response: ${env_put_resp}"
+
+log "redeploying to pick up env vars (3rd generation)..."
+deploy3_resp=$(deploy_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
+deploy3_status=$(printf '%s' "${deploy3_resp}" | jq -r '.status // empty')
+[ "${deploy3_status}" = "healthy" ] || fail "env redeploy failed: ${deploy3_resp}"
+
+only_gen3_running() {
+	names=$(podman ps --filter "label=basepod.app=${SLUG}" --format '{{.Names}}' 2>/dev/null || true)
+	[ "${names}" = "bp-${SLUG}-3" ]
+}
+if ! wait_for "exactly bp-${SLUG}-3 running (bp-${SLUG}-2 removed)" "${MAX_WAIT}" only_gen3_running; then
+	got=$(podman ps -a --filter "label=basepod.app=${SLUG}" --format '{{.Names}}' 2>/dev/null || true)
+	fail "expected exactly bp-${SLUG}-3 after env redeploy, got: ${got}"
+fi
+
+log "verifying the new container's env via podman inspect..."
+container_env=$(podman inspect "bp-${SLUG}-3" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)
+printf '%s\n' "${container_env}" | grep -qxF "E2E_FOO=bar123" || fail "bp-${SLUG}-3 env missing E2E_FOO=bar123: ${container_env}"
+printf '%s\n' "${container_env}" | grep -qxF "E2E_SECRET=shh" || fail "bp-${SLUG}-3 env missing E2E_SECRET=shh: ${container_env}"
+
+log "verifying GET env still masks the secret..."
+env_get_resp=$(auth_curl "${API_BASE}/api/v1/apps/${SLUG}/env")
+get_secret_value=$(printf '%s' "${env_get_resp}" | jq -r '.[] | select(.key=="E2E_SECRET") | .value')
+[ "${get_secret_value}" = "" ] || fail "GET env: E2E_SECRET value not masked: ${env_get_resp}"
+
+# ---------------------------------------------------------------------------
+# Domains — a custom hostname must land in Caddy's rendered config on
+# POST, and disappear from it on DELETE.
+# ---------------------------------------------------------------------------
+CADDY_CONFIG="${DATA_DIR}/caddy/current.json"
+CUSTOM_DOMAIN=e2e-custom.example.com
+
+log "adding custom domain '${CUSTOM_DOMAIN}'..."
+domain_raw=$(auth_curl -w '\n%{http_code}' -X POST "${API_BASE}/api/v1/apps/${SLUG}/domains" \
+	-d "{\"hostname\":\"${CUSTOM_DOMAIN}\"}")
+domain_code=$(printf '%s' "${domain_raw}" | tail -n1)
+domain_body=$(printf '%s' "${domain_raw}" | sed '$d')
+[ "${domain_code}" = "201" ] || fail "add domain: expected 201, got ${domain_code}: ${domain_body}"
+domain_id=$(printf '%s' "${domain_body}" | jq -r '.id // empty')
+[ -n "${domain_id}" ] || fail "add domain: no id in response: ${domain_body}"
+
+[ -f "${CADDY_CONFIG}" ] || fail "caddy config not found at ${CADDY_CONFIG}"
+grep -q "${CUSTOM_DOMAIN}" "${CADDY_CONFIG}" || fail "caddy config does not contain ${CUSTOM_DOMAIN} after POST"
+
+log "deleting custom domain '${CUSTOM_DOMAIN}'..."
+delete_domain_code=$(http_code -X DELETE -H "Authorization: Bearer ${TOKEN}" \
+	"${API_BASE}/api/v1/apps/${SLUG}/domains/${domain_id}")
+[ "${delete_domain_code}" = "204" ] || fail "delete domain: expected 204, got ${delete_domain_code}"
+
+if grep -q "${CUSTOM_DOMAIN}" "${CADDY_CONFIG}"; then
+	fail "caddy config still contains ${CUSTOM_DOMAIN} after DELETE"
+fi
+
+# ---------------------------------------------------------------------------
+# Logs — a finite (follow=0) SSE stream over the query-token auth path
+# must carry the app's own log output; query-token auth must NOT work on
+# any other route.
+# ---------------------------------------------------------------------------
+log "curling the app to generate a log line..."
+curl -sk --max-time 5 \
+	--resolve "${SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
+	"https://${SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}/" >/dev/null 2>&1 || true
+
+log "fetching a finite (follow=0) log stream..."
+logs_output=$(curl -sN --max-time 15 \
+	"${API_BASE}/api/v1/apps/${SLUG}/logs?follow=0&tail=50&access_token=${TOKEN}")
+printf '%s' "${logs_output}" | grep -q '^event: log$' || fail "logs stream missing an 'event: log' line: ${logs_output}"
+printf '%s' "${logs_output}" | grep -q '"stream"' || fail "logs stream missing a data line with a stream field: ${logs_output}"
+
+log "verifying query-token auth is rejected outside the logs route..."
+apps_query_token_code=$(http_code "${API_BASE}/api/v1/apps?access_token=${TOKEN}")
+[ "${apps_query_token_code}" = "401" ] || fail "expected /api/v1/apps with ?access_token= to be 401, got ${apps_query_token_code}"
 
 # ---------------------------------------------------------------------------
 # Delete app — route must be dropped from Caddy

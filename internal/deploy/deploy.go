@@ -13,14 +13,21 @@ import (
 	"io"
 	"os"
 	osexec "os/exec"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
 )
+
+// ErrNotRunning is returned by AppLogs when an app has no running
+// container to stream logs from (e.g. it was created but never deployed,
+// or its last deploy failed before any container reached "running").
+var ErrNotRunning = errors.New("deploy: app has no running container")
 
 // Engine drives app deployments: pull, create, start, probe, cut traffic
 // over, and tear down the previous container generation.
@@ -30,6 +37,31 @@ type Engine struct {
 	router     Router
 	probe      Prober
 	rootDomain string
+
+	// routesMu serializes every route render+apply critical section: the
+	// Routes() DB read paired with the router.Apply call that renders it,
+	// across ApplyRoutes (called directly by the API layer on domain
+	// add/delete, and internally by Deploy's cutover) and RemoveApp's
+	// filtered apply. These can run concurrently — e.g. a domain-add HTTP
+	// handler racing an in-flight deploy's cutover — and both write the
+	// same current.json.tmp (internal/caddy/manager.go writeFileAtomic),
+	// so an unserialized interleaving can splice two writers' output into
+	// a corrupt config, hit an ENOENT rename race that 502s a live
+	// request, or apply a stale route set that silently drops a
+	// just-added hostname. The lock must be held across the DB read too,
+	// not just the Apply call: "last write wins" here has to mean
+	// "rendered from the latest DB state at the time it ran", not just
+	// "the last Apply call physically completed last" — a Routes() read
+	// taken outside the lock could be stale by the time its Apply runs.
+	// It must NOT wrap all of Deploy: pulls and probes are slow and must
+	// not serialize with unrelated domain adds, so only the route-apply
+	// step is under this lock.
+	routesMu sync.Mutex
+
+	// decrypt turns an EnvVar.ValueEncrypted into its plaintext value.
+	// nil disables env injection entirely: Deploy fails rather than ship
+	// a container silently missing configured env vars (see Deploy).
+	decrypt func(string) (string, error)
 
 	// probeInterval and probeAttempts control the health-probe retry
 	// loop; they default to 1s/30 (New) and are unexported so tests can
@@ -44,13 +76,17 @@ type Engine struct {
 
 // New builds an Engine. rootDomain is appended to an app's slug to form
 // its hostname (e.g. rootDomain "apps.example.com" -> "blog.apps.example.com").
-func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string) *Engine {
+// decrypt turns a stored EnvVar's encrypted value into plaintext; pass nil
+// to disable env injection (Deploy then fails rather than silently
+// omitting configured env vars).
+func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(string) (string, error)) *Engine {
 	return &Engine{
 		st:            st,
 		rt:            rt,
 		router:        router,
 		probe:         probe,
 		rootDomain:    rootDomain,
+		decrypt:       decrypt,
 		probeInterval: time.Second,
 		probeAttempts: 30,
 		log:           os.Stderr,
@@ -88,6 +124,30 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 		NetworkAliases: []string{"bp-" + app.Slug},
 		RestartPolicy:  "always",
 	}
+
+	envVars, err := e.st.ListEnvVars(app.ID)
+	if err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: list env vars: %w", err))
+	}
+	if len(envVars) > 0 {
+		// A half-injected env must never ship silently: with no decrypt
+		// func the caller has env injection disabled entirely, so refuse
+		// to deploy an app that has configured env vars rather than
+		// starting it with them silently missing.
+		if e.decrypt == nil {
+			return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: app has env vars but env injection is disabled"))
+		}
+		env := make(map[string]string, len(envVars))
+		for _, ev := range envVars {
+			plain, err := e.decrypt(ev.ValueEncrypted)
+			if err != nil {
+				return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: decrypt env var %s: %w", ev.Key, err))
+			}
+			env[ev.Key] = plain
+		}
+		spec.Env = env
+	}
+
 	id, err := e.rt.CreateContainer(ctx, spec)
 	if err != nil {
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: create container: %w", err))
@@ -114,12 +174,8 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: mark running: %w", err))
 	}
 
-	routes, err := e.Routes()
-	if err != nil {
-		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: compute routes: %w", err))
-	}
-	if err := e.router.Apply(ctx, routes); err != nil {
-		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: apply routes: %w", err))
+	if err := e.ApplyRoutes(ctx); err != nil {
+		return e.fail(ctx, app, dep, id, err)
 	}
 
 	// Traffic is now on the new container's alias; only past this point
@@ -279,6 +335,15 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 		}
 	}
 
+	// See the routesMu field comment: this Routes()+filter+Apply sequence
+	// must run as one atomic critical section relative to ApplyRoutes
+	// (including Deploy's cutover, which calls it), so a concurrent
+	// deploy's cutover can never read a Routes() snapshot from before
+	// this removal, or write over the route set this call is about to
+	// apply.
+	e.routesMu.Lock()
+	defer e.routesMu.Unlock()
+
 	routes, err := e.Routes()
 	if err != nil {
 		return fmt.Errorf("deploy: compute routes: %w", err)
@@ -302,25 +367,105 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 }
 
 // Routes builds the current route set: every app whose store status is
-// "running", mapped to its stable alias upstream. The result is not
-// sorted; caddy.Render sorts by slug itself.
+// "running", mapped to its stable alias upstream and a Hostnames list —
+// the app's generated slug.rootDomain hostname first, followed by its
+// custom domains (from ListAllDomains) sorted lexically. The result is
+// not sorted by slug; caddy.Render sorts by slug itself.
 func (e *Engine) Routes() ([]caddy.AppRoute, error) {
 	apps, err := e.st.ListApps()
 	if err != nil {
 		return nil, fmt.Errorf("deploy: list apps: %w", err)
 	}
+	domains, err := e.st.ListAllDomains()
+	if err != nil {
+		return nil, fmt.Errorf("deploy: list domains: %w", err)
+	}
+	// Group the single ListAllDomains query by app rather than issuing a
+	// ListDomains query per app.
+	customByApp := make(map[int64][]string, len(domains))
+	for _, d := range domains {
+		customByApp[d.AppID] = append(customByApp[d.AppID], d.Hostname)
+	}
+
 	var routes []caddy.AppRoute
 	for _, a := range apps {
 		if a.Status != "running" {
 			continue
 		}
+		custom := customByApp[a.ID]
+		sort.Strings(custom)
+		hostnames := append([]string{a.Slug + "." + e.rootDomain}, custom...)
 		routes = append(routes, caddy.AppRoute{
-			Slug:     a.Slug,
-			Hostname: a.Slug + "." + e.rootDomain,
-			Upstream: fmt.Sprintf("bp-%s:%d", a.Slug, a.Port),
+			Slug:      a.Slug,
+			Hostnames: hostnames,
+			Upstream:  fmt.Sprintf("bp-%s:%d", a.Slug, a.Port),
 		})
 	}
 	return routes, nil
+}
+
+// ApplyRoutes recomputes the current route set via Routes and pushes it
+// to the router (Caddy). It's the shared Routes()+router.Apply sequence
+// used by Deploy on every successful cutover, and is exported so the API
+// layer can trigger a route refresh directly (e.g. after a domain is
+// added or removed) without going through a deploy.
+func (e *Engine) ApplyRoutes(ctx context.Context) error {
+	// See the routesMu field comment: the DB read (Routes) and the apply
+	// (router.Apply) must run as one atomic critical section relative to
+	// RemoveApp's and any other ApplyRoutes call's own Routes()+Apply
+	// pair.
+	e.routesMu.Lock()
+	defer e.routesMu.Unlock()
+
+	routes, err := e.Routes()
+	if err != nil {
+		return fmt.Errorf("deploy: compute routes: %w", err)
+	}
+	if err := e.router.Apply(ctx, routes); err != nil {
+		return fmt.Errorf("deploy: apply routes: %w", err)
+	}
+	return nil
+}
+
+// AppLogs streams a running app's container logs. The returned
+// ReadCloser is the raw, still-multiplexed stream straight from the
+// runtime (see podman.DemuxLogs) — the caller owns closing it, which
+// matters in particular for follow=true, whose stream never ends on its
+// own.
+//
+// It looks the app up by slug — ErrNotFound passes through unchanged
+// from the store lookup — then finds its running container via
+// ListContainers filtered by the basepod.managed+basepod.app labels,
+// picking the one with State=="running" (Deploy always tears down prior
+// generations before returning, so at most one should ever be running).
+// If none is running, it returns ErrNotRunning.
+func (e *Engine) AppLogs(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error) {
+	app, err := e.st.AppBySlug(slug)
+	if err != nil {
+		return nil, err
+	}
+
+	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
+	if err != nil {
+		return nil, fmt.Errorf("deploy: list containers for %s: %w", app.Slug, err)
+	}
+
+	var id string
+	for _, c := range containers {
+		if c.State == "running" {
+			id = c.ID
+			break
+		}
+	}
+	if id == "" {
+		return nil, ErrNotRunning
+	}
+
+	rc, err := e.rt.ContainerLogs(ctx, id, follow, tail)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: logs for %s: %w", app.Slug, err)
+	}
+	return rc, nil
 }
 
 // CaddyProber returns a Prober that checks an upstream by running a

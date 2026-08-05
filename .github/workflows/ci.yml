@@ -8,6 +8,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci && npm run build && npm run type-check
       - uses: actions/setup-go@v5
         with: {go-version: 'stable'}
       - run: go vet ./...
@@ -18,6 +24,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci && npm run build
       - uses: actions/setup-go@v5
         with: {go-version: 'stable'}
       - run: podman version   # preinstalled on ubuntu-24.04 runners

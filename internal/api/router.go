@@ -8,6 +8,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,6 +34,25 @@ type Deployer interface {
 // by (*podman.Client).Ping.
 type Pinger func(ctx context.Context) error
 
+// RoutesApplier recomputes and pushes the current route set to the router
+// (Caddy). It is declared here (rather than the API depending on package
+// deploy's concrete Engine type) so handlers can be tested against a fake
+// instead of a real container runtime. *deploy.Engine satisfies this
+// interface; see the compile-time assertion in api_test.go.
+type RoutesApplier interface {
+	ApplyRoutes(ctx context.Context) error
+}
+
+// LogSource streams a running app's raw (still-multiplexed — see
+// podman.DemuxLogs) container log data by slug. It is declared here
+// (rather than the API depending on package deploy's concrete Engine
+// type) so handlers can be tested against a fake instead of a real
+// container runtime; *deploy.Engine's AppLogs method satisfies it. It
+// must return store.ErrNotFound for an unknown slug and deploy.ErrNotRunning
+// when the app has no running container — handleAppLogs maps both to the
+// documented HTTP status/error codes.
+type LogSource func(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error)
+
 // deployTimeout bounds a single deploy request. v0.1 deploys run
 // synchronously inside the HTTP handler (no SSE build-log streaming until
 // v0.2's real builds), so a stuck pull or health-probe loop must not hang
@@ -56,16 +76,34 @@ type api struct {
 	ping    Pinger
 	version string
 	limiter *rateLimiter
+
+	// seal/open encrypt and decrypt EnvVar.ValueEncrypted values. They
+	// close over the process's encryption key (see internal/crypto) so
+	// this package never handles the raw key itself.
+	seal func(string) (string, error)
+	open func(string) (string, error)
+
+	// routes recomputes and pushes the current route set to the router
+	// (Caddy) after a domain is added or removed.
+	routes RoutesApplier
+
+	// logs streams an app's raw container log data for handleAppLogs to
+	// demux into SSE events.
+	logs LogSource
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
-func New(st *store.Store, dep Deployer, ping Pinger, version string) http.Handler {
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier, logs LogSource) http.Handler {
 	a := &api{
 		st:      st,
 		dep:     dep,
 		ping:    ping,
 		version: version,
 		limiter: newRateLimiter(loginRateLimit, loginRateWindow),
+		seal:    seal,
+		open:    open,
+		routes:  routes,
+		logs:    logs,
 	}
 
 	r := chi.NewRouter()
@@ -81,6 +119,20 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string) http.Handle
 			r.Get("/apps/{slug}", a.handleGetApp)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)
+			r.Get("/apps/{slug}/env", a.handleGetEnv)
+			r.Put("/apps/{slug}/env", a.handlePutEnv)
+			r.Get("/apps/{slug}/domains", a.handleListDomains)
+			r.Post("/apps/{slug}/domains", a.handleAddDomain)
+			r.Delete("/apps/{slug}/domains/{id}", a.handleDeleteDomain)
+		})
+
+		// The logs route gets its own auth middleware rather than
+		// requireAuth: native EventSource cannot set an Authorization
+		// header, so this route (and only this route) also accepts the
+		// session token via ?access_token=. See requireAuthLogs.
+		r.Group(func(r chi.Router) {
+			r.Use(a.requireAuthLogs)
+			r.Get("/apps/{slug}/logs", a.handleAppLogs)
 		})
 	})
 	return r
@@ -89,6 +141,23 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string) http.Handle
 // userContextKey is the context key holding the authenticated *store.User,
 // set by requireAuth.
 type userContextKey struct{}
+
+// validateToken resolves a raw session token (however it was transported)
+// into its *store.User via the session-hash lookup, or reports false if
+// the token is missing/unknown/expired. Shared by requireAuth and
+// requireAuthLogs so their validation logic — which must stay identical,
+// a query token being an alternate transport for the same credential, not
+// a weaker one — can't silently drift apart.
+func (a *api) validateToken(token string) (*store.User, bool) {
+	if token == "" {
+		return nil, false
+	}
+	user, err := a.st.UserBySessionTokenHash(auth.HashToken(token))
+	if err != nil {
+		return nil, false
+	}
+	return user, true
+}
 
 // requireAuth resolves "Authorization: Bearer <token>" into a *store.User
 // and attaches it to the request context, or fails the request with 401
@@ -102,8 +171,45 @@ func (a *api) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		user, err := a.st.UserBySessionTokenHash(auth.HashToken(token))
-		if err != nil {
+		user, ok := a.validateToken(token)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired session")
+			return
+		}
+
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
+	})
+}
+
+// requireAuthLogs is requireAuth's variant for the log-streaming route
+// only: native EventSource cannot set request headers, so a browser
+// client has no way to send "Authorization: Bearer <token>" when opening
+// the stream. This middleware therefore also accepts the session token as
+// a ?access_token= query parameter, tried only after the Authorization
+// header comes up empty (so a valid header always wins over a query
+// token, bogus or not — see TestHandleAppLogsBearerPrecedenceOverQueryToken
+// in logs_test.go), and validated through the exact same validateToken
+// helper requireAuth uses.
+//
+// This fallback is deliberately wired to this one route (see the router
+// group above) rather than folded into requireAuth: query strings end up
+// in access logs, browser history, and Referer headers far more readily
+// than headers do, so every other endpoint should keep requiring the
+// header. The token itself is never logged or echoed back by this
+// middleware or handleAppLogs's error paths.
+func (a *api) requireAuthLogs(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || token == "" {
+			token = r.URL.Query().Get("access_token")
+		}
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization")
+			return
+		}
+
+		user, ok := a.validateToken(token)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired session")
 			return
 		}

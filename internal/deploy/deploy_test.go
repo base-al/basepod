@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,6 +39,24 @@ type fakeRuntime struct {
 	// IDs — used to make exactly one container in a multi-container
 	// teardown fail while the rest succeed.
 	removeErrIDs map[string]error
+
+	// createdSpecs records the full CreateSpec passed to CreateContainer,
+	// keyed by container name, so tests can assert on fields (like Env)
+	// that ContainerInfo doesn't carry.
+	createdSpecs map[string]podman.CreateSpec
+
+	// logsReader/logsErr script ContainerLogs; logsCalls records every
+	// call's arguments for assertions.
+	logsReader io.ReadCloser
+	logsErr    error
+	logsCalls  []loggedCall
+}
+
+// loggedCall records one ContainerLogs invocation.
+type loggedCall struct {
+	nameOrID string
+	follow   bool
+	tail     int
 }
 
 func newFakeRuntime(ops *[]string) *fakeRuntime {
@@ -62,10 +84,12 @@ func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpe
 	f.nextID++
 	id := fmt.Sprintf("c%d", f.nextID)
 	labels := map[string]string{}
-	for k, v := range spec.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, spec.Labels)
 	f.containers[id] = podman.ContainerInfo{ID: id, Name: spec.Name, State: "created", Labels: labels}
+	if f.createdSpecs == nil {
+		f.createdSpecs = map[string]podman.CreateSpec{}
+	}
+	f.createdSpecs[spec.Name] = spec
 	f.record("create:" + spec.Name)
 	return id, nil
 }
@@ -154,6 +178,20 @@ func (f *fakeRuntime) ListContainers(ctx context.Context, labelFilters map[strin
 	return out, nil
 }
 
+func (f *fakeRuntime) ContainerLogs(ctx context.Context, nameOrID string, follow bool, tail int) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.logsCalls = append(f.logsCalls, loggedCall{nameOrID: nameOrID, follow: follow, tail: tail})
+	if f.logsErr != nil {
+		return nil, f.logsErr
+	}
+	if f.logsReader != nil {
+		return f.logsReader, nil
+	}
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
 // fakeRouter is a test double for Router.
 type fakeRouter struct {
 	ops        *[]string
@@ -167,6 +205,74 @@ func (f *fakeRouter) Apply(ctx context.Context, routes []caddy.AppRoute) error {
 	f.calls++
 	f.lastRoutes = routes
 	return f.applyErr
+}
+
+// blockingRouter is a test double for Router whose Apply blocks until
+// release() is called, and tracks how many Apply calls are concurrently
+// in flight. It exists to prove routesMu serializes the Routes()+Apply
+// critical section: entered fires the instant a call is inside Apply
+// (i.e. holding routesMu), and maxInFlight() reports whether any two
+// Apply calls were ever in flight at once — see
+// TestApplyRoutesSerializesConcurrentCalls (I1).
+type blockingRouter struct {
+	mu       sync.Mutex
+	inFlight int
+	maxSeen  int
+	calls    [][]caddy.AppRoute
+
+	entered chan struct{}
+	block   chan struct{}
+}
+
+func newBlockingRouter() *blockingRouter {
+	return &blockingRouter{
+		entered: make(chan struct{}, 4),
+		block:   make(chan struct{}),
+	}
+}
+
+func (r *blockingRouter) Apply(ctx context.Context, routes []caddy.AppRoute) error {
+	r.mu.Lock()
+	r.inFlight++
+	if r.inFlight > r.maxSeen {
+		r.maxSeen = r.inFlight
+	}
+	r.mu.Unlock()
+
+	r.entered <- struct{}{}
+	<-r.block // released by the test once it's done setting up the race
+
+	r.mu.Lock()
+	r.inFlight--
+	// Copy: the caller (ApplyRoutes) owns routes's backing array and
+	// nothing here should alias it past this call.
+	cp := append([]caddy.AppRoute(nil), routes...)
+	r.calls = append(r.calls, cp)
+	r.mu.Unlock()
+	return nil
+}
+
+// release unblocks every Apply call currently (or later) parked on
+// <-r.block. It's called once, after the race is set up, which is safe
+// because closing a channel unblocks all current and future receivers.
+func (r *blockingRouter) release() { close(r.block) }
+
+func (r *blockingRouter) maxInFlight() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxSeen
+}
+
+func (r *blockingRouter) callAt(i int) []caddy.AppRoute {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[i]
+}
+
+func (r *blockingRouter) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
 }
 
 // fakeProber is a test double for Prober. failUpstream, if non-empty,
@@ -209,7 +315,7 @@ func newTestEngine(t *testing.T, st *store.Store) (*Engine, *fakeRuntime, *fakeR
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost")
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	return eng, rt, router, prober, ops
@@ -266,8 +372,8 @@ func TestDeployHappyPath(t *testing.T) {
 	if router.calls != 1 {
 		t.Fatalf("router.calls = %d, want 1", router.calls)
 	}
-	want := []caddy.AppRoute{{Slug: "blog", Hostname: "blog.apps.localhost", Upstream: "bp-blog:80"}}
-	if len(router.lastRoutes) != 1 || router.lastRoutes[0] != want[0] {
+	want := []caddy.AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.localhost"}, Upstream: "bp-blog:80"}}
+	if len(router.lastRoutes) != 1 || !reflect.DeepEqual(router.lastRoutes[0], want[0]) {
 		t.Errorf("router.lastRoutes = %+v, want %+v", router.lastRoutes, want)
 	}
 
@@ -432,6 +538,220 @@ func TestFailedPull(t *testing.T) {
 	}
 }
 
+// TestDeployInjectsDecryptedEnv proves Deploy reads the app's env vars,
+// decrypts each ValueEncrypted through the Engine's decrypt func, and
+// passes the resulting plaintext map as CreateSpec.Env to CreateContainer.
+func TestDeployInjectsDecryptedEnv(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	decrypt := func(s string) (string, error) { return "plain-" + s, nil }
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt)
+	eng.probeInterval = time.Millisecond
+	eng.probeAttempts = 5
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:old", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertEnvVar(app.ID, "FOO", "enc-foo", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertEnvVar(app.ID, "BAR", "enc-bar", true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.Deploy(ctx, app, "nginx:new"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	spec, ok := rt.createdSpecs["bp-blog-1"]
+	if !ok {
+		t.Fatal("CreateContainer spec not recorded for bp-blog-1")
+	}
+	want := map[string]string{"FOO": "plain-enc-foo", "BAR": "plain-enc-bar"}
+	if !reflect.DeepEqual(spec.Env, want) {
+		t.Errorf("spec.Env = %+v, want %+v", spec.Env, want)
+	}
+}
+
+// TestDeployFailsOnDecryptError proves that when decrypting a stored env
+// var fails, Deploy fails through the normal fail() path: no new
+// container is ever created, and the previous (old, healthy) container is
+// left completely untouched — a half-injected env must never ship.
+func TestDeployFailsOnDecryptError(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	decrypt := func(s string) (string, error) { return "", errors.New("bad key") }
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt)
+	eng.probeInterval = time.Millisecond
+	eng.probeAttempts = 5
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First deploy has no env vars yet, so decrypt is never invoked and
+	// this establishes a healthy "old" container for the assertion below.
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+
+	if err := st.UpsertEnvVar(app.ID, "FOO", "enc-foo", false); err != nil {
+		t.Fatal(err)
+	}
+
+	dep2, err := eng.Deploy(ctx, app, "nginx:v2")
+	if err == nil {
+		t.Fatal("expected error from decrypt failure")
+	}
+	if dep2.Status != "failed" {
+		t.Errorf("dep2.Status = %q, want failed", dep2.Status)
+	}
+	if dep2.Error == "" {
+		t.Error("dep2.Error empty, want decrypt failure message")
+	}
+
+	var oldID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			oldID = id
+		}
+		if c.Name == "bp-blog-2" {
+			t.Errorf("bp-blog-2 should never have been created (decrypt fails before CreateContainer), got %+v", c)
+		}
+	}
+	if oldID == "" {
+		t.Fatal("bp-blog-1 (old, healthy) should still exist")
+	}
+	if got := rt.containers[oldID]; got.State != "running" {
+		t.Errorf("bp-blog-1 state = %q, want still running (untouched)", got.State)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "running" {
+		t.Errorf("app.Status = %q, want running (old container still up)", gotApp.Status)
+	}
+	if gotApp.ImageRef != "nginx:v1" {
+		t.Errorf("app.ImageRef = %q, want unchanged nginx:v1", gotApp.ImageRef)
+	}
+}
+
+// TestDeployFailsWhenEnvInjectionDisabled proves that an app with stored
+// env vars fails to deploy when the Engine has no decrypt func (env
+// injection disabled) — a container must never start silently missing
+// its configured env, so this must go through the fail() path exactly
+// like a decrypt error: deployment marked failed, no new container ever
+// created, and an existing old container left untouched.
+func TestDeployFailsWhenEnvInjectionDisabled(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil) // decrypt disabled
+	eng.probeInterval = time.Millisecond
+	eng.probeAttempts = 5
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First deploy has no env vars yet, so it succeeds even with decrypt
+	// disabled, giving us a healthy "old" container to assert stays
+	// untouched below.
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+
+	if err := st.UpsertEnvVar(app.ID, "FOO", "enc-foo", false); err != nil {
+		t.Fatal(err)
+	}
+
+	dep2, err := eng.Deploy(ctx, app, "nginx:v2")
+	if err == nil {
+		t.Fatal("expected error: app has env vars but env injection is disabled")
+	}
+	if dep2.Status != "failed" {
+		t.Errorf("dep2.Status = %q, want failed", dep2.Status)
+	}
+	if dep2.Error == "" {
+		t.Error("dep2.Error empty, want env-injection-disabled failure message")
+	}
+
+	var oldID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			oldID = id
+		}
+		if c.Name == "bp-blog-2" {
+			t.Errorf("bp-blog-2 should never have been created (env-injection-disabled check runs before CreateContainer), got %+v", c)
+		}
+	}
+	if oldID == "" {
+		t.Fatal("bp-blog-1 (old, healthy) should still exist")
+	}
+	if got := rt.containers[oldID]; got.State != "running" {
+		t.Errorf("bp-blog-1 state = %q, want still running (untouched)", got.State)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "running" {
+		t.Errorf("app.Status = %q, want running (old container still up)", gotApp.Status)
+	}
+	if gotApp.ImageRef != "nginx:v1" {
+		t.Errorf("app.ImageRef = %q, want unchanged nginx:v1", gotApp.ImageRef)
+	}
+}
+
+// TestRoutesIncludeCustomDomains proves Routes() builds each running
+// app's Hostnames as [slug.rootDomain] followed by that app's custom
+// domains (from ListAllDomains), sorted lexically.
+func TestRoutesIncludeCustomDomains(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppStatus(app.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddDomain(app.ID, "blog.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddDomain(app.ID, "aaa.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err := eng.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("routes = %+v, want 1 route", routes)
+	}
+	want := []string{"blog.apps.localhost", "aaa.example.com", "blog.example.com"}
+	if !reflect.DeepEqual(routes[0].Hostnames, want) {
+		t.Errorf("Hostnames = %v, want %v", routes[0].Hostnames, want)
+	}
+}
+
 // TestRemoveAppBestEffortTeardown is a regression test: RemoveApp must
 // not abort teardown (or skip re-applying routes) just because one
 // container's removal errors. It should keep going for every remaining
@@ -485,9 +805,112 @@ func TestRemoveAppBestEffortTeardown(t *testing.T) {
 	// RemoveApp explicitly filters it out before calling router.Apply.
 	// Assert on the *applied* set, not just the call count.
 	for _, rt := range router.lastRoutes {
-		if rt.Slug == "blog" || rt.Hostname == "blog.apps.localhost" {
+		if rt.Slug == "blog" {
 			t.Errorf("router.lastRoutes still contains removed app's route: %+v", router.lastRoutes)
 		}
+		for _, h := range rt.Hostnames {
+			if h == "blog.apps.localhost" {
+				t.Errorf("router.lastRoutes still contains removed app's hostname: %+v", router.lastRoutes)
+			}
+		}
+	}
+}
+
+// TestApplyRoutesSerializesConcurrentCalls is a regression test for I1: two
+// concurrent route-apply callers (e.g. a domain-add HTTP handler racing an
+// in-flight deploy's cutover) must never interleave their Routes() DB read
+// with their router.Apply call, since both write the same current.json.tmp
+// (internal/caddy/manager.go writeFileAtomic). It uses a blockingRouter to
+// force the interleaving deterministically: the first ApplyRoutes call is
+// parked inside Apply (proven by <-router.entered, which only fires once
+// Apply — and therefore routesMu — has been entered) while a new domain is
+// inserted and a second ApplyRoutes call is started. Because the first
+// call still holds routesMu, the second's own Lock() call blocks until the
+// first releases it via router.release() — Go's mutex semantics guarantee
+// this ordering regardless of goroutine scheduling, so the test needs no
+// sleeps to be deterministic. The assertions then confirm: (1)
+// maxInFlight() never exceeded 1, i.e. the two Apply calls never
+// overlapped; and (2) the second call's applied route set includes the
+// domain inserted after the first call had already read Routes() — which
+// only holds if the second call re-read Routes() under the lock rather
+// than reusing a stale snapshot.
+func TestApplyRoutesSerializesConcurrentCalls(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppStatus(app.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+
+	router := newBlockingRouter()
+	eng.router = router
+
+	// First call: acquires routesMu, reads Routes() (blog only, no custom
+	// domain yet), and parks inside Apply holding the lock.
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- eng.ApplyRoutes(ctx)
+	}()
+	<-router.entered // first call is now inside Apply, holding routesMu
+
+	// Insert a new domain while the first call is blocked mid-Apply,
+	// still holding routesMu.
+	if _, err := st.AddDomain(app.ID, "new.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second call: its Lock() must block behind the first (routesMu is
+	// still held), so it cannot read Routes() until after the first call
+	// has fully returned.
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- eng.ApplyRoutes(ctx)
+	}()
+
+	// Release the first call. Because closing router.block unblocks all
+	// current and future receivers, this is safe even though the second
+	// call may not have reached its own <-r.block yet (it can't have —
+	// it's still blocked on routesMu.Lock() — but even if scheduling
+	// changed that, the close is still correct).
+	router.release()
+
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first ApplyRoutes: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second ApplyRoutes: %v", err)
+	}
+
+	if max := router.maxInFlight(); max > 1 {
+		t.Fatalf("router.Apply had %d calls in flight simultaneously, want at most 1: routesMu did not serialize ApplyRoutes", max)
+	}
+
+	if got := router.callCount(); got != 2 {
+		t.Fatalf("router.Apply called %d times, want 2", got)
+	}
+
+	firstRoutes := router.callAt(0)
+	if len(firstRoutes) != 1 || len(firstRoutes[0].Hostnames) != 1 {
+		t.Errorf("first call's applied routes = %+v, want just blog.apps.localhost (new.example.com was added after this call's Routes() read)", firstRoutes)
+	}
+
+	secondRoutes := router.callAt(1)
+	if len(secondRoutes) != 1 {
+		t.Fatalf("second call's applied routes = %+v, want 1 route", secondRoutes)
+	}
+	found := false
+	for _, h := range secondRoutes[0].Hostnames {
+		if h == "new.example.com" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("second call's applied Hostnames = %v, want it to include new.example.com (its Routes() read must happen under routesMu, after the domain was added, not before)", secondRoutes[0].Hostnames)
 	}
 }
 
@@ -516,7 +939,7 @@ func TestFailDetachesCleanupFromCancelledContext(t *testing.T) {
 		return pctx.Err()
 	}
 
-	eng := New(st, rt, router, probe, "apps.localhost")
+	eng := New(st, rt, router, probe, "apps.localhost", nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 1
 
@@ -620,4 +1043,100 @@ func TestCaddyProber(t *testing.T) {
 			t.Errorf("cmd = %v, want %v", gotCmd, want)
 		}
 	})
+}
+
+// TestAppLogsAppNotFound proves AppLogs passes store.ErrNotFound through
+// unchanged for an unknown slug.
+func TestAppLogsAppNotFound(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	_, err := eng.AppLogs(context.Background(), "does-not-exist", false, 200)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("err = %v, want store.ErrNotFound", err)
+	}
+}
+
+// TestAppLogsNotRunning proves AppLogs returns ErrNotRunning for an app
+// that exists but has no running container (never deployed).
+func TestAppLogsNotRunning(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	if _, err := st.CreateApp("blog", "nginx:v1", 80); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := eng.AppLogs(context.Background(), "blog", false, 200)
+	if !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("err = %v, want ErrNotRunning", err)
+	}
+}
+
+// TestAppLogsRunning proves AppLogs finds the app's running container and
+// forwards follow/tail to Runtime.ContainerLogs, returning its reader.
+func TestAppLogsRunning(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	wantReader := io.NopCloser(strings.NewReader("scripted log data"))
+	rt.logsReader = wantReader
+
+	rc, err := eng.AppLogs(ctx, "blog", true, 500)
+	if err != nil {
+		t.Fatalf("AppLogs: %v", err)
+	}
+	if rc != wantReader {
+		t.Errorf("AppLogs returned a different reader than Runtime.ContainerLogs supplied")
+	}
+
+	if len(rt.logsCalls) != 1 {
+		t.Fatalf("logsCalls = %+v, want exactly 1 call", rt.logsCalls)
+	}
+	call := rt.logsCalls[0]
+	if !call.follow || call.tail != 500 {
+		t.Errorf("logsCalls[0] = %+v, want follow=true tail=500", call)
+	}
+	var wantID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			wantID = id
+		}
+	}
+	if call.nameOrID != wantID {
+		t.Errorf("logsCalls[0].nameOrID = %q, want %q (bp-blog-1's container ID)", call.nameOrID, wantID)
+	}
+}
+
+// TestAppLogsPropagatesRuntimeError proves a Runtime.ContainerLogs error
+// (e.g. the container vanished between ListContainers and the logs call)
+// surfaces from AppLogs rather than being swallowed.
+func TestAppLogsPropagatesRuntimeError(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	rt.logsErr = errors.New("logs boom")
+
+	_, err = eng.AppLogs(ctx, "blog", false, 200)
+	if err == nil || !strings.Contains(err.Error(), "logs boom") {
+		t.Fatalf("err = %v, want it to wrap %q", err, "logs boom")
+	}
 }
