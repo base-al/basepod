@@ -309,6 +309,60 @@ func (s *Store) DeleteEnvVar(appID int64, key string) error {
 	return err
 }
 
+// ReplaceEnvVars replaces appID's entire env var set in a single
+// transaction: every entry in vars is upserted, and every existing key
+// not present in vars is deleted. This is what backs a full-replace PUT
+// — doing the upserts and prunes as individual statements outside a
+// transaction would risk leaving a mix of old and new values if one of
+// them failed partway through.
+func (s *Store) ReplaceEnvVars(appID int64, vars []EnvVar) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT key FROM env_vars WHERE app_id = ?`, appID)
+	if err != nil {
+		return err
+	}
+	var existingKeys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			rows.Close()
+			return err
+		}
+		existingKeys = append(existingKeys, k)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	keep := make(map[string]bool, len(vars))
+	for _, v := range vars {
+		keep[v.Key] = true
+		if _, err := tx.Exec(`INSERT INTO env_vars(app_id, key, value_encrypted, is_secret)
+			VALUES(?, ?, ?, ?) ON CONFLICT(app_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, is_secret = excluded.is_secret`,
+			appID, v.Key, v.ValueEncrypted, v.IsSecret); err != nil {
+			return err
+		}
+	}
+
+	for _, k := range existingKeys {
+		if keep[k] {
+			continue
+		}
+		if _, err := tx.Exec(`DELETE FROM env_vars WHERE app_id = ? AND key = ?`, appID, k); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 // ListEnvVars returns all environment variables for appID, ordered by key.
 func (s *Store) ListEnvVars(appID int64) ([]EnvVar, error) {
 	rows, err := s.db.Query(`SELECT id, app_id, key, value_encrypted, is_secret

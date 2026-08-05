@@ -133,10 +133,12 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 		existingByKey[ev.Key] = ev
 	}
 
-	keep := make(map[string]bool, len(req))
+	// Resolve every entry's sealed value up front, then persist the whole
+	// desired set in one transactional call — ReplaceEnvVars upserts and
+	// prunes atomically, so a mid-request failure can never leave a mix
+	// of old and new env vars stored.
+	desired := make([]store.EnvVar, 0, len(req))
 	for _, ev := range req {
-		keep[ev.Key] = true
-
 		var valueEncrypted string
 		if ev.IsSecret && ev.Value == "" {
 			if prior, ok := existingByKey[ev.Key]; ok && prior.IsSecret {
@@ -160,21 +162,12 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 			}
 			valueEncrypted = sealed
 		}
-
-		if err := a.st.UpsertEnvVar(app.ID, ev.Key, valueEncrypted, ev.IsSecret); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal", "failed to save env var")
-			return
-		}
+		desired = append(desired, store.EnvVar{AppID: app.ID, Key: ev.Key, ValueEncrypted: valueEncrypted, IsSecret: ev.IsSecret})
 	}
 
-	for _, ev := range existing {
-		if keep[ev.Key] {
-			continue
-		}
-		if err := a.st.DeleteEnvVar(app.ID, ev.Key); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal", "failed to delete env var")
-			return
-		}
+	if err := a.st.ReplaceEnvVars(app.ID, desired); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to save env vars")
+		return
 	}
 
 	after, err := a.effectiveEnv(app.ID)

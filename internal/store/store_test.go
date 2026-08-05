@@ -258,6 +258,61 @@ func TestEnvVarOrdering(t *testing.T) {
 	}
 }
 
+func TestReplaceEnvVars(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("app", "img:1.0", 8080)
+
+	// seed an initial set
+	if err := s.UpsertEnvVar(app.ID, "KEEP", "old-keep", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEnvVar(app.ID, "DROP", "gone-soon", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// replace: KEEP gets a new value, DROP is omitted (pruned), ADD is new
+	err := s.ReplaceEnvVars(app.ID, []EnvVar{
+		{Key: "KEEP", ValueEncrypted: "new-keep", IsSecret: false},
+		{Key: "ADD", ValueEncrypted: "added", IsSecret: true},
+	})
+	if err != nil {
+		t.Fatalf("ReplaceEnvVars failed: %v", err)
+	}
+
+	vars, err := s.ListEnvVars(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vars) != 2 {
+		t.Fatalf("expected 2 vars after replace, got %d: %+v", len(vars), vars)
+	}
+	byKey := make(map[string]EnvVar, len(vars))
+	for _, v := range vars {
+		byKey[v.Key] = v
+	}
+	if byKey["KEEP"].ValueEncrypted != "new-keep" || byKey["KEEP"].IsSecret {
+		t.Fatalf("KEEP not updated correctly: %+v", byKey["KEEP"])
+	}
+	if byKey["ADD"].ValueEncrypted != "added" || !byKey["ADD"].IsSecret {
+		t.Fatalf("ADD not inserted correctly: %+v", byKey["ADD"])
+	}
+	if _, ok := byKey["DROP"]; ok {
+		t.Fatalf("expected DROP to be pruned, got %+v", vars)
+	}
+
+	// replace with an empty set prunes everything
+	if err := s.ReplaceEnvVars(app.ID, nil); err != nil {
+		t.Fatalf("ReplaceEnvVars(nil) failed: %v", err)
+	}
+	vars, err = s.ListEnvVars(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vars) != 0 {
+		t.Fatalf("expected 0 vars after empty replace, got %d: %+v", len(vars), vars)
+	}
+}
+
 func TestDeleteEnvVar(t *testing.T) {
 	s := open(t)
 	app, _ := s.CreateApp("app", "img:1.0", 8080)

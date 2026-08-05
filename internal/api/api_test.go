@@ -39,17 +39,19 @@ func testSeal(plaintext string) (string, error) { return crypto.Seal(testKey, pl
 func testOpen(sealed string) (string, error)    { return crypto.Open(testKey, sealed) }
 
 // fakeRoutesApplier is a test double for RoutesApplier that records how
-// many times ApplyRoutes was called.
+// many times ApplyRoutes was called and can be scripted to fail (to
+// exercise the domain handlers' rollback paths).
 type fakeRoutesApplier struct {
 	mu    sync.Mutex
 	calls int
+	err   error
 }
 
 func (f *fakeRoutesApplier) ApplyRoutes(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	return nil
+	return f.err
 }
 
 func (f *fakeRoutesApplier) callCount() int {
@@ -637,5 +639,62 @@ func TestDomainCrossAppDelete(t *testing.T) {
 		fmt.Sprintf("%s/api/v1/apps/my-blog/domains/%d", srv.URL, added.ID), token, nil, nil)
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("owning-app delete: got status %d, want 204", resp.StatusCode)
+	}
+}
+
+// TestDomainAddRollsBackOnRoutesFailure verifies that when ApplyRoutes
+// fails after a domain row was already committed, the API rolls the
+// insert back rather than leaving the DB claiming a domain Caddy never
+// actually picked up.
+func TestDomainAddRollsBackOnRoutesFailure(t *testing.T) {
+	srv, _, token, _, routes := setupEnvDomainsTest(t)
+	routes.err = errors.New("caddy unreachable")
+
+	var errBody errorResponse
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/my-blog/domains", token,
+		addDomainRequest{Hostname: "rollback.example.org"}, &errBody)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("add with routes failure: got status %d, want 502", resp.StatusCode)
+	}
+	if errBody.Error.Code != "routes_failed" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+
+	var list domainsListResponse
+	resp = doJSON(t, http.MethodGet, srv.URL+"/api/v1/apps/my-blog/domains", token, nil, &list)
+	if resp.StatusCode != http.StatusOK || len(list.Custom) != 0 {
+		t.Fatalf("expected the failed add to be rolled back, got status=%d body=%+v", resp.StatusCode, list)
+	}
+}
+
+// TestDomainDeleteRollsBackOnRoutesFailure verifies that when ApplyRoutes
+// fails after a domain row was already deleted, the API re-adds the
+// domain rather than silently dropping it.
+func TestDomainDeleteRollsBackOnRoutesFailure(t *testing.T) {
+	srv, _, token, _, routes := setupEnvDomainsTest(t)
+
+	var added domainResponse
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/my-blog/domains", token,
+		addDomainRequest{Hostname: "keep.example.org"}, &added)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("add: got status %d, want 201", resp.StatusCode)
+	}
+
+	routes.err = errors.New("caddy unreachable")
+
+	var errBody errorResponse
+	resp = doJSON(t, http.MethodDelete,
+		fmt.Sprintf("%s/api/v1/apps/my-blog/domains/%d", srv.URL, added.ID), token, nil, &errBody)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("delete with routes failure: got status %d, want 502", resp.StatusCode)
+	}
+	if errBody.Error.Code != "routes_failed" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+
+	var list domainsListResponse
+	resp = doJSON(t, http.MethodGet, srv.URL+"/api/v1/apps/my-blog/domains", token, nil, &list)
+	if resp.StatusCode != http.StatusOK || len(list.Custom) != 1 || list.Custom[0].Hostname != "keep.example.org" {
+		t.Fatalf("expected the failed delete to be rolled back, got status=%d body=%+v", resp.StatusCode, list)
 	}
 }

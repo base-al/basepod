@@ -112,6 +112,9 @@ func (a *api) handleAddDomain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, store.ErrNotFound) {
+			// Only reachable via a concurrent delete of this app between
+			// appBySlugOrNotFound above and this insert (TOCTOU) — the
+			// foreign key check fails because app.ID no longer exists.
 			writeError(w, http.StatusNotFound, "app_not_found", "app not found")
 			return
 		}
@@ -120,6 +123,12 @@ func (a *api) handleAddDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.routes.ApplyRoutes(r.Context()); err != nil {
+		// Best-effort rollback: the domain row was committed but Caddy
+		// never actually picked it up, so don't leave the DB claiming a
+		// domain that isn't routed. If this delete itself fails there's
+		// nothing more to do here; the stale row surfaces on the next
+		// list/reconcile rather than being silently invisible.
+		_ = a.st.DeleteDomain(domain.ID)
 		writeError(w, http.StatusBadGateway, "routes_failed", err.Error())
 		return
 	}
@@ -148,10 +157,12 @@ func (a *api) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to list domains")
 		return
 	}
+	var hostname string
 	found := false
 	for _, d := range domains {
 		if d.ID == id {
 			found = true
+			hostname = d.Hostname
 			break
 		}
 	}
@@ -166,6 +177,12 @@ func (a *api) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.routes.ApplyRoutes(r.Context()); err != nil {
+		// Best-effort rollback: the domain row is already gone but Caddy
+		// never applied the change, so re-add it rather than silently
+		// dropping a domain the operator still expects to be routed. The
+		// restored row gets a new ID — callers must re-fetch via GET
+		// rather than assuming the deleted ID still applies.
+		_, _ = a.st.AddDomain(app.ID, hostname)
 		writeError(w, http.StatusBadGateway, "routes_failed", err.Error())
 		return
 	}
