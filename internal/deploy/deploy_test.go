@@ -1,11 +1,15 @@
 package deploy
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -15,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
@@ -1392,5 +1397,214 @@ func TestAppLogsPropagatesRuntimeError(t *testing.T) {
 	_, err = eng.AppLogs(ctx, "blog", false, 200)
 	if err == nil || !strings.Contains(err.Error(), "logs boom") {
 		t.Fatalf("err = %v, want it to wrap %q", err, "logs boom")
+	}
+}
+
+// fakeBuildRuntime is a test double for build.BuildRuntime: it writes a
+// scripted log line (if any) to the logSink it's given and returns a
+// scripted error.
+type fakeBuildRuntime struct {
+	logLine string
+	err     error
+	calls   int
+}
+
+func (f *fakeBuildRuntime) BuildImage(ctx context.Context, tag, dockerfile string, contextTar io.Reader, logSink io.Writer) error {
+	f.calls++
+	if f.logLine != "" {
+		io.WriteString(logSink, f.logLine)
+	}
+	return f.err
+}
+
+// gzipTarWithContainerfile builds a minimal valid gzipped-tar upload body
+// containing just a root Containerfile, for feeding into DeployBuild.
+func gzipTarWithContainerfile(t *testing.T) io.Reader {
+	t.Helper()
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	body := []byte("FROM alpine\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "Containerfile", Mode: 0o644, Size: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	if _, err := gw.Write(tarBuf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return &gzBuf
+}
+
+// TestDeployBuildHappyPathSkipsPull proves DeployBuild builds the
+// uploaded tarball into a local image tag, records it (and the build log
+// path) on the deployment row, rolls the new container out exactly like
+// Deploy, and — critically — never calls Runtime.PullImage, since a
+// "localhost/basepod/..." tag is already local.
+func TestDeployBuildHappyPathSkipsPull(t *testing.T) {
+	st := openStore(t)
+	eng, rt, router, prober, ops := newTestEngine(t, st)
+	buildRt := &fakeBuildRuntime{logLine: "Successfully built abc123\n"}
+	builder := build.New(buildRt, t.TempDir(), 2)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dep, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder)
+	if err != nil {
+		t.Fatalf("DeployBuild: %v", err)
+	}
+	if dep.Status != "healthy" {
+		t.Fatalf("dep.Status = %q, want healthy", dep.Status)
+	}
+	if dep.Source != "tarball" {
+		t.Fatalf("dep.Source = %q, want tarball", dep.Source)
+	}
+	wantTag := "localhost/basepod/blog:1"
+	if dep.ImageRef != wantTag {
+		t.Fatalf("dep.ImageRef = %q, want %q", dep.ImageRef, wantTag)
+	}
+	if dep.BuildLogPath == "" {
+		t.Fatal("dep.BuildLogPath empty, want the build log path recorded")
+	}
+	if buildRt.calls != 1 {
+		t.Fatalf("BuildImage calls = %d, want 1", buildRt.calls)
+	}
+
+	for _, op := range *ops {
+		if strings.HasPrefix(op, "pull:") {
+			t.Fatalf("ops contains a pull op %q — DeployBuild must never pull a local build tag: %v", op, *ops)
+		}
+	}
+
+	var found *podman.ContainerInfo
+	for _, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			cc := c
+			found = &cc
+		}
+	}
+	if found == nil || found.State != "running" {
+		t.Fatalf("bp-blog-1 = %+v, want a running container", found)
+	}
+	if router.calls != 1 {
+		t.Fatalf("router.calls = %d, want 1", router.calls)
+	}
+	if len(prober.calls) != 1 {
+		t.Fatalf("prober.calls = %v, want 1 call", prober.calls)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "running" || gotApp.ImageRef != wantTag {
+		t.Fatalf("app = %+v, want running/%s", gotApp, wantTag)
+	}
+}
+
+// TestDeployBuildFailureMarksDeploymentFailedAndRestoresStatus proves a
+// failing build goes through the same fail() path as any other deploy
+// failure: the deployment is marked failed with the build error, no
+// container is ever created, the build log path is still recorded (with
+// whatever was streamed before the failure), and — since this is the
+// app's first-ever deploy attempt, with no other container up — the app
+// status is restored to "error".
+func TestDeployBuildFailureMarksDeploymentFailedAndRestoresStatus(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	buildErr := errors.New("executor failed running [/bin/sh -c false]")
+	buildRt := &fakeBuildRuntime{logLine: "Step 1/1 : RUN false\n", err: buildErr}
+	builder := build.New(buildRt, t.TempDir(), 2)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dep, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder)
+	if err == nil {
+		t.Fatal("expected an error from the failed build")
+	}
+	if !strings.Contains(err.Error(), "executor failed running") {
+		t.Fatalf("err = %v, want it to contain the build failure message", err)
+	}
+	if dep.Status != "failed" {
+		t.Fatalf("dep.Status = %q, want failed", dep.Status)
+	}
+	if dep.BuildLogPath == "" {
+		t.Fatal("dep.BuildLogPath empty, want the build log path recorded even on failure")
+	}
+	data, rerr := os.ReadFile(dep.BuildLogPath)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(data) != "Step 1/1 : RUN false\n" {
+		t.Fatalf("build log contents = %q", data)
+	}
+	if len(rt.containers) != 0 {
+		t.Fatalf("containers = %+v, want none created (build fails before any container)", rt.containers)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "error" {
+		t.Fatalf("app.Status = %q, want error (no containers at all)", gotApp.Status)
+	}
+}
+
+// TestDeployBuildFailureKeepsOldContainerRunning proves that when a build
+// fails on a *redeploy* (the app already has a healthy container from a
+// prior deploy), the app status is restored to "running" rather than
+// "error" — mirroring TestFailedProbeKeepsOld's assertion for the
+// image-pull path.
+func TestDeployBuildFailureKeepsOldContainerRunning(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+
+	buildRt := &fakeBuildRuntime{err: errors.New("build boom")}
+	builder := build.New(buildRt, t.TempDir(), 2)
+
+	dep2, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder)
+	if err == nil {
+		t.Fatal("expected an error from the failed build")
+	}
+	if dep2.Status != "failed" {
+		t.Fatalf("dep2.Status = %q, want failed", dep2.Status)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "running" {
+		t.Fatalf("app.Status = %q, want running (old container still up)", gotApp.Status)
+	}
+	if gotApp.ImageRef != "nginx:v1" {
+		t.Fatalf("app.ImageRef = %q, want unchanged nginx:v1", gotApp.ImageRef)
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
@@ -123,6 +124,66 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: pull %s: %w", imageRef, err))
 	}
 
+	return e.runRollout(ctx, app, dep, imageRef)
+}
+
+// DeployBuild runs one tarball-sourced deploy of app: it creates the
+// deployment row up front (source "tarball", with no image_ref yet — see
+// store.CreateDeploymentFull) so the deployment number exists for the
+// build log's path, marks the app "deploying", then hands gzTar off to
+// builder.Build to decompress, validate, and build it into a local image
+// tag. The build log path is recorded on the deployment as soon as it's
+// known (even if the build itself then fails), so a failed build's log
+// is still addressable via the deployment row.
+//
+// On a build failure, this goes through the same fail() path Deploy uses
+// for every other failure: the deployment is marked failed and the app's
+// status is restored (to "running" if other containers are still up for
+// it, "error" otherwise) — no container was ever created for a build
+// failure, so fail() is called with an empty newContainerID.
+//
+// On a successful build, the image tag is recorded on the deployment and
+// rollout proceeds via the same runRollout Deploy uses — but, critically,
+// skipping Deploy's PullImage step: builder.Build produces a local
+// "localhost/basepod/..." tag, and pulling a localhost/ tag from a
+// registry would either fail outright or (worse) silently pull the wrong
+// thing.
+func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
+	dep, err := e.st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		return nil, fmt.Errorf("deploy: create deployment: %w", err)
+	}
+	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
+	}
+
+	tag, logPath, buildErr := builder.Build(ctx, app.Slug, dep.Number, gzTar)
+	if logPath != "" {
+		if err := e.st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+			fmt.Fprintf(e.log, "deploy: set build log path for deployment %d: %v\n", dep.ID, err)
+		}
+		dep.BuildLogPath = logPath
+	}
+	if buildErr != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: build: %w", buildErr))
+	}
+
+	if err := e.st.SetDeploymentImage(dep.ID, tag); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: set deployment image: %w", err))
+	}
+	dep.ImageRef = tag
+
+	return e.runRollout(ctx, app, dep, tag)
+}
+
+// runRollout is the shared back half of a deploy — create+start a new
+// container, probe it, cut traffic over, and remove the previous
+// container generation — used by both Deploy (after a successful pull)
+// and DeployBuild (after a successful local build). It deliberately never
+// pulls imageRef itself: Deploy pulls before calling this, and
+// DeployBuild must not (see its doc comment) — a built image is already
+// local.
+func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Deployment, imageRef string) (*store.Deployment, error) {
 	name := fmt.Sprintf("bp-%s-%d", app.Slug, dep.Number)
 	spec := podman.CreateSpec{
 		Name:  name,
