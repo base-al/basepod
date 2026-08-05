@@ -1,0 +1,82 @@
+package podman
+
+import "errors"
+
+// ErrNotFound is returned by Client methods when the requested libpod
+// resource (container, network, image, ...) does not exist.
+var ErrNotFound = errors.New("podman: not found")
+
+// CreateSpec describes a container to create via the libpod SpecGenerator
+// (POST /libpod/containers/create). Only the fields BasePod needs are
+// exposed here; Client.CreateContainer maps this onto the wire format.
+type CreateSpec struct {
+	Name           string
+	Image          string
+	Labels         map[string]string
+	Env            map[string]string
+	Command        []string // optional override of the image's default command
+	NetworkName    string
+	NetworkAliases []string
+	PortMappings   []PortMapping
+	Mounts         []BindMount
+	RestartPolicy  string // "always" | "no"
+}
+
+// ContainerInfo is a summarized view of a libpod container, as returned by
+// InspectContainer and ListContainers.
+type ContainerInfo struct {
+	ID     string
+	Name   string
+	State  string // "running" | "exited" | ...
+	Labels map[string]string
+}
+
+// PortMapping maps a container port to a host port. It is marshaled
+// directly into the libpod SpecGenerator's "portmappings" field.
+type PortMapping struct {
+	ContainerPort uint16 `json:"container_port"`
+	HostPort      uint16 `json:"host_port,omitempty"`
+	Protocol      string `json:"protocol,omitempty"`
+}
+
+// BindMount describes a host bind mount into the container.
+type BindMount struct {
+	Source   string
+	Dest     string
+	ReadOnly bool
+}
+
+// specGen is the subset of libpod's SpecGenerator that CreateContainer
+// sends to POST /libpod/containers/create. Field names/casing follow the
+// libpod API exactly (see docs/plan/03 and the podman API reference).
+type specGen struct {
+	Name          string                       `json:"name"`
+	Image         string                       `json:"image"`
+	Labels        map[string]string            `json:"labels,omitempty"`
+	Env           map[string]string            `json:"env,omitempty"`
+	Command       []string                     `json:"command,omitempty"`
+	Networks      map[string]perNetworkOptions `json:"Networks,omitempty"`
+	PortMappings  []PortMapping                `json:"portmappings,omitempty"`
+	Mounts        []specMount                  `json:"mounts,omitempty"`
+	RestartPolicy string                       `json:"restart_policy,omitempty"`
+}
+
+// perNetworkOptions configures how a container joins a given network
+// (libpod SpecGenerator's Networks map value).
+type perNetworkOptions struct {
+	Aliases []string `json:"aliases,omitempty"`
+}
+
+// specMount is a libpod SpecGenerator bind mount entry.
+type specMount struct {
+	Destination string   `json:"destination"`
+	Source      string   `json:"source"`
+	Type        string   `json:"type"`              // "bind"
+	Options     []string `json:"options,omitempty"` // ["ro"] when ReadOnly
+}
+
+// networkCreate is the body for POST /libpod/networks/create.
+type networkCreate struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels,omitempty"`
+}
