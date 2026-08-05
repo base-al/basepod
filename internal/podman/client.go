@@ -536,3 +536,47 @@ func (c *Client) ListContainers(ctx context.Context, labelFilters map[string]str
 	}
 	return out, nil
 }
+
+// ContainerLogs streams a container's stdout+stderr log data. The
+// returned ReadCloser is the raw HTTP response body — libpod's multiplex
+// framing, unparsed (see DemuxLogs) — rather than something this method
+// JSON-decodes itself, since the whole point is to let the caller stream
+// it (potentially indefinitely, with follow=true) instead of buffering it
+// all in memory first. The caller owns closing it.
+//
+// follow keeps the connection open and streams new log data as the
+// container produces it, so it must never complete on its own; this is
+// safe because c.http's transport has no request Timeout configured (see
+// New) — only ctx bounds the call. tail limits the response to the last N
+// lines; tail<=0 requests the daemon's default (all logs).
+//
+// Returns ErrNotFound if the container doesn't exist.
+func (c *Client) ContainerLogs(ctx context.Context, nameOrID string, follow bool, tail int) (io.ReadCloser, error) {
+	q := url.Values{}
+	q.Set("stdout", "true")
+	q.Set("stderr", "true")
+	q.Set("follow", strconv.FormatBool(follow))
+	if tail > 0 {
+		q.Set("tail", strconv.Itoa(tail))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/containers/"+url.PathEscape(nameOrID)+"/logs?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("podman: logs %q: %w", nameOrID, err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil, ErrNotFound
+	}
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, apiError(resp.StatusCode, data)
+	}
+	return resp.Body, nil
+}

@@ -23,6 +23,11 @@ import (
 	"github.com/base-al/basepod/internal/store"
 )
 
+// ErrNotRunning is returned by AppLogs when an app has no running
+// container to stream logs from (e.g. it was created but never deployed,
+// or its last deploy failed before any container reached "running").
+var ErrNotRunning = errors.New("deploy: app has no running container")
+
 // Engine drives app deployments: pull, create, start, probe, cut traffic
 // over, and tear down the previous container generation.
 type Engine struct {
@@ -383,6 +388,47 @@ func (e *Engine) ApplyRoutes(ctx context.Context) error {
 		return fmt.Errorf("deploy: apply routes: %w", err)
 	}
 	return nil
+}
+
+// AppLogs streams a running app's container logs. The returned
+// ReadCloser is the raw, still-multiplexed stream straight from the
+// runtime (see podman.DemuxLogs) — the caller owns closing it, which
+// matters in particular for follow=true, whose stream never ends on its
+// own.
+//
+// It looks the app up by slug — ErrNotFound passes through unchanged
+// from the store lookup — then finds its running container via
+// ListContainers filtered by the basepod.managed+basepod.app labels,
+// picking the one with State=="running" (Deploy always tears down prior
+// generations before returning, so at most one should ever be running).
+// If none is running, it returns ErrNotRunning.
+func (e *Engine) AppLogs(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error) {
+	app, err := e.st.AppBySlug(slug)
+	if err != nil {
+		return nil, err
+	}
+
+	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
+	if err != nil {
+		return nil, fmt.Errorf("deploy: list containers for %s: %w", app.Slug, err)
+	}
+
+	var id string
+	for _, c := range containers {
+		if c.State == "running" {
+			id = c.ID
+			break
+		}
+	}
+	if id == "" {
+		return nil, ErrNotRunning
+	}
+
+	rc, err := e.rt.ContainerLogs(ctx, id, follow, tail)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: logs for %s: %w", app.Slug, err)
+	}
+	return rc, nil
 }
 
 // CaddyProber returns a Prober that checks an upstream by running a

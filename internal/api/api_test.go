@@ -28,6 +28,10 @@ var _ Deployer = (*deploy.Engine)(nil)
 // interface this package defines and consumes.
 var _ RoutesApplier = (*deploy.Engine)(nil)
 
+// Compile-time assertion that (*deploy.Engine).AppLogs satisfies the
+// LogSource func type this package defines and consumes.
+var _ LogSource = (*deploy.Engine)(nil).AppLogs
+
 const testPassword = "correct-password"
 
 // testKey is a fixed 32-byte encryption key used by testSeal/testOpen so
@@ -125,12 +129,28 @@ func newTestStore(t *testing.T) *store.Store {
 
 // newTestServer serves the API handler over httptest against st and dep,
 // with seal/open closures over a fixed test key and routes as the
-// RoutesApplier.
+// RoutesApplier. Tests that don't exercise the logs endpoint get a stub
+// LogSource that always fails; logs_test.go builds its own server with a
+// scripted one instead.
 func newTestServer(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes))
+	return newTestServerWithLogs(t, st, dep, routes, unusedLogSource)
+}
+
+// newTestServerWithLogs is newTestServer with an explicit LogSource, for
+// tests that need to script the app-logs endpoint.
+func newTestServerWithLogs(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// unusedLogSource is the default LogSource for tests that don't exercise
+// GET .../logs; calling it is a test bug, so it fails loudly rather than
+// returning an empty stream that would silently hide the mistake.
+func unusedLogSource(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error) {
+	return nil, errors.New("unusedLogSource: this test's LogSource was not expected to be called")
 }
 
 // doJSON performs an HTTP request with an optional JSON body and optional

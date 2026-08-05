@@ -111,7 +111,7 @@ func Run(ctx context.Context, cfgPath string) error {
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
-		Handler: api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine),
+		Handler: api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs),
 	}
 
 	log.Printf("basepod: listening on %s", cfg.Listen)

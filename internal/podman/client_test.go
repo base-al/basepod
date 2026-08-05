@@ -1,8 +1,10 @@
 package podman
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -285,5 +287,78 @@ func TestPingSuccess(t *testing.T) {
 	c := fakeDaemon(t, mux)
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestContainerLogsQueryAndRawBody proves ContainerLogs sends the expected
+// query parameters and returns the response body completely unparsed
+// (raw multiplex bytes, not JSON-decoded) for the caller to stream.
+func TestContainerLogsQueryAndRawBody(t *testing.T) {
+	rawBody := []byte{1, 0, 0, 0, 0, 0, 0, 5, 'h', 'e', 'l', 'l', 'o'}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/bp-blog-1/logs", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("stdout"); got != "true" {
+			t.Errorf("stdout = %q, want true", got)
+		}
+		if got := r.URL.Query().Get("stderr"); got != "true" {
+			t.Errorf("stderr = %q, want true", got)
+		}
+		if got := r.URL.Query().Get("follow"); got != "true" {
+			t.Errorf("follow = %q, want true", got)
+		}
+		if got := r.URL.Query().Get("tail"); got != "200" {
+			t.Errorf("tail = %q, want 200", got)
+		}
+		w.WriteHeader(200)
+		w.Write(rawBody)
+	})
+	c := fakeDaemon(t, mux)
+
+	rc, err := c.ContainerLogs(context.Background(), "bp-blog-1", true, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, rawBody) {
+		t.Fatalf("body = %v, want %v (must not be JSON-decoded)", got, rawBody)
+	}
+}
+
+// TestContainerLogsNoTailOmitsParam proves tail<=0 omits the tail query
+// param entirely (podman's daemon default is "all logs").
+func TestContainerLogsNoTailOmitsParam(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/bp-blog-1/logs", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.URL.Query()["tail"]; ok {
+			t.Errorf("expected no tail param, got %q", r.URL.Query().Get("tail"))
+		}
+		if got := r.URL.Query().Get("follow"); got != "false" {
+			t.Errorf("follow = %q, want false", got)
+		}
+		w.WriteHeader(200)
+	})
+	c := fakeDaemon(t, mux)
+	rc, err := c.ContainerLogs(context.Background(), "bp-blog-1", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+}
+
+func TestContainerLogsNotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/nope/logs", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"cause": "no such container"})
+	})
+	c := fakeDaemon(t, mux)
+	_, err := c.ContainerLogs(context.Background(), "nope", false, 100)
+	if err != ErrNotFound {
+		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }

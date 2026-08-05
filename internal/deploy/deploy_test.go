@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os/exec"
 	"path/filepath"
@@ -42,6 +43,19 @@ type fakeRuntime struct {
 	// keyed by container name, so tests can assert on fields (like Env)
 	// that ContainerInfo doesn't carry.
 	createdSpecs map[string]podman.CreateSpec
+
+	// logsReader/logsErr script ContainerLogs; logsCalls records every
+	// call's arguments for assertions.
+	logsReader io.ReadCloser
+	logsErr    error
+	logsCalls  []loggedCall
+}
+
+// loggedCall records one ContainerLogs invocation.
+type loggedCall struct {
+	nameOrID string
+	follow   bool
+	tail     int
 }
 
 func newFakeRuntime(ops *[]string) *fakeRuntime {
@@ -161,6 +175,20 @@ func (f *fakeRuntime) ListContainers(ctx context.Context, labelFilters map[strin
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+func (f *fakeRuntime) ContainerLogs(ctx context.Context, nameOrID string, follow bool, tail int) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.logsCalls = append(f.logsCalls, loggedCall{nameOrID: nameOrID, follow: follow, tail: tail})
+	if f.logsErr != nil {
+		return nil, f.logsErr
+	}
+	if f.logsReader != nil {
+		return f.logsReader, nil
+	}
+	return io.NopCloser(strings.NewReader("")), nil
 }
 
 // fakeRouter is a test double for Router.
@@ -848,4 +876,100 @@ func TestCaddyProber(t *testing.T) {
 			t.Errorf("cmd = %v, want %v", gotCmd, want)
 		}
 	})
+}
+
+// TestAppLogsAppNotFound proves AppLogs passes store.ErrNotFound through
+// unchanged for an unknown slug.
+func TestAppLogsAppNotFound(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	_, err := eng.AppLogs(context.Background(), "does-not-exist", false, 200)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("err = %v, want store.ErrNotFound", err)
+	}
+}
+
+// TestAppLogsNotRunning proves AppLogs returns ErrNotRunning for an app
+// that exists but has no running container (never deployed).
+func TestAppLogsNotRunning(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	if _, err := st.CreateApp("blog", "nginx:v1", 80); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := eng.AppLogs(context.Background(), "blog", false, 200)
+	if !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("err = %v, want ErrNotRunning", err)
+	}
+}
+
+// TestAppLogsRunning proves AppLogs finds the app's running container and
+// forwards follow/tail to Runtime.ContainerLogs, returning its reader.
+func TestAppLogsRunning(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	wantReader := io.NopCloser(strings.NewReader("scripted log data"))
+	rt.logsReader = wantReader
+
+	rc, err := eng.AppLogs(ctx, "blog", true, 500)
+	if err != nil {
+		t.Fatalf("AppLogs: %v", err)
+	}
+	if rc != wantReader {
+		t.Errorf("AppLogs returned a different reader than Runtime.ContainerLogs supplied")
+	}
+
+	if len(rt.logsCalls) != 1 {
+		t.Fatalf("logsCalls = %+v, want exactly 1 call", rt.logsCalls)
+	}
+	call := rt.logsCalls[0]
+	if !call.follow || call.tail != 500 {
+		t.Errorf("logsCalls[0] = %+v, want follow=true tail=500", call)
+	}
+	var wantID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			wantID = id
+		}
+	}
+	if call.nameOrID != wantID {
+		t.Errorf("logsCalls[0].nameOrID = %q, want %q (bp-blog-1's container ID)", call.nameOrID, wantID)
+	}
+}
+
+// TestAppLogsPropagatesRuntimeError proves a Runtime.ContainerLogs error
+// (e.g. the container vanished between ListContainers and the logs call)
+// surfaces from AppLogs rather than being swallowed.
+func TestAppLogsPropagatesRuntimeError(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	rt.logsErr = errors.New("logs boom")
+
+	_, err = eng.AppLogs(ctx, "blog", false, 200)
+	if err == nil || !strings.Contains(err.Error(), "logs boom") {
+		t.Fatalf("err = %v, want it to wrap %q", err, "logs boom")
+	}
 }

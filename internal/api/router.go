@@ -8,6 +8,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -42,6 +43,16 @@ type RoutesApplier interface {
 	ApplyRoutes(ctx context.Context) error
 }
 
+// LogSource streams a running app's raw (still-multiplexed — see
+// podman.DemuxLogs) container log data by slug. It is declared here
+// (rather than the API depending on package deploy's concrete Engine
+// type) so handlers can be tested against a fake instead of a real
+// container runtime; *deploy.Engine's AppLogs method satisfies it. It
+// must return store.ErrNotFound for an unknown slug and deploy.ErrNotRunning
+// when the app has no running container — handleAppLogs maps both to the
+// documented HTTP status/error codes.
+type LogSource func(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error)
+
 // deployTimeout bounds a single deploy request. v0.1 deploys run
 // synchronously inside the HTTP handler (no SSE build-log streaming until
 // v0.2's real builds), so a stuck pull or health-probe loop must not hang
@@ -75,10 +86,14 @@ type api struct {
 	// routes recomputes and pushes the current route set to the router
 	// (Caddy) after a domain is added or removed.
 	routes RoutesApplier
+
+	// logs streams an app's raw container log data for handleAppLogs to
+	// demux into SSE events.
+	logs LogSource
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
-func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier) http.Handler {
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier, logs LogSource) http.Handler {
 	a := &api{
 		st:      st,
 		dep:     dep,
@@ -88,6 +103,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 		seal:    seal,
 		open:    open,
 		routes:  routes,
+		logs:    logs,
 	}
 
 	r := chi.NewRouter()
@@ -103,6 +119,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 			r.Get("/apps/{slug}", a.handleGetApp)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)
+			r.Get("/apps/{slug}/logs", a.handleAppLogs)
 			r.Get("/apps/{slug}/env", a.handleGetEnv)
 			r.Put("/apps/{slug}/env", a.handlePutEnv)
 			r.Get("/apps/{slug}/domains", a.handleListDomains)
