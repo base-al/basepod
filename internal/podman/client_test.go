@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -210,11 +211,104 @@ func TestEnsureNetworkCreatesWhenMissing(t *testing.T) {
 	}
 }
 
+// TestEnsureNetworkNoopWhenPresent proves EnsureNetwork does nothing
+// (beyond the existence and DNS self-heal checks) when the network exists
+// and its DNS resolution is already enabled.
 func TestEnsureNetworkNoopWhenPresent(t *testing.T) {
-	createCalls := 0
+	createCalls, removeCalls := 0, 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(204)
+	})
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{"name": "basepod", "dns_enabled": true})
+	})
+	mux.HandleFunc("POST /v5.0.0/libpod/networks/create", func(w http.ResponseWriter, _ *http.Request) {
+		createCalls++
+		w.WriteHeader(200)
+	})
+	mux.HandleFunc("DELETE /v5.0.0/libpod/networks/basepod", func(w http.ResponseWriter, _ *http.Request) {
+		removeCalls++
+		w.WriteHeader(200)
+	})
+	c := fakeDaemon(t, mux)
+	if err := c.EnsureNetwork(context.Background(), "basepod"); err != nil {
+		t.Fatal(err)
+	}
+	if createCalls != 0 {
+		t.Fatalf("expected no create call, got %d", createCalls)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("expected no remove call, got %d", removeCalls)
+	}
+}
+
+// TestEnsureNetworkSelfHealsDNSWhenNoContainers proves that a
+// DNS-disabled network with zero basepod-managed containers attached is
+// removed and recreated with DNS enabled.
+func TestEnsureNetworkSelfHealsDNSWhenNoContainers(t *testing.T) {
+	var createBody map[string]any
+	removeCalls, createCalls := 0, 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(204)
+	})
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{"name": "basepod", "dns_enabled": false})
+	})
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode([]map[string]any{}) // no basepod containers attached
+	})
+	mux.HandleFunc("DELETE /v5.0.0/libpod/networks/basepod", func(w http.ResponseWriter, _ *http.Request) {
+		removeCalls++
+		w.WriteHeader(200)
+	})
+	mux.HandleFunc("POST /v5.0.0/libpod/networks/create", func(w http.ResponseWriter, r *http.Request) {
+		createCalls++
+		json.NewDecoder(r.Body).Decode(&createBody)
+		w.WriteHeader(200)
+	})
+	c := fakeDaemon(t, mux)
+	if err := c.EnsureNetwork(context.Background(), "basepod"); err != nil {
+		t.Fatal(err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+	if createCalls != 1 {
+		t.Fatalf("createCalls = %d, want 1", createCalls)
+	}
+	if createBody["dns_enabled"] != true {
+		t.Fatalf("recreate body dns_enabled = %v, want true", createBody["dns_enabled"])
+	}
+}
+
+// TestEnsureNetworkWarnsWhenDNSDisabledButContainersAttached proves that a
+// DNS-disabled network with at least one basepod-managed container
+// attached is left alone entirely (no remove, no recreate) — recreating
+// it out from under a live container would break its networking.
+func TestEnsureNetworkWarnsWhenDNSDisabledButContainersAttached(t *testing.T) {
+	removeCalls, createCalls := 0, 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(204)
+	})
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{"name": "basepod", "dns_enabled": false})
+	})
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"Id": "c1", "Names": []string{"/bp-blog-1"}, "State": "running", "Labels": map[string]string{"basepod.managed": "true"}},
+		})
+	})
+	mux.HandleFunc("DELETE /v5.0.0/libpod/networks/basepod", func(w http.ResponseWriter, _ *http.Request) {
+		removeCalls++
+		w.WriteHeader(200)
 	})
 	mux.HandleFunc("POST /v5.0.0/libpod/networks/create", func(w http.ResponseWriter, _ *http.Request) {
 		createCalls++
@@ -224,8 +318,51 @@ func TestEnsureNetworkNoopWhenPresent(t *testing.T) {
 	if err := c.EnsureNetwork(context.Background(), "basepod"); err != nil {
 		t.Fatal(err)
 	}
+	if removeCalls != 0 {
+		t.Fatalf("removeCalls = %d, want 0 (must not recreate a network with live containers attached)", removeCalls)
+	}
 	if createCalls != 0 {
-		t.Fatalf("expected no create call, got %d", createCalls)
+		t.Fatalf("createCalls = %d, want 0", createCalls)
+	}
+}
+
+func TestInspectNetwork(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"name":        "basepod",
+			"dns_enabled": true,
+			"subnets": []map[string]any{
+				{"subnet": "10.89.2.0/24", "gateway": "10.89.2.1"},
+			},
+		})
+	})
+	c := fakeDaemon(t, mux)
+	info, err := c.InspectNetwork(context.Background(), "basepod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "basepod" || !info.DNSEnabled || info.Gateway != "10.89.2.1" {
+		t.Fatalf("got %+v", info)
+	}
+}
+
+func TestInspectNetworkNotFound(t *testing.T) {
+	c := fakeDaemon(t, http.NewServeMux()) // 404 everything
+	if _, err := c.InspectNetwork(context.Background(), "nope"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestRemoveNetworkAlreadyGoneIsSuccess(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v5.0.0/libpod/networks/basepod", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(404)
+	})
+	c := fakeDaemon(t, mux)
+	if err := c.RemoveNetwork(context.Background(), "basepod"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -276,6 +413,74 @@ func TestInspectContainer(t *testing.T) {
 	}
 	if info.ID != "c1" || info.Name != "bp-blog-1" || info.State != "running" || info.Labels["basepod.app"] != "blog" {
 		t.Fatalf("got %+v", info)
+	}
+}
+
+// TestInspectContainerImageAndPorts proves InspectContainer parses the
+// human-readable image ref from "ImageName" (not the digest-ID "Image"
+// field) and the container's TCP port bindings from
+// HostConfig.PortBindings — both verified against a real podman 6.0.1
+// client / 5.7.1 server's inspect payload shape.
+func TestInspectContainerImageAndPorts(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/bp-caddy/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"Id":        "c1",
+			"Name":      "/bp-caddy",
+			"Image":     "8f5619aac3ed45304632491507becd99711bcaed375aee3e6317c7b703902969",
+			"ImageName": "docker.io/library/caddy:2.10-alpine",
+			"State":     map[string]any{"Status": "running"},
+			"Config":    map[string]any{"Labels": map[string]string{"basepod.managed": "true"}},
+			"HostConfig": map[string]any{
+				"PortBindings": map[string]any{
+					"80/tcp":  []map[string]any{{"HostIp": "0.0.0.0", "HostPort": "8080"}},
+					"443/tcp": []map[string]any{{"HostIp": "0.0.0.0", "HostPort": "8443"}},
+				},
+			},
+		})
+	})
+	c := fakeDaemon(t, mux)
+	info, err := c.InspectContainer(context.Background(), "bp-caddy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Image != "docker.io/library/caddy:2.10-alpine" {
+		t.Errorf("Image = %q, want the ImageName ref, not the digest ID", info.Image)
+	}
+	want := []PortMapping{
+		{ContainerPort: 80, HostPort: 8080},
+		{ContainerPort: 443, HostPort: 8443},
+	}
+	if !reflect.DeepEqual(info.Ports, want) {
+		t.Errorf("Ports = %+v, want %+v", info.Ports, want)
+	}
+}
+
+// TestInspectContainerIgnoresNonTCPBindings proves parsePortBindings
+// skips non-TCP entries (out of scope for v0.3) rather than erroring or
+// misparsing them.
+func TestInspectContainerIgnoresNonTCPBindings(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/x/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{
+			"Id": "c1", "Name": "/x",
+			"State": map[string]any{"Status": "running"},
+			"HostConfig": map[string]any{
+				"PortBindings": map[string]any{
+					"53/udp": []map[string]any{{"HostIp": "0.0.0.0", "HostPort": "53"}},
+				},
+			},
+		})
+	})
+	c := fakeDaemon(t, mux)
+	info, err := c.InspectContainer(context.Background(), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Ports) != 0 {
+		t.Errorf("Ports = %+v, want none (UDP filtered out)", info.Ports)
 	}
 }
 

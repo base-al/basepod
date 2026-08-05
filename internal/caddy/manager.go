@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +32,8 @@ type Runtime interface {
 	PullImage(ctx context.Context, ref string) error
 	CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error)
 	StartContainer(ctx context.Context, id string) error
+	StopContainer(ctx context.Context, id string, timeoutSec int) error
+	RemoveContainer(ctx context.Context, id string, force bool) error
 	InspectContainer(ctx context.Context, nameOrID string) (*podman.ContainerInfo, error)
 }
 
@@ -76,9 +79,24 @@ func (m *Manager) dataDir() string {
 	return filepath.Join(filepath.Dir(m.configDir), "caddy-data")
 }
 
+// driftStopTimeout bounds how long Ensure waits for a drifted bp-caddy
+// container to stop gracefully before recreating it — short, since a
+// drifted container (wrong image/ports, or stuck in "created") is being
+// discarded outright rather than handed off traffic cleanly.
+const driftStopTimeout = 5
+
 // Ensure makes sure the shared network and the bp-caddy container both
 // exist and are running, creating and starting the container (with an
 // initial empty-routes config) on first run.
+//
+// If bp-caddy already exists, Ensure first checks for drift against the
+// spec create would build today — a different image, different host port
+// mappings, or a container stuck in the "created" state (meaning it was
+// made but never successfully started, e.g. because its port mapping lost
+// a bind race on a previous boot) — and if any of those differ, stops and
+// removes the old container and recreates it fresh, rather than trying to
+// reconcile it in place. Otherwise it just starts the container if it
+// isn't already running.
 func (m *Manager) Ensure(ctx context.Context) error {
 	if err := m.rt.EnsureNetwork(ctx, NetworkName); err != nil {
 		return fmt.Errorf("caddy: ensure network %q: %w", NetworkName, err)
@@ -92,12 +110,77 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return m.create(ctx)
 	}
 
+	if reason := driftReason(info, m.desiredPorts()); reason != "" {
+		log.Printf("caddy: %s has drifted (%s) — recreating", ContainerName, reason)
+		if err := m.rt.StopContainer(ctx, info.ID, driftStopTimeout); err != nil {
+			return fmt.Errorf("caddy: stop drifted %s: %w", ContainerName, err)
+		}
+		if err := m.rt.RemoveContainer(ctx, info.ID, true); err != nil {
+			return fmt.Errorf("caddy: remove drifted %s: %w", ContainerName, err)
+		}
+		return m.create(ctx)
+	}
+
 	if info.State != "running" {
 		if err := m.rt.StartContainer(ctx, info.ID); err != nil {
 			return fmt.Errorf("caddy: start %s: %w", ContainerName, err)
 		}
 	}
 	return nil
+}
+
+// desiredPorts is the port mapping set create() builds — the same
+// {80,443} -> {httpPort,httpsPort} mapping Ensure compares an existing
+// container's inspected ports against for drift.
+func (m *Manager) desiredPorts() []podman.PortMapping {
+	return []podman.PortMapping{
+		{ContainerPort: 80, HostPort: uint16(m.httpPort)},
+		{ContainerPort: 443, HostPort: uint16(m.httpsPort)},
+	}
+}
+
+// driftReason reports why an existing bp-caddy container no longer
+// matches what Ensure would create today, or "" if it matches. Checked in
+// order: a container stuck in "created" (made but never started
+// successfully — reconciling it in place isn't meaningfully different
+// from recreating it, and recreating is simpler to reason about); an
+// image mismatch (a newer basepod build changed the pinned Caddy image);
+// then a port-mapping mismatch (the known stale-port-mapping issue: a
+// previous boot's ports don't match the currently configured
+// httpPort/httpsPort).
+func driftReason(info *podman.ContainerInfo, desiredPorts []podman.PortMapping) string {
+	switch {
+	case info.State == "created":
+		return "state=created (previous boot never started it successfully)"
+	case info.Image != Image:
+		return fmt.Sprintf("image %s != desired %s", info.Image, Image)
+	case !portsEqual(info.Ports, desiredPorts):
+		return fmt.Sprintf("ports %v != desired %v", info.Ports, desiredPorts)
+	default:
+		return ""
+	}
+}
+
+// portsEqual reports whether a and b contain the same
+// {ContainerPort,HostPort} pairs, ignoring order (and ignoring Protocol,
+// which InspectContainer never populates — see parsePortBindings).
+func portsEqual(a, b []podman.PortMapping) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	type key struct{ containerPort, hostPort uint16 }
+	counts := make(map[key]int, len(a))
+	for _, p := range a {
+		counts[key{p.ContainerPort, p.HostPort}]++
+	}
+	for _, p := range b {
+		k := key{p.ContainerPort, p.HostPort}
+		if counts[k] == 0 {
+			return false
+		}
+		counts[k]--
+	}
+	return true
 }
 
 // create writes the initial (empty-routes) config, pulls the Caddy image,

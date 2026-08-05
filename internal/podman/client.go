@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -348,14 +349,20 @@ func (c *Client) PullImage(ctx context.Context, ref string) error {
 }
 
 // EnsureNetwork makes sure a network named name exists, creating it
-// (labeled basepod.managed=true) if it doesn't.
+// (labeled basepod.managed=true) if it doesn't. If it already exists, it
+// self-heals a DNS-disabled network (see selfHealNetworkDNS) — a state
+// that leaves every app container unable to resolve another by name/alias
+// ("bp-<slug>"), and has been observed to arise from an out-of-band
+// `podman network create basepod` (whose CLI default differs from the raw
+// API's, see networkCreate) or a partially-applied config from an older
+// basepod version.
 func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
 	status, data, err := c.request(ctx, http.MethodGet, "/networks/"+url.PathEscape(name)+"/exists", nil)
 	if err != nil {
 		return fmt.Errorf("podman: checking network %q: %w", name, err)
 	}
 	if status < 300 {
-		return nil // already exists
+		return c.selfHealNetworkDNS(ctx, name)
 	}
 	if status != http.StatusNotFound {
 		return apiError(status, data)
@@ -374,6 +381,105 @@ func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
 		return apiError(status, data)
 	}
 	return nil
+}
+
+// selfHealNetworkDNS inspects an already-existing network and, if it has
+// DNS resolution disabled, recreates it with DNS enabled — but ONLY when
+// no basepod-managed container is currently attached to it: recreating a
+// network out from under a running container would break its networking
+// outright, so in that case this just logs a loud warning with manual
+// remediation steps instead. Containers are identified broadly (every
+// basepod.managed=true container, not just ones actually attached to
+// name) since v0.3 has exactly one shared network and every managed
+// container joins it.
+func (c *Client) selfHealNetworkDNS(ctx context.Context, name string) error {
+	info, err := c.InspectNetwork(ctx, name)
+	if err != nil {
+		return fmt.Errorf("podman: inspecting network %q: %w", name, err)
+	}
+	if info.DNSEnabled {
+		return nil
+	}
+
+	containers, err := c.ListContainers(ctx, map[string]string{"basepod.managed": "true"})
+	if err != nil {
+		return fmt.Errorf("podman: listing containers to self-heal network %q: %w", name, err)
+	}
+	if len(containers) > 0 {
+		log.Printf(
+			"podman: WARNING: network %q has DNS resolution disabled but %d basepod container(s) are still attached — "+
+				"refusing to recreate it automatically. Containers won't be able to resolve each other by name. "+
+				"Remediation: stop all basepod apps, run `podman network rm %s`, then restart basepod.",
+			name, len(containers), name,
+		)
+		return nil
+	}
+
+	log.Printf("podman: network %q has DNS resolution disabled and no containers are attached — recreating it with DNS enabled", name)
+	if err := c.RemoveNetwork(ctx, name); err != nil {
+		return fmt.Errorf("podman: removing network %q to self-heal DNS: %w", name, err)
+	}
+	body := networkCreate{
+		Name:       name,
+		Labels:     map[string]string{"basepod.managed": "true"},
+		DNSEnabled: true,
+	}
+	status, data, err := c.request(ctx, http.MethodPost, "/networks/create", body)
+	if err != nil {
+		return fmt.Errorf("podman: recreating network %q: %w", name, err)
+	}
+	if status >= 300 {
+		return apiError(status, data)
+	}
+	return nil
+}
+
+// networkInspectResponse is the subset of libpod's network inspect
+// payload InspectNetwork cares about.
+type networkInspectResponse struct {
+	Name       string `json:"name"`
+	DNSEnabled bool   `json:"dns_enabled"`
+	Subnets    []struct {
+		Gateway string `json:"gateway"`
+	} `json:"subnets"`
+}
+
+// InspectNetwork fetches details for a network by name. Returns
+// ErrNotFound if it doesn't exist.
+func (c *Client) InspectNetwork(ctx context.Context, name string) (*NetworkInfo, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/networks/"+url.PathEscape(name)+"/json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("podman: inspecting network %q: %w", name, err)
+	}
+	if status == http.StatusNotFound {
+		return nil, ErrNotFound
+	}
+	if status >= 300 {
+		return nil, apiError(status, data)
+	}
+
+	var raw networkInspectResponse
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("podman: decoding network inspect response for %q: %w", name, err)
+	}
+	gateway := ""
+	if len(raw.Subnets) > 0 {
+		gateway = raw.Subnets[0].Gateway
+	}
+	return &NetworkInfo{Name: raw.Name, DNSEnabled: raw.DNSEnabled, Gateway: gateway}, nil
+}
+
+// RemoveNetwork removes a network by name. Removing an already-gone
+// network (404) is treated as success.
+func (c *Client) RemoveNetwork(ctx context.Context, name string) error {
+	status, data, err := c.request(ctx, http.MethodDelete, "/networks/"+url.PathEscape(name), nil)
+	if err != nil {
+		return fmt.Errorf("podman: removing network %q: %w", name, err)
+	}
+	if status == http.StatusNotFound || status < 300 {
+		return nil
+	}
+	return apiError(status, data)
 }
 
 // CreateContainer creates a container from spec and returns its ID.
@@ -475,16 +581,28 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, force bool) err
 }
 
 // inspectResponse is the subset of libpod's container inspect payload
-// InspectContainer cares about.
+// InspectContainer cares about. ImageName is the human-readable image
+// reference (e.g. "docker.io/library/caddy:2.10-alpine"), as opposed to
+// the top-level "Image" field (an ID digest) — verified against a live
+// libpod 5.7.1 daemon. HostConfig.PortBindings is keyed
+// "<containerPort>/<protocol>" (e.g. "80/tcp"); HostPort arrives as a
+// JSON string, not a number.
 type inspectResponse struct {
-	Id    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	Id        string `json:"Id"`
+	Name      string `json:"Name"`
+	ImageName string `json:"ImageName"`
+	State     struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
+	HostConfig struct {
+		PortBindings map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"PortBindings"`
+	} `json:"HostConfig"`
 }
 
 // InspectContainer fetches details for a container by name or ID.
@@ -510,7 +628,46 @@ func (c *Client) InspectContainer(ctx context.Context, nameOrID string) (*Contai
 		Name:   strings.TrimPrefix(raw.Name, "/"),
 		State:  raw.State.Status,
 		Labels: raw.Config.Labels,
+		Image:  raw.ImageName,
+		Ports:  parsePortBindings(raw.HostConfig.PortBindings),
 	}, nil
+}
+
+// parsePortBindings converts libpod inspect's HostConfig.PortBindings map
+// into []PortMapping. Only TCP bindings are parsed (v0.3 scope — see
+// PortMapping); any entry with an unparseable port number is skipped
+// rather than failing the whole inspect. The result is sorted by
+// ContainerPort (then HostPort) for a deterministic, comparable order,
+// since PortBindings is a map with no inherent ordering.
+func parsePortBindings(bindings map[string][]struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}) []PortMapping {
+	var out []PortMapping
+	for key, entries := range bindings {
+		port, proto, ok := strings.Cut(key, "/")
+		if !ok || proto != "tcp" {
+			continue
+		}
+		containerPort, err := strconv.Atoi(port)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			hostPort, err := strconv.Atoi(e.HostPort)
+			if err != nil {
+				continue
+			}
+			out = append(out, PortMapping{ContainerPort: uint16(containerPort), HostPort: uint16(hostPort)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ContainerPort != out[j].ContainerPort {
+			return out[i].ContainerPort < out[j].ContainerPort
+		}
+		return out[i].HostPort < out[j].HostPort
+	})
+	return out
 }
 
 // listEntry is one element of the libpod container list response.

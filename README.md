@@ -88,14 +88,6 @@ See [`scripts/e2e-local.sh`](scripts/e2e-local.sh) for this whole flow
 (plus env vars, custom domains, and log streaming) scripted end-to-end
 (also run in CI on every push/PR).
 
-## Known issues
-
-- If the first `basepod server` boot fails because port 80/443 is
-  already taken, a created-but-never-started `bp-caddy` container with
-  the old port mapping can be left behind. Remedy: `podman rm -f
-  bp-caddy`, then set `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` to free
-  ports and restart.
-
 ## Contributing
 
 The dashboard (`web/`) is a Vite/Vue app that gets embedded into the

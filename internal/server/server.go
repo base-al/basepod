@@ -69,10 +69,13 @@ const (
 //
 // Boot order: load config, open the store, refuse to start if no admin
 // user exists yet (run `basepod setup` first), resolve the root domain,
-// connect to Podman, ensure the Caddy container is up, build the deploy
-// engine, reconcile Caddy's route config against the store's current app
-// state (the config file is rebuilt from DB truth on every boot), then
-// serve HTTP with a graceful shutdown.
+// connect to Podman, ensure the Caddy container is up (self-healing any
+// drifted image/ports or a disabled-DNS network along the way — see
+// caddy.Manager.Ensure and podman.Client.EnsureNetwork), build the deploy
+// engine, garbage-collect orphaned containers left behind by a previous
+// crash (see Engine.CleanupOrphans), reconcile Caddy's route config
+// against the store's current app state (the config file is rebuilt from
+// DB truth on every boot), then serve HTTP with a graceful shutdown.
 func Run(ctx context.Context, cfgPath string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -140,6 +143,18 @@ func Run(ctx context.Context, cfgPath string) error {
 	}
 
 	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt)
+
+	// Orphan GC: remove containers left behind by a previous crash or
+	// interrupted deploy (unknown app slug, or a stale non-current
+	// generation) before routes are reconciled below, so a leftover
+	// container can never keep answering on a hostname/alias a fresh
+	// deploy is about to reuse. Best-effort: a failure here is logged and
+	// boot continues rather than dying on it.
+	if removed, err := engine.CleanupOrphans(ctx); err != nil {
+		log.Printf("basepod: orphan container cleanup: %v", err)
+	} else if removed > 0 {
+		log.Printf("basepod: orphan container cleanup: removed %d orphaned container(s)", removed)
+	}
 
 	// Reconcile: the Caddy config file is rebuilt from DB truth on every
 	// boot, rather than trusting whatever current.json happened to

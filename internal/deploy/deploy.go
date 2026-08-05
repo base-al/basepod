@@ -468,6 +468,120 @@ func (e *Engine) AppLogs(ctx context.Context, slug string, follow bool, tail int
 	return rc, nil
 }
 
+// orphanCleanupTimeout bounds CleanupOrphans's stop/remove work — it runs
+// once at boot (see server.Run), detached from the caller's ctx like
+// fail's/removeOldContainers's cleanupCtx (a slow boot racing a shutdown
+// signal must not abandon a container mid-removal).
+const orphanCleanupTimeout = 60 * time.Second
+
+// CleanupOrphans removes containers left behind by a previous crash or
+// interrupted deploy: a basepod.managed=true container whose
+// basepod.app slug no longer has a matching app in the store (the app
+// was deleted while its container survived), or whose
+// basepod.deployment generation isn't the app's latest *healthy*
+// deployment (a stale or never-finished generation from a cutover that
+// never completed). bp-caddy is always skipped by name — it's labeled
+// basepod.managed=true but has no basepod.app label and is a distinct
+// lifecycle from app containers. Containers with basepod.managed=true
+// but no basepod.app label are left alone with a warning: GC has no
+// record of what they belong to, so removing them isn't safe to do
+// automatically.
+//
+// Called once at boot (see server.Run), after the engine is constructed
+// and before Caddy's route config is reconciled — an orphan surviving
+// from a previous crash must never keep answering on a hostname (or
+// port, via the container's DNS alias) a fresh deploy is about to reuse.
+// Every failure along the way (listing containers, looking up an app,
+// listing its deployments, stopping/removing a container) is logged via
+// e.log and the loop continues rather than aborting: a partially-failing
+// GC pass must never stop basepod from finishing boot. Only a failure to
+// list containers in the first place (a precondition nothing else here
+// can work around) is returned as an error.
+func (e *Engine) CleanupOrphans(ctx context.Context) (int, error) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orphanCleanupTimeout)
+	defer cancel()
+
+	containers, err := e.rt.ListContainers(cleanupCtx, map[string]string{"basepod.managed": "true"})
+	if err != nil {
+		return 0, fmt.Errorf("deploy: orphan gc: list containers: %w", err)
+	}
+
+	removed := 0
+	for _, c := range containers {
+		if c.Name == caddy.ContainerName {
+			continue
+		}
+		slug, ok := c.Labels["basepod.app"]
+		if !ok {
+			fmt.Fprintf(e.log, "deploy: orphan gc: %s is basepod.managed but has no basepod.app label — leaving it alone\n", c.Name)
+			continue
+		}
+
+		app, err := e.st.AppBySlug(slug)
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				fmt.Fprintf(e.log, "deploy: orphan gc: look up app %q: %v\n", slug, err)
+				continue
+			}
+			fmt.Fprintf(e.log, "deploy: orphan gc: removing %s (app %q no longer exists)\n", c.Name, slug)
+			e.removeOrphanContainer(cleanupCtx, c)
+			removed++
+			continue
+		}
+
+		latest, err := e.latestHealthyDeploymentNumber(app.ID)
+		if err != nil {
+			fmt.Fprintf(e.log, "deploy: orphan gc: list deployments for %q: %v\n", slug, err)
+			continue
+		}
+		if latest == 0 {
+			// The app exists but has never had a healthy deployment
+			// (e.g. its only deploy is still in flight, or every past
+			// attempt failed before going healthy) — nothing to compare
+			// this container's generation against, so leave it alone.
+			continue
+		}
+		if c.Labels["basepod.deployment"] != strconv.Itoa(latest) {
+			fmt.Fprintf(e.log, "deploy: orphan gc: removing %s (deployment %s, latest healthy for %q is %d)\n",
+				c.Name, c.Labels["basepod.deployment"], slug, latest)
+			e.removeOrphanContainer(cleanupCtx, c)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// removeOrphanContainer stops and force-removes a single orphaned
+// container, logging (not failing on) either step — mirrors
+// removeOldContainers's best-effort teardown, since by the time
+// CleanupOrphans runs at boot there's no live traffic depending on the
+// container staying reachable a moment longer.
+func (e *Engine) removeOrphanContainer(ctx context.Context, c podman.ContainerInfo) {
+	if err := e.rt.StopContainer(ctx, c.ID, 10); err != nil {
+		fmt.Fprintf(e.log, "deploy: orphan gc: stop %s: %v\n", c.Name, err)
+	}
+	if err := e.rt.RemoveContainer(ctx, c.ID, true); err != nil {
+		fmt.Fprintf(e.log, "deploy: orphan gc: remove %s: %v\n", c.Name, err)
+	}
+}
+
+// latestHealthyDeploymentNumber returns the Number of appID's most
+// recent deployment with Status=="healthy". ListDeployments returns
+// deployments newest-first, so this is just the first match; it returns
+// 0 if appID has never had a healthy deployment.
+func (e *Engine) latestHealthyDeploymentNumber(appID int64) (int, error) {
+	deps, err := e.st.ListDeployments(appID)
+	if err != nil {
+		return 0, err
+	}
+	for _, d := range deps {
+		if d.Status == "healthy" {
+			return d.Number, nil
+		}
+	}
+	return 0, nil
+}
+
 // CaddyProber returns a Prober that checks an upstream by running a
 // wget --spider request inside the bp-caddy container (which shares the
 // basepod network with every app container, and ships busybox wget in

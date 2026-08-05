@@ -33,6 +33,8 @@ type fakeRuntime struct {
 	startErr   error
 	pullErr    error
 	networkErr error
+	stopErr    error
+	removeErr  error
 }
 
 func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
@@ -69,6 +71,16 @@ func (f *fakeRuntime) InspectContainer(ctx context.Context, nameOrID string) (*p
 		return nil, f.inspectErr
 	}
 	return f.inspectInfo, nil
+}
+
+func (f *fakeRuntime) StopContainer(ctx context.Context, id string, timeoutSec int) error {
+	f.calls = append(f.calls, "StopContainer")
+	return f.stopErr
+}
+
+func (f *fakeRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	f.calls = append(f.calls, "RemoveContainer")
+	return f.removeErr
 }
 
 // fakeExecer is a test double for Execer: it records the argv of every
@@ -173,11 +185,23 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	}
 }
 
+// matchingPorts is the {80,443} -> {8080,8443} port set every drift test
+// in this file builds its Manager against (NewManager(..., 8080, 8443)),
+// so a fakeRuntime.inspectInfo carrying these plus Image: Image
+// represents an existing container with no drift.
+var matchingPorts = []podman.PortMapping{
+	{ContainerPort: 80, HostPort: 8080},
+	{ContainerPort: 443, HostPort: 8443},
+}
+
 func TestEnsureStartsWhenStopped(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
 
-	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{ID: "abc123", Name: ContainerName, State: "exited"}}
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "exited",
+		Image: Image, Ports: matchingPorts,
+	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
@@ -195,7 +219,10 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
 
-	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{ID: "abc123", Name: ContainerName, State: "running"}}
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image, Ports: matchingPorts,
+	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
@@ -206,6 +233,128 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v", fr.calls, wantCalls)
+	}
+}
+
+// wantRecreateCalls is the call sequence Ensure makes when it decides an
+// existing bp-caddy container has drifted: stop+remove the old one, then
+// the same pull+create+start sequence as a first-run create().
+var wantRecreateCalls = []string{
+	"EnsureNetwork", "InspectContainer", "StopContainer", "RemoveContainer",
+	"PullImage", "CreateContainer", "StartContainer",
+}
+
+// TestEnsureRecreatesWhenStateCreated proves a container stuck in the
+// "created" state (made but never started successfully — the known
+// stale-port-mapping issue's original symptom) is stopped, removed, and
+// recreated, even though its image and ports otherwise match exactly.
+func TestEnsureRecreatesWhenStateCreated(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "created",
+		Image: Image, Ports: matchingPorts,
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+	if fr.createSpec.Name != ContainerName {
+		t.Errorf("recreated spec.Name = %q, want %q", fr.createSpec.Name, ContainerName)
+	}
+}
+
+// TestEnsureRecreatesOnImageMismatch proves a running container whose
+// image no longer matches the pinned Image const (e.g. after a basepod
+// upgrade bumps the Caddy version) is recreated rather than left running
+// the stale image.
+func TestEnsureRecreatesOnImageMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: "docker.io/library/caddy:2.9-alpine", Ports: matchingPorts,
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+}
+
+// TestEnsureRecreatesOnPortMismatch proves a running container whose
+// inspected host ports don't match the currently configured
+// httpPort/httpsPort (the known stale-port-mapping issue: e.g. basepod
+// was reconfigured to a new HTTP port but bp-caddy was never recreated)
+// is recreated with the current port mapping.
+func TestEnsureRecreatesOnPortMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image,
+		Ports: []podman.PortMapping{
+			{ContainerPort: 80, HostPort: 9090}, // stale: mgr wants 8080
+			{ContainerPort: 443, HostPort: 8443},
+		},
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+	wantPorts := []podman.PortMapping{
+		{ContainerPort: 80, HostPort: 8080},
+		{ContainerPort: 443, HostPort: 8443},
+	}
+	if !reflect.DeepEqual(fr.createSpec.PortMappings, wantPorts) {
+		t.Errorf("recreated spec.PortMappings = %+v, want %+v", fr.createSpec.PortMappings, wantPorts)
+	}
+}
+
+// TestEnsureNoopWhenAllMatch is the drift matrix's negative case: a
+// running container whose state, image, and ports (regardless of
+// declaration order) all match the desired spec exactly must not be
+// touched at all.
+func TestEnsureNoopWhenAllMatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image,
+		// Deliberately reversed order vs. desiredPorts() to prove the
+		// comparison is set-based, not positional.
+		Ports: []podman.PortMapping{
+			{ContainerPort: 443, HostPort: 8443},
+			{ContainerPort: 80, HostPort: 8080},
+		},
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no drift — must not stop/remove/recreate)", fr.calls, wantCalls)
 	}
 }
 

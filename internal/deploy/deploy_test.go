@@ -1045,6 +1045,206 @@ func TestCaddyProber(t *testing.T) {
 	})
 }
 
+// TestCleanupOrphansRemovesUnknownSlug proves a basepod.managed container
+// whose basepod.app slug has no matching row in the store (the app was
+// deleted while its container somehow survived) is stopped and removed.
+func TestCleanupOrphansRemovesUnknownSlug(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID: "c1", Name: "bp-ghost-1", State: "running",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "ghost", "basepod.deployment": "1"},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1", removed)
+	}
+	if _, stillThere := rt.containers["c1"]; stillThere {
+		t.Error("bp-ghost-1 should have been removed (unknown app slug)")
+	}
+}
+
+// TestCleanupOrphansRemovesStaleGeneration proves a container whose
+// basepod.deployment generation is not the app's latest *healthy*
+// deployment is stopped and removed, even though its app still exists —
+// e.g. left behind by a cutover that was interrupted mid-teardown.
+func TestCleanupOrphansRemovesStaleGeneration(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v2", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep1, err := st.CreateDeployment(app.ID, "nginx:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep1.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+	dep2, err := st.CreateDeployment(app.ID, "nginx:v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep2.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+	// dep2 (number 2) is the latest healthy deployment; a leftover
+	// container still labeled for generation 1 is stale.
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID: "c1", Name: "bp-blog-1", State: "exited",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "1"},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1", removed)
+	}
+	if _, stillThere := rt.containers["c1"]; stillThere {
+		t.Error("bp-blog-1 (stale generation 1) should have been removed")
+	}
+}
+
+// TestCleanupOrphansKeepsCurrentHealthyGeneration proves a container
+// whose basepod.deployment generation IS the app's latest healthy
+// deployment is left completely untouched.
+func TestCleanupOrphansKeepsCurrentHealthyGeneration(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(app.ID, "nginx:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID: "c1", Name: "bp-blog-1", State: "running",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "1"},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+	if _, stillThere := rt.containers["c1"]; !stillThere {
+		t.Error("bp-blog-1 (current healthy generation) should not have been removed")
+	}
+}
+
+// TestCleanupOrphansSkipsCaddyByName proves bp-caddy is never touched by
+// orphan GC even though it carries basepod.managed=true and, in this
+// test, a basepod.app label it wouldn't normally have — the skip is by
+// container name, not by the absence of app labels.
+func TestCleanupOrphansSkipsCaddyByName(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	rt.containers["ccaddy"] = podman.ContainerInfo{
+		ID: "ccaddy", Name: caddy.ContainerName, State: "running",
+		// Deliberately labeled as if it belonged to a nonexistent app, to
+		// prove the name-based skip runs before (and instead of) the
+		// slug-lookup path that would otherwise remove it.
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "ghost", "basepod.deployment": "1"},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+	if _, stillThere := rt.containers["ccaddy"]; !stillThere {
+		t.Error("bp-caddy should never be touched by orphan GC")
+	}
+}
+
+// TestCleanupOrphansWarnsAndKeepsUnlabeledContainer proves a
+// basepod.managed container with no basepod.app label is left alone
+// (not removed) — GC has no record of what it belongs to, so it isn't
+// safe to guess.
+func TestCleanupOrphansWarnsAndKeepsUnlabeledContainer(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID: "c1", Name: "bp-mystery", State: "running",
+		Labels: map[string]string{"basepod.managed": "true"},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+	if _, stillThere := rt.containers["c1"]; !stillThere {
+		t.Error("unlabeled container should have been left alone, not removed")
+	}
+}
+
+// TestCleanupOrphansKeepsInFlightDeployWithNoHealthyGenerationYet proves
+// that a container for an app which exists but has never had a healthy
+// deployment (e.g. its first deploy is still probing) is left alone
+// rather than removed for "not matching" a latest-healthy number that
+// doesn't exist yet.
+func TestCleanupOrphansKeepsInFlightDeployWithNoHealthyGenerationYet(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(app.ID, "nginx:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deployment left in "deploying" — never finished healthy.
+	_ = dep
+
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID: "c1", Name: "bp-blog-1", State: "running",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "1"},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0 (no healthy deployment recorded yet)", removed)
+	}
+	if _, stillThere := rt.containers["c1"]; !stillThere {
+		t.Error("bp-blog-1 should have been left alone (app has no healthy deployment yet)")
+	}
+}
+
 // TestAppLogsAppNotFound proves AppLogs passes store.ErrNotFound through
 // unchanged for an unknown slug.
 func TestAppLogsAppNotFound(t *testing.T) {
