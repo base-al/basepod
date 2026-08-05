@@ -415,3 +415,46 @@ func TestBuildEmptyUploadIsNotValidGzip(t *testing.T) {
 	_, _, err := b.Build(context.Background(), "blog", 1, bytes.NewReader(nil))
 	fatalIfErrNotContains(t, err, "gzip")
 }
+
+// TestBuildRejectsOversizeDecompressedContext proves a small, validly
+// gzipped upload whose *decompressed* content exceeds
+// Builder.maxDecompressedContext is rejected as ErrContextTooLarge —
+// without ever calling BuildImage — and its spool file is still removed,
+// exactly like every other validation failure. This guards against a
+// "gzip bomb": a tiny compressed upload that expands into something that
+// could fill the data directory's disk long before the API's
+// compressed-upload cap (or any request timeout) would ever catch it.
+// The Builder's limit is shrunk to a few KiB so the test fixture itself
+// stays tiny rather than needing a real multi-hundred-MiB payload.
+func TestBuildRejectsOversizeDecompressedContext(t *testing.T) {
+	dataDir := t.TempDir()
+	rt := &fakeRuntime{}
+	b := New(rt, dataDir, 2)
+	b.maxDecompressedContext = 1024
+
+	// A single all-zero 4 KiB file: its *tar-serialized* size (header +
+	// body, what actually lands in the spool once decompressed) is well
+	// past the 1024-byte limit above, regardless of how well the zero
+	// bytes happen to compress.
+	body := strings.Repeat("\x00", 4096)
+	gz := gzipTar(t, []tarEntry{{name: "Containerfile", body: body}})
+
+	tag, logPath, err := b.Build(context.Background(), "blog", 1, gz)
+	if !errors.Is(err, ErrContextTooLarge) {
+		t.Fatalf("err = %v, want ErrContextTooLarge", err)
+	}
+	if tag != "" || logPath != "" {
+		t.Fatalf("tag=%q logPath=%q, want both empty (rejected before any log file was created)", tag, logPath)
+	}
+	if rt.callCount() != 0 {
+		t.Fatal("BuildImage should never have been called")
+	}
+
+	entries, rerr := os.ReadDir(filepath.Join(dataDir, "builds"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("builds/ spool dir = %v, want empty (spool must be removed)", entries)
+	}
+}

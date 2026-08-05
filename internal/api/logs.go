@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"strconv"
@@ -190,9 +191,10 @@ const buildLogPollInterval = 500 * time.Millisecond
 // Errors: 404 "app_not_found" for an unknown slug, 400 "invalid_request"
 // if {number} isn't an integer, 404 "deployment_not_found" for an
 // unknown deployment number, 404 "no_build_log" if the deployment has no
-// build log (an image-sourced deploy, or too early a request — see
-// DeployBuild, which records the path immediately, before this can
-// actually happen in practice).
+// build log (an image-sourced deploy) *or* has one recorded but the file
+// doesn't actually exist on disk (a build that failed before ever
+// creating it — see the plain-text branch below) — both read to a caller
+// as "there's no build log to show", not a 500.
 func (a *api) handleDeploymentLog(w http.ResponseWriter, r *http.Request) {
 	app, ok := a.appBySlugOrNotFound(w, r)
 	if !ok {
@@ -226,6 +228,19 @@ func (a *api) handleDeploymentLog(w http.ResponseWriter, r *http.Request) {
 
 	data, err := os.ReadFile(dep.BuildLogPath)
 	if err != nil {
+		// The deployment row can carry a build_log_path before the file at
+		// that path is actually guaranteed to exist on disk (DeployBuild
+		// records it immediately — before the build starts — so a live
+		// SSE tail can find it from the very first poll; see
+		// deploy.Engine.DeployBuild). If the build then failed before ever
+		// creating the file (e.g. disk full, permissions), or the file was
+		// otherwise removed out of band, that's the same caller-visible
+		// situation as "no build log" — 404, not a 500 that would read as
+		// a BasePod bug.
+		if errors.Is(err, fs.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "no_build_log", "deployment has no build log")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal", "failed to read build log")
 		return
 	}

@@ -314,14 +314,19 @@ func (a *api) handleDeployTarball(w http.ResponseWriter, r *http.Request) {
 // writeDeployBuildError maps a DeployBuild failure to the documented
 // status/error code: an oversize upload (bodyLimit's *http.MaxBytesError,
 // surfacing here through the io.Copy chain inside the build pipeline
-// rather than a JSON decode) is 413; a build-context validation failure
-// is 422 with a code naming which check failed; anything else is a
-// generic 502 "deploy_failed", matching handleDeploy's own catch-all.
+// rather than a JSON decode) is 413, as is a build context that decompresses
+// past the pipeline's own size cap (build.ErrContextTooLarge — a defense
+// against a small compressed upload expanding into a much larger one, a
+// "gzip bomb"); a build-context validation failure is 422 with a code
+// naming which check failed; anything else is a generic 502
+// "deploy_failed", matching handleDeploy's own catch-all.
 func writeDeployBuildError(w http.ResponseWriter, err error) {
 	var maxErr *http.MaxBytesError
 	switch {
 	case errors.As(err, &maxErr):
 		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body too large")
+	case errors.Is(err, build.ErrContextTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "context_too_large", err.Error())
 	case errors.Is(err, build.ErrNoContainerfile):
 		writeError(w, http.StatusUnprocessableEntity, "no_containerfile", err.Error())
 	case errors.Is(err, build.ErrBadPath):

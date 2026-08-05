@@ -59,6 +59,47 @@ func TestHandleDeploymentLogDeploymentNotFound(t *testing.T) {
 	}
 }
 
+// TestHandleDeploymentLogDanglingPathDegradesGracefully proves that a
+// finished deployment whose build_log_path is recorded but whose file
+// doesn't actually exist on disk (e.g. a build that failed before ever
+// creating the log file — DeployBuild records the path immediately,
+// before the build starts, so it can be tailed live; see its doc
+// comment) is reported as 404 "no_build_log", not a 500 — the dangling
+// path must never read to a caller as a BasePod bug.
+func TestHandleDeploymentLogDanglingPathDegradesGracefully(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	app, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Points at a file that is never created — simulating a build that
+	// failed (e.g. disk full, permissions) before createLog ever ran.
+	if err := st.SetDeploymentBuildLog(dep.ID, filepath.Join(t.TempDir(), "never-created.log")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep.ID, "failed", "build: create log file: boom"); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	var errBody errorResponse
+	resp := doJSON(t, http.MethodGet, srv.URL+"/api/v1/apps/blog/deployments/1/log", session.Token, nil, &errBody)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (not 500)", resp.StatusCode)
+	}
+	if errBody.Error.Code != "no_build_log" {
+		t.Fatalf("error code = %q, want no_build_log", errBody.Error.Code)
+	}
+}
+
 // TestHandleDeploymentLogTextModeWhenFinished proves a finished (any
 // terminal status) tarball deployment's build log is served as the full
 // plain-text file content.

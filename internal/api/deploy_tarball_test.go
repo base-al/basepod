@@ -89,6 +89,29 @@ func TestHandleDeployTarballOversize(t *testing.T) {
 	}
 }
 
+// TestHandleDeployTarballContextTooLarge proves build.ErrContextTooLarge
+// from DeployBuild (a small compressed upload that decompresses past the
+// build pipeline's own size cap — see maxDecompressedContext in
+// internal/build) maps to 413 "context_too_large", distinct from the
+// compressed-body "request_too_large" case above.
+func TestHandleDeployTarballContextTooLarge(t *testing.T) {
+	st := newTestStore(t)
+	dep := &fakeDeployer{st: st, deployBuildErr: build.ErrContextTooLarge}
+	srv := newTestServer(t, st, dep, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+	createTestAppForTarball(t, st)
+
+	var errBody errorResponse
+	resp := postTarball(t, srv.URL+"/api/v1/apps/blog/deploy/tarball", session.Token, "application/gzip", []byte("fake-gzip-bytes"))
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	decodeInto(t, resp, &errBody)
+	if errBody.Error.Code != "context_too_large" {
+		t.Fatalf("error code = %q, want context_too_large", errBody.Error.Code)
+	}
+}
+
 // TestHandleDeployTarballNoContainerfile proves build.ErrNoContainerfile
 // from DeployBuild maps to 422 "no_containerfile".
 func TestHandleDeployTarballNoContainerfile(t *testing.T) {

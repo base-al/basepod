@@ -37,6 +37,24 @@ var ErrNoContainerfile = errors.New("build: no Containerfile or Dockerfile found
 // it to podman rather than relying on that.
 var ErrBadPath = errors.New("build: tar contains an entry with an unsafe path")
 
+// ErrContextTooLarge is returned when an uploaded build context
+// decompresses past Builder.maxDecompressedContext. The API layer's own
+// upload cap (see maxTarballBody in internal/api) only bounds the
+// *compressed* body size — gzip's compression ratio means a small
+// compressed upload can still expand into an enormous decompressed one (a
+// "gzip bomb"), which would otherwise fill the data directory's disk
+// (shared with the SQLite store) well before that cap, or any request
+// timeout, ever kicks in.
+var ErrContextTooLarge = errors.New("build: decompressed build context exceeds the size limit")
+
+// defaultMaxDecompressedContext is Builder's default
+// maxDecompressedContext (see New): 1 GiB, four times maxTarballBody's
+// 256 MiB compressed-upload cap — generous for any legitimate build
+// context, while still bounding worst-case disk use from a hostile or
+// buggy upload to a fixed, small multiple of the compressed cap rather
+// than leaving it unbounded.
+const defaultMaxDecompressedContext = 1 << 30 // 1 GiB
+
 // BuildRuntime is the podman capability the build pipeline needs
 // (satisfied by *podman.Client; see the compile-time assertion in
 // internal/server, which is the only place that constructs a real one).
@@ -53,6 +71,14 @@ var _ BuildRuntime = (*podman.Client)(nil)
 type Builder struct {
 	rt      BuildRuntime
 	dataDir string
+
+	// maxDecompressedContext bounds how many bytes spool will write from
+	// a decompressed upload before giving up with ErrContextTooLarge (see
+	// its doc comment). It's a field — defaulting to
+	// defaultMaxDecompressedContext in New — rather than a bare constant
+	// so tests can shrink it and exercise the limit without needing a
+	// multi-hundred-MiB fixture.
+	maxDecompressedContext int64
 
 	// sem bounds the number of builds running concurrently across every
 	// app (maxConcurrent, set by New).
@@ -79,10 +105,11 @@ func New(rt BuildRuntime, dataDir string, maxConcurrent int) *Builder {
 		maxConcurrent = 1
 	}
 	return &Builder{
-		rt:      rt,
-		dataDir: dataDir,
-		sem:     make(chan struct{}, maxConcurrent),
-		perApp:  make(map[string]*sync.Mutex),
+		rt:                     rt,
+		dataDir:                dataDir,
+		maxDecompressedContext: defaultMaxDecompressedContext,
+		sem:                    make(chan struct{}, maxConcurrent),
+		perApp:                 make(map[string]*sync.Mutex),
 	}
 }
 
@@ -180,9 +207,21 @@ func (b *Builder) spool(gzTar io.Reader) (string, error) {
 		os.Remove(path)
 		return "", fmt.Errorf("build: upload is not valid gzip: %w", err)
 	}
-	if _, err := io.Copy(f, gz); err != nil {
+	// Read at most one byte past the limit: if the copy consumes the
+	// full maxDecompressedContext+1 bytes available from limited, the
+	// decompressed context is at least that large and gets rejected below
+	// — without ever buffering (or writing to disk) more than
+	// maxDecompressedContext+1 bytes of a hostile or buggy upload,
+	// however large it claims (or turns out) to be.
+	limited := io.LimitReader(gz, b.maxDecompressedContext+1)
+	n, err := io.Copy(f, limited)
+	if err != nil {
 		os.Remove(path)
 		return "", fmt.Errorf("build: decompress upload: %w", err)
+	}
+	if n > b.maxDecompressedContext {
+		os.Remove(path)
+		return "", ErrContextTooLarge
 	}
 	// gzip.Reader.Close only checks the trailing checksum/size, which is
 	// immaterial once every byte has already been copied out above — a
