@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/base-al/basepod/internal/api"
+	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/config"
 	"github.com/base-al/basepod/internal/crypto"
@@ -64,6 +65,12 @@ const (
 	minPodmanMajor = 4
 	minPodmanMinor = 9
 )
+
+// maxConcurrentBuilds bounds how many tarball-upload builds (see
+// internal/build.Builder) may run at once across every app — a container
+// build is CPU/IO-heavy enough that letting an unbounded number run
+// simultaneously on a single control-plane host would be a foot-gun.
+const maxConcurrentBuilds = 2
 
 // Run loads configuration from cfgPath and serves the BasePod control
 // plane until ctx is canceled or a SIGINT/SIGTERM is received.
@@ -206,6 +213,7 @@ func Run(ctx context.Context, cfgPath string) error {
 	}
 
 	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt, dashboardRoute)
+	builder := build.New(pc, cfg.DataDir, maxConcurrentBuilds)
 
 	// Orphan GC: remove containers left behind by a previous crash or
 	// interrupted deploy (unknown app slug, or a stale non-current
@@ -230,7 +238,7 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: apply routes: %w", err)
 	}
 
-	srv := newHTTPServer(cfg.Listen, rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs)))
+	srv := newHTTPServer(cfg.Listen, rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder)))
 
 	log.Printf("basepod: listening on %s", cfg.Listen)
 	log.Printf("basepod: root domain %s", rootDomain)

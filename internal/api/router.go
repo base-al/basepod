@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/base-al/basepod/internal/auth"
+	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/store"
 )
 
@@ -28,6 +29,13 @@ import (
 // satisfies this interface; see the compile-time assertion in api_test.go.
 type Deployer interface {
 	Deploy(ctx context.Context, app *store.App, imageRef string) (*store.Deployment, error)
+	// DeployBuild runs a tarball-sourced deploy: gzTar is the raw gzipped
+	// tar upload body, and builder is the shared build pipeline
+	// (internal/build.Builder) handleDeployTarball hands every call —
+	// passed per-call rather than baked into the Deployer at construction
+	// so the API layer owns configuring build concurrency without
+	// changing deploy.New's signature.
+	DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error)
 	RemoveApp(ctx context.Context, app *store.App) error
 }
 
@@ -112,10 +120,16 @@ type api struct {
 	// logs streams an app's raw container log data for handleAppLogs to
 	// demux into SSE events.
 	logs LogSource
+
+	// builder is the shared tarball-build pipeline, passed straight
+	// through to every Deployer.DeployBuild call by handleDeployTarball —
+	// see the Deployer.DeployBuild doc comment for why it's threaded
+	// through per-call rather than held only by dep.
+	builder *build.Builder
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
-func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier, logs LogSource) http.Handler {
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder) http.Handler {
 	a := &api{
 		st:      st,
 		dep:     dep,
@@ -126,6 +140,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 		open:    open,
 		routes:  routes,
 		logs:    logs,
+		builder: builder,
 	}
 
 	r := chi.NewRouter()
@@ -155,13 +170,24 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 			r.Delete("/apps/{slug}/domains/{id}", a.handleDeleteDomain)
 		})
 
+		// The tarball upload route needs its own, much larger body cap
+		// (see maxTarballBody in apps.go) — a bare http.MaxBytesReader in
+		// the handler itself, not bodyLimit's 1 MiB — so it's registered
+		// in its own group with only requireAuth, not bodyLimit.
+		r.Group(func(r chi.Router) {
+			r.Use(a.requireAuth)
+			r.Post("/apps/{slug}/deploy/tarball", a.handleDeployTarball)
+		})
+
 		// The logs route gets its own auth middleware rather than
 		// requireAuth: native EventSource cannot set an Authorization
-		// header, so this route (and only this route) also accepts the
-		// session token via ?access_token=. See requireAuthLogs.
+		// header, so this route (and only this route, plus the build-log
+		// route below — same reasoning) also accepts the session token via
+		// ?access_token=. See requireAuthLogs.
 		r.Group(func(r chi.Router) {
 			r.Use(a.requireAuthLogs)
 			r.Get("/apps/{slug}/logs", a.handleAppLogs)
+			r.Get("/apps/{slug}/deployments/{number}/log", a.handleDeploymentLog)
 		})
 	})
 	return r

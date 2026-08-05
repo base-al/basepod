@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/base-al/basepod/internal/podman"
 )
 
 // ErrNoContainerfile is returned when an uploaded build context has
@@ -42,6 +44,10 @@ var ErrBadPath = errors.New("build: tar contains an entry with an unsafe path")
 type BuildRuntime interface {
 	BuildImage(ctx context.Context, tag, dockerfile string, contextTar io.Reader, logSink io.Writer) error
 }
+
+// Compile-time check that the production podman client satisfies the
+// seam Builder consumes.
+var _ BuildRuntime = (*podman.Client)(nil)
 
 // Builder turns uploaded gzipped tar build contexts into local images.
 type Builder struct {
@@ -186,15 +192,24 @@ func (b *Builder) spool(gzTar io.Reader) (string, error) {
 	return path, nil
 }
 
+// LogPath returns the path Build writes slug's deploymentNumber build log
+// to. It's a pure path computation (no I/O, and safe to call before a
+// build even starts) so a caller — deploy.Engine.DeployBuild — can record
+// it on a deployment row immediately after creating it, making the log
+// addressable (e.g. for live tailing while the build is still running)
+// for the log's entire lifetime rather than only once Build returns.
+func (b *Builder) LogPath(slug string, deploymentNumber int) string {
+	return filepath.Join(b.dataDir, "apps", slug, "builds", strconv.Itoa(deploymentNumber)+".log")
+}
+
 // createLog creates (with parent directories) the build log file for
 // slug's deploymentNumber and returns its path and an open, writable
 // handle. The caller owns closing it.
 func (b *Builder) createLog(slug string, deploymentNumber int) (string, *os.File, error) {
-	logDir := filepath.Join(b.dataDir, "apps", slug, "builds")
-	if err := os.MkdirAll(logDir, 0o700); err != nil {
+	logPath := b.LogPath(slug, deploymentNumber)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		return "", nil, fmt.Errorf("build: create log dir: %w", err)
 	}
-	logPath := filepath.Join(logDir, strconv.Itoa(deploymentNumber)+".log")
 	f, err := os.Create(logPath)
 	if err != nil {
 		return "", nil, fmt.Errorf("build: create log file: %w", err)

@@ -130,11 +130,14 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 // DeployBuild runs one tarball-sourced deploy of app: it creates the
 // deployment row up front (source "tarball", with no image_ref yet — see
 // store.CreateDeploymentFull) so the deployment number exists for the
-// build log's path, marks the app "deploying", then hands gzTar off to
+// build log's path, records that path on the deployment immediately
+// (builder.LogPath is a pure computation from slug+number, so this needs
+// no I/O and can happen before the build even starts — see its doc
+// comment for why: it's what makes GET .../deployments/{n}/log able to
+// live-tail the log for the build's entire duration, not just after it
+// finishes), marks the app "deploying", then hands gzTar off to
 // builder.Build to decompress, validate, and build it into a local image
-// tag. The build log path is recorded on the deployment as soon as it's
-// known (even if the build itself then fails), so a failed build's log
-// is still addressable via the deployment row.
+// tag.
 //
 // On a build failure, this goes through the same fail() path Deploy uses
 // for every other failure: the deployment is marked failed and the app's
@@ -153,17 +156,18 @@ func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reade
 	if err != nil {
 		return nil, fmt.Errorf("deploy: create deployment: %w", err)
 	}
+
+	logPath := builder.LogPath(app.Slug, dep.Number)
+	if err := e.st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		fmt.Fprintf(e.log, "deploy: set build log path for deployment %d: %v\n", dep.ID, err)
+	}
+	dep.BuildLogPath = logPath
+
 	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
 	}
 
-	tag, logPath, buildErr := builder.Build(ctx, app.Slug, dep.Number, gzTar)
-	if logPath != "" {
-		if err := e.st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
-			fmt.Fprintf(e.log, "deploy: set build log path for deployment %d: %v\n", dep.ID, err)
-		}
-		dep.BuildLogPath = logPath
-	}
+	tag, _, buildErr := builder.Build(ctx, app.Slug, dep.Number, gzTar)
 	if buildErr != nil {
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: build: %w", buildErr))
 	}
