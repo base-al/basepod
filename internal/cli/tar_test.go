@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -259,5 +260,47 @@ func TestPackToTempFileSizeAndReadability(t *testing.T) {
 	names := listTarEntries(t, data)
 	if !containsName(names, "app.py") {
 		t.Fatalf("names missing app.py: %v", names)
+	}
+}
+
+// TestPackDirSkipsSymlinksPointingOutsideTheBuildContext proves packDir
+// neither includes a symlink entry itself nor follows it into the tarball
+// — a symlink that escapes the build context (e.g. into the packer's own
+// working directory, or anywhere else on the host filesystem the server
+// was never meant to see) must not leak its target's contents into an
+// uploaded build context.
+func TestPackDirSkipsSymlinksPointingOutsideTheBuildContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Symlink requires elevated privileges on windows")
+	}
+
+	outside := t.TempDir()
+	secretPath := filepath.Join(outside, "secret.txt")
+	const secretContents = "outside-the-build-context-should-never-be-uploaded"
+	if err := os.WriteFile(secretPath, []byte(secretContents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, "Containerfile", "FROM scratch\n")
+	writeFile(t, dir, "app.py", "print('hi')\n")
+	if err := os.Symlink(secretPath, filepath.Join(dir, "escape-link")); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := packDir(dir, &buf); err != nil {
+		t.Fatalf("packDir: %v", err)
+	}
+
+	names := listTarEntries(t, buf.Bytes())
+	if containsName(names, "escape-link") {
+		t.Fatalf("names contains the symlink itself, want it skipped: %v", names)
+	}
+	if !containsName(names, "app.py") || !containsName(names, "Containerfile") {
+		t.Fatalf("names missing real files: %v", names)
+	}
+	if bytes.Contains(buf.Bytes(), []byte(secretContents)) {
+		t.Fatal("packed tarball contains the symlink target's content — the symlink was followed instead of skipped")
 	}
 }

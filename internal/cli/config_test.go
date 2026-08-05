@@ -69,6 +69,38 @@ func TestSaveConfigFileMode0600(t *testing.T) {
 	}
 }
 
+// TestSaveConfigFixesLoosePermissionsOnExistingFile proves SaveConfigTo
+// re-tightens an already-existing cli.yaml's mode to 0600 rather than only
+// applying that mode at creation time (os.WriteFile's mode argument is a
+// no-op against a file that already exists) — the config holds a bearer
+// session token, so a re-save must never leave a previously
+// loosely-permissioned file world/group-readable.
+func TestSaveConfigFixesLoosePermissionsOnExistingFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits aren't meaningful on windows")
+	}
+	path := filepath.Join(t.TempDir(), "cli.yaml")
+	if err := os.WriteFile(path, []byte("current: \"\"\ncontexts: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("precondition: file mode = %v, %v, want 0644", info, err)
+	}
+
+	cfg := &Config{Contexts: map[string]Context{"prod": {URL: "https://x", Token: "t"}}, Current: "prod"}
+	if err := SaveConfigTo(path, cfg); err != nil {
+		t.Fatalf("SaveConfigTo: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("file mode after re-save = %o, want 0600 (loose permissions on a pre-existing file must be tightened)", perm)
+	}
+}
+
 func TestConfigPathEnvOverride(t *testing.T) {
 	custom := filepath.Join(t.TempDir(), "custom-cli.yaml")
 	t.Setenv(configPathEnv, custom)

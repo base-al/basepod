@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -90,7 +91,7 @@ func TestLoginSavesContext(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, _, err := runCLI(t, "", "login", srv.URL, "--email", "a@b.com", "--password", "hunter2")
+	out, _, err := runCLI(t, "hunter2\n", "login", srv.URL, "--email", "a@b.com")
 	if err != nil {
 		t.Fatalf("login: %v (out=%s)", err, out)
 	}
@@ -236,6 +237,116 @@ func TestDeployFromSourceRequiresContainerfile(t *testing.T) {
 	_, _, err := runCLI(t, "", "deploy", "-a", "blog", dir)
 	if err == nil || !strings.Contains(err.Error(), "Containerfile") {
 		t.Fatalf("err = %v, want a Containerfile-required error", err)
+	}
+}
+
+// TestDeployFromSourceHappyPath proves the tarball path of `basepod
+// deploy` uploads a gzipped build context (Content-Type application/gzip)
+// to .../deploy/tarball and reports the deployment healthy when the
+// server's synchronous response says so.
+func TestDeployFromSourceHappyPath(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	var gotContentType string
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/apps/blog/deploy/tarball" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		gotContentType = r.Header.Get("Content-Type")
+		gotPath = r.URL.Path
+		// Drain the body so the handler behaves like a real server that
+		// actually reads the upload before responding.
+		_, _ = io.Copy(io.Discard, r.Body)
+		writeJSONResponse(w, http.StatusOK, Deployment{
+			Number: 7, Image: "localhost/basepod/blog:7", Status: "healthy",
+			Source: "tarball", Trigger: "api",
+		})
+	}))
+	defer srv.Close()
+	saveTestContext(t, path, srv.URL, "tok")
+
+	dir := t.TempDir()
+	writeFile(t, dir, "Containerfile", "FROM scratch\n")
+	writeFile(t, dir, "main.go", "package main\n")
+
+	out, _, err := runCLI(t, "", "deploy", "-a", "blog", dir)
+	if err != nil {
+		t.Fatalf("deploy: %v (out=%s)", err, out)
+	}
+	if gotPath != "/api/v1/apps/blog/deploy/tarball" {
+		t.Fatalf("request path = %q", gotPath)
+	}
+	if gotContentType != "application/gzip" {
+		t.Fatalf("Content-Type = %q, want application/gzip", gotContentType)
+	}
+	if !strings.Contains(out, "deployment #7") || !strings.Contains(out, "healthy") {
+		t.Fatalf("output = %q", out)
+	}
+}
+
+// TestDeployFromSourcePrintsBuildLogOnFailure proves that when the
+// tarball upload fails server-side (502 deploy_failed — no deployment
+// number in that response body at all, see internal/api's
+// handleDeployTarball), the CLI infers which deployment just failed by
+// GETting the app (deployments come back newest-first — see
+// store.ListDeployments' ORDER BY number DESC — so Deployments[0] is the
+// one that just failed) and prints its build log, then still reports the
+// original error.
+func TestDeployFromSourcePrintsBuildLogOnFailure(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	var appDetailRequested, logRequested bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/apps/blog/deploy/tarball":
+			_, _ = io.Copy(io.Discard, r.Body)
+			writeJSONResponse(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]string{"code": "deploy_failed", "message": "build failed: exit status 1"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/apps/blog":
+			appDetailRequested = true
+			writeJSONResponse(w, http.StatusOK, AppDetail{
+				AppInfo: AppInfo{Slug: "blog", Status: "failed"},
+				Deployments: []Deployment{
+					// Newest first, matching the real server's ordering.
+					{Number: 5, Status: "failed", Source: "tarball", HasBuildLog: true},
+					{Number: 4, Status: "healthy", Source: "tarball", HasBuildLog: true},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/apps/blog/deployments/5/log":
+			logRequested = true
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("Step 1/2: FROM scratch\nStep 2/2: RUN false\nexit status 1\n"))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	saveTestContext(t, path, srv.URL, "tok")
+
+	dir := t.TempDir()
+	writeFile(t, dir, "Containerfile", "FROM scratch\nRUN false\n")
+
+	out, _, err := runCLI(t, "", "deploy", "-a", "blog", dir)
+	if err == nil {
+		t.Fatal("want a non-nil error for a failed deploy")
+	}
+	if err.Error() != "build failed: exit status 1" {
+		t.Fatalf("err = %q, want the server's message verbatim", err.Error())
+	}
+	if !appDetailRequested {
+		t.Fatal("CLI never GET the app to find the failed deployment")
+	}
+	if !logRequested {
+		t.Fatal("CLI never fetched deployment #5's build log")
+	}
+	if !strings.Contains(out, "Step 2/2: RUN false") || !strings.Contains(out, "exit status 1") {
+		t.Fatalf("output missing build log text: %q", out)
+	}
+	if !strings.Contains(out, "--- build log ---") {
+		t.Fatalf("output missing build log delimiter: %q", out)
 	}
 }
 

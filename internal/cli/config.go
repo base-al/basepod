@@ -91,6 +91,14 @@ func SaveConfig(cfg *Config) error {
 
 // SaveConfigTo writes cfg to an explicit path, bypassing ConfigPath's
 // env-var resolution — the save-side counterpart to LoadConfigFrom.
+//
+// os.WriteFile's mode argument only takes effect when it creates the file;
+// it is silently ignored by the umask-independent "file already exists"
+// path, so re-saving over a pre-existing cli.yaml that somehow ended up
+// world/group-readable (a stray `umask 022`, a config seeded by another
+// tool) would otherwise leave the bearer token exposed at whatever mode
+// the file already had. An explicit os.Chmod after every write closes that
+// gap regardless of whether the file was just created or already existed.
 func SaveConfigTo(path string, cfg *Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("cli: create config dir: %w", err)
@@ -101,6 +109,9 @@ func SaveConfigTo(path string, cfg *Config) error {
 	}
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		return fmt.Errorf("cli: write config %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("cli: chmod config %s: %w", path, err)
 	}
 	return nil
 }

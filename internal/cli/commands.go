@@ -85,7 +85,7 @@ func contextNameFromURL(raw string) string {
 
 // newLoginCmd builds `basepod login <url>`.
 func newLoginCmd() *cobra.Command {
-	var email, password, ctxName string
+	var email, ctxName string
 	cmd := &cobra.Command{
 		Use:          "login <url>",
 		Short:        "Log in to a BasePod server and save it as a context",
@@ -104,18 +104,18 @@ func newLoginCmd() *cobra.Command {
 				}
 				email = line
 			}
-			if password == "" {
-				// No golang.org/x/term dependency here (see task brief):
-				// the password is read as a plain line from stdin, echoed
-				// like any other terminal input. Warn so that isn't a
-				// surprise over e.g. a screen-shared terminal.
-				fmt.Fprintln(out, "Warning: password will be echoed (typed input is not masked)")
-				fmt.Fprint(out, "Password: ")
-				line, err := readLine(in)
-				if err != nil {
-					return fmt.Errorf("read password: %w", err)
-				}
-				password = line
+
+			// Deliberately no --password flag (and no golang.org/x/term
+			// dependency — see the task brief): a password flag would land
+			// in shell history and be visible to anyone on the box via
+			// `ps`, so the password is always read as a plain line from
+			// stdin instead, echoed like any other terminal input. Warn so
+			// that isn't a surprise over e.g. a screen-shared terminal.
+			fmt.Fprintln(out, "Warning: password will be echoed (typed input is not masked)")
+			fmt.Fprint(out, "Password: ")
+			password, err := readLine(in)
+			if err != nil {
+				return fmt.Errorf("read password: %w", err)
 			}
 
 			client := NewClient(serverURL, "")
@@ -144,7 +144,6 @@ func newLoginCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&email, "email", "", "account email (prompted if omitted)")
-	cmd.Flags().StringVar(&password, "password", "", "account password (prompted if omitted)")
 	cmd.Flags().StringVar(&ctxName, "context", "", "name for the saved context (default: the URL's host)")
 	return cmd
 }
@@ -159,8 +158,16 @@ func newContextCmd() *cobra.Command {
 	return cmd
 }
 
+// contextListEntry is the --json shape of one `context list` row.
+type contextListEntry struct {
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Current bool   `json:"current"`
+}
+
 func newContextListCmd() *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	cmd := &cobra.Command{
 		Use:          "list",
 		Short:        "List saved contexts",
 		SilenceUsage: true,
@@ -175,6 +182,14 @@ func newContextListCmd() *cobra.Command {
 			}
 			sort.Strings(names)
 
+			if asJSON {
+				entries := make([]contextListEntry, 0, len(names))
+				for _, n := range names {
+					entries = append(entries, contextListEntry{Name: n, URL: cfg.Contexts[n].URL, Current: n == cfg.Current})
+				}
+				return printJSON(cmd.OutOrStdout(), entries)
+			}
+
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
 			fmt.Fprintln(tw, "NAME\tURL\tCURRENT")
 			for _, n := range names {
@@ -187,6 +202,8 @@ func newContextListCmd() *cobra.Command {
 			return tw.Flush()
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON instead of a table")
+	return cmd
 }
 
 func newContextUseCmd() *cobra.Command {
@@ -604,8 +621,15 @@ func newRollbackCmd() *cobra.Command {
 	return cmd
 }
 
+// statusOutput is the --json shape of `basepod status`.
+type statusOutput struct {
+	System SystemInfo `json:"system"`
+	Apps   []AppInfo  `json:"apps"`
+}
+
 // newStatusCmd builds `basepod status`.
 func newStatusCmd() *cobra.Command {
+	var asJSON bool
 	cmd := &cobra.Command{
 		Use:          "status",
 		Short:        "Show system and app status",
@@ -625,6 +649,9 @@ func newStatusCmd() *cobra.Command {
 			}
 
 			out := cmd.OutOrStdout()
+			if asJSON {
+				return printJSON(out, statusOutput{System: *sys, Apps: apps})
+			}
 			fmt.Fprintf(out, "version: %s\npodman:  %s\napps:    %d\n\n", sys.Version, sys.Podman, sys.Apps)
 			tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
 			fmt.Fprintln(tw, "SLUG\tSTATUS\tIMAGE\tPORT")
@@ -634,6 +661,7 @@ func newStatusCmd() *cobra.Command {
 			return tw.Flush()
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON instead of a table")
 	addContextFlag(cmd)
 	return cmd
 }
