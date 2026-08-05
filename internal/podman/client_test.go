@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -160,6 +161,110 @@ func TestPullImageStreamErrorSurvivesTrailingGarbage(t *testing.T) {
 	err := c.PullImage(context.Background(), "example.com/missing:latest")
 	if err == nil || !strings.Contains(err.Error(), "manifest unknown") {
 		t.Fatalf("want error containing %q, got %v", "manifest unknown", err)
+	}
+}
+
+// TestBuildImageStreamsLogAndSetsTagDockerfile proves BuildImage sends
+// dockerfile/t as query params, writes every {"stream":...} line verbatim
+// to logSink, and returns nil on a clean stream.
+func TestBuildImageStreamsLogAndSetsTagDockerfile(t *testing.T) {
+	var gotQuery url.Values
+	var gotContentType string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/build", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		gotContentType = r.Header.Get("Content-Type")
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(200)
+		w.Write([]byte("{\"stream\":\"Step 1/2 : FROM alpine\\n\"}\n{\"stream\":\"Step 2/2 : RUN true\\n\"}\n"))
+	})
+	c := fakeDaemon(t, mux)
+
+	var logBuf bytes.Buffer
+	err := c.BuildImage(context.Background(), "localhost/basepod/blog:1", "Containerfile", strings.NewReader("fake-tar-bytes"), &logBuf)
+	if err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+	if gotQuery.Get("dockerfile") != "Containerfile" || gotQuery.Get("t") != "localhost/basepod/blog:1" {
+		t.Fatalf("query = %v, want dockerfile=Containerfile t=localhost/basepod/blog:1", gotQuery)
+	}
+	if gotContentType != "application/x-tar" {
+		t.Fatalf("Content-Type = %q, want application/x-tar", gotContentType)
+	}
+	want := "Step 1/2 : FROM alpine\nStep 2/2 : RUN true\n"
+	if logBuf.String() != want {
+		t.Fatalf("logSink = %q, want %q", logBuf.String(), want)
+	}
+}
+
+// TestBuildImageDefaultsDockerfileToContainerfile proves an empty
+// dockerfile argument defaults the query param to "Containerfile".
+func TestBuildImageDefaultsDockerfileToContainerfile(t *testing.T) {
+	var gotQuery url.Values
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/build", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.WriteHeader(200)
+		w.Write([]byte("{\"stream\":\"ok\\n\"}\n"))
+	})
+	c := fakeDaemon(t, mux)
+	if err := c.BuildImage(context.Background(), "x:1", "", strings.NewReader(""), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if gotQuery.Get("dockerfile") != "Containerfile" {
+		t.Fatalf("dockerfile = %q, want Containerfile", gotQuery.Get("dockerfile"))
+	}
+}
+
+// TestBuildImageStreamError proves a {"error":...} line within an
+// otherwise-200 body surfaces as an error (mirroring PullImage's stream
+// error handling).
+func TestBuildImageStreamError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/build", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("{\"stream\":\"Step 1/2\\n\"}\n{\"error\":\"executor failed running [/bin/sh -c false]\"}\n"))
+	})
+	c := fakeDaemon(t, mux)
+	err := c.BuildImage(context.Background(), "x:1", "Containerfile", strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "executor failed running") {
+		t.Fatalf("err = %v, want it to contain the stream error message", err)
+	}
+}
+
+// TestBuildImageStreamErrorPrefersErrorDetailMessage proves that when a
+// stream error line carries both a flat "error" string and a nested
+// "errorDetail":{"message":...}, the more specific errorDetail message
+// wins.
+func TestBuildImageStreamErrorPrefersErrorDetailMessage(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/build", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"errorDetail":{"message":"detailed failure reason"},"error":"generic failure"}` + "\n"))
+	})
+	c := fakeDaemon(t, mux)
+	err := c.BuildImage(context.Background(), "x:1", "Containerfile", strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "detailed failure reason") {
+		t.Fatalf("err = %v, want it to contain the errorDetail message", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "generic failure") {
+		t.Fatalf("err = %v, want the flat 'error' message to be overridden by errorDetail", err)
+	}
+}
+
+// TestBuildImageNon2xxStatus proves a non-2xx HTTP response (e.g. a
+// malformed request rejected before any streaming begins) is reported via
+// apiError rather than treated as a (nonexistent) JSON stream.
+func TestBuildImageNon2xxStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/build", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]any{"message": "internal build error", "response": 500})
+	})
+	c := fakeDaemon(t, mux)
+	err := c.BuildImage(context.Background(), "x:1", "Containerfile", strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "internal build error") {
+		t.Fatalf("err = %v, want it to contain %q", err, "internal build error")
 	}
 }
 

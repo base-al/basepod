@@ -348,6 +348,94 @@ func (c *Client) PullImage(ctx context.Context, ref string) error {
 	return streamErr
 }
 
+// buildStreamLine is one line of the newline-delimited JSON stream
+// libpod's POST /build sends back — mirrors pullStreamLine, but /build's
+// error shape can additionally carry a nested "errorDetail":{"message":
+// "..."} object instead of (or alongside) the flat "error" string; when
+// both are present ErrorDetail.Message is preferred as the more specific
+// message.
+type buildStreamLine struct {
+	Stream      string `json:"stream,omitempty"`
+	Error       string `json:"error,omitempty"`
+	ErrorDetail *struct {
+		Message string `json:"message"`
+	} `json:"errorDetail,omitempty"`
+}
+
+// BuildImage builds an image tagged tag from contextTar — a raw,
+// *uncompressed* tar stream (the caller decompresses any gzip wrapper
+// first; see internal/build.Builder) — via libpod's POST /build.
+// dockerfile names the in-context path to the Containerfile/Dockerfile to
+// build (libpod's build endpoint accepts either name, but does not try
+// both itself — the caller must pass whichever one its context actually
+// contains); "" defaults to "Containerfile".
+//
+// Like PullImage, build progress and failures both arrive as
+// newline-delimited JSON within an otherwise-200 body: {"stream":"..."}
+// lines are progress text, written verbatim to logSink, while
+// {"error":"..."} (optionally with a more specific nested
+// "errorDetail":{"message":"..."}) reports a failed build. The whole
+// stream is drained before returning an error, mirroring PullImage's
+// reasoning: a stream-reported error is the actionable signal and must
+// not be discarded by a decode failure on a later (or trailing garbage)
+// line.
+func (c *Client) BuildImage(ctx context.Context, tag, dockerfile string, contextTar io.Reader, logSink io.Writer) error {
+	if tag == "" {
+		return fmt.Errorf("podman: BuildImage: tag is required")
+	}
+	if dockerfile == "" {
+		dockerfile = "Containerfile"
+	}
+	q := url.Values{}
+	q.Set("dockerfile", dockerfile)
+	q.Set("t", tag)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/build?"+q.Encode(), contextTar)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("podman: build %s: %w", tag, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return apiError(resp.StatusCode, data)
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	var streamErr error
+	for {
+		var line buildStreamLine
+		if err := dec.Decode(&line); err != nil {
+			if err == io.EOF {
+				break
+			}
+			// See PullImage's identical reasoning: a captured stream error
+			// takes precedence over a decode failure on whatever comes
+			// after it.
+			if streamErr != nil {
+				break
+			}
+			return fmt.Errorf("podman: build %s: reading stream: %w", tag, err)
+		}
+		if line.Stream != "" {
+			io.WriteString(logSink, line.Stream)
+		}
+		if line.Error != "" {
+			msg := line.Error
+			if line.ErrorDetail != nil && line.ErrorDetail.Message != "" {
+				msg = line.ErrorDetail.Message
+			}
+			streamErr = fmt.Errorf("podman: build %s: %s", tag, msg)
+		}
+	}
+	return streamErr
+}
+
 // EnsureNetwork makes sure a network named name exists, creating it
 // (labeled basepod.managed=true) if it doesn't. If it already exists, it
 // self-heals a DNS-disabled network (see selfHealNetworkDNS) — a state
