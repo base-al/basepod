@@ -6,6 +6,7 @@ import { useToast } from '@nuxt/ui/composables'
 import type { TabsItem } from '@nuxt/ui'
 
 import { api, ApiError } from '../lib/api'
+import { isPendingPlaceholder } from '../lib/pendingImage'
 import StatusBadge from '../components/StatusBadge.vue'
 import ImageRef from '../components/ImageRef.vue'
 import DeploymentList from '../components/DeploymentList.vue'
@@ -116,6 +117,15 @@ const deployMutation = useMutation({
 const isDeploying = computed(() => deployMutation.isPending.value || app.value?.status === 'deploying')
 const displayStatus = computed(() => (isDeploying.value ? 'deploying' : (app.value?.status ?? 'created')))
 
+// True when this app was created for an upload build that never landed
+// (see lib/pendingImage.ts) — it's still sitting on the honest-but-fake
+// "localhost/basepod/<slug>:pending" image NewApp.vue sets before the
+// real tarball deploy runs. Plain "Deploy" (redeploy the app's *current*
+// image) would just try, and fail, to pull that nonexistent tag, so it's
+// disabled in that state; "Deploy new image…" and "Delete" stay enabled
+// since both are real ways out of it.
+const hasPendingPlaceholder = computed(() => (app.value ? isPendingPlaceholder(app.value.image) : false))
+
 // Set by the ?buildLog=<number> query param below, right after
 // NewApp.vue's upload-source flow lands here — passed down to
 // DeploymentList so it opens that deployment's build-log drawer without
@@ -148,7 +158,10 @@ onMounted(() => {
 })
 
 function deployLatest() {
-  if (isDeploying.value) return
+  // Same guard as the Deploy button's :disabled — also reached from
+  // EnvEditor's "Redeploy" action (env tab), which redeploys the current
+  // image too and would hit the same doomed pull against the placeholder.
+  if (isDeploying.value || hasPendingPlaceholder.value) return
   deployMutation.mutate(undefined)
 }
 
@@ -241,6 +254,25 @@ const deleteMutation = useMutation({
         <UTabs :items="tabItems" :model-value="activeTab" :content="false" variant="link" class="mb-6" @update:model-value="onTabChange" />
 
         <div v-if="activeTab === 'overview'" class="flex flex-col gap-6">
+          <UAlert v-if="hasPendingPlaceholder" color="warning" variant="subtle" title="No successful build yet" icon="i-lucide-alert-triangle">
+            <template #actions>
+              <UButton size="sm" color="warning" variant="soft" icon="i-lucide-package-plus" @click="openNewImage">
+                Deploy new image…
+              </UButton>
+              <UButton size="sm" color="neutral" variant="ghost" to="/apps/new" icon="i-lucide-upload">
+                New app (upload)
+              </UButton>
+            </template>
+            <template #description>
+              <p class="text-sm text-slate-400">
+                This app was created for an upload build that never finished, so it has no real image to run —
+                deploying now would just fail trying to pull a placeholder tag. Deploy a real image below, delete
+                this app and re-upload from <span class="font-medium text-slate-300">New app</span>, or deploy a
+                build context from the command line with <span class="font-mono">basepod deploy</span>.
+              </p>
+            </template>
+          </UAlert>
+
           <UAlert v-if="deployError" color="error" variant="subtle" title="Deploy failed" :description="deployError" icon="i-lucide-alert-circle" />
 
           <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
@@ -284,7 +316,8 @@ const deleteMutation = useMutation({
                   variant="soft"
                   icon="i-lucide-rocket"
                   :loading="deployMutation.isPending.value"
-                  :disabled="isDeploying"
+                  :disabled="isDeploying || hasPendingPlaceholder"
+                  :title="hasPendingPlaceholder ? 'No successful build yet — upload a build context or set an image' : undefined"
                   @click="deployLatest"
                 >
                   Deploy
