@@ -18,8 +18,8 @@ func main() {
 		&cobra.Command{Use: "version", Short: "Print version", Run: func(*cobra.Command, []string) {
 			fmt.Println(Version)
 		}},
-		newServerCmd(), // added in Task 8; stub now: prints "not implemented", exits 1
-		newSetupCmd(),  // added in Task 7; stub now
+		newServerCmd(),
+		newSetupCmd(),
 	)
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -44,11 +44,6 @@ func newSetupCmd() *cobra.Command {
 		Use:   "setup",
 		Short: "First-run setup",
 		RunE: func(*cobra.Command, []string) error {
-			// Use provided config path or default
-			if cfgPath == "" {
-				cfgPath = config.DefaultPath()
-			}
-
 			// Validate required flags
 			if rootDomain == "" {
 				return fmt.Errorf("--root-domain is required")
@@ -81,7 +76,7 @@ func newSetupCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&cfgPath, "config", "", fmt.Sprintf("config file (default: %s)", config.DefaultPath()))
+	cmd.Flags().StringVar(&cfgPath, "config", config.DefaultPath(), "config file")
 	cmd.Flags().StringVar(&rootDomain, "root-domain", "", "root domain for deployed apps")
 	cmd.Flags().StringVar(&adminEmail, "admin-email", "", "email address for admin user")
 	cmd.Flags().StringVar(&adminPassword, "admin-password", "", "password for admin user (min 8 chars)")
