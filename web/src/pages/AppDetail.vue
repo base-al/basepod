@@ -116,14 +116,34 @@ const deployMutation = useMutation({
 const isDeploying = computed(() => deployMutation.isPending.value || app.value?.status === 'deploying')
 const displayStatus = computed(() => (isDeploying.value ? 'deploying' : (app.value?.status ?? 'created')))
 
+// Set by the ?buildLog=<number> query param below, right after
+// NewApp.vue's upload-source flow lands here — passed down to
+// DeploymentList so it opens that deployment's build-log drawer without
+// requiring an extra click to find the build that was just kicked off.
+const autoExpandDeploymentNumber = ref<number | null>(null)
+
 // NewApp.vue navigates here with ?autodeploy=1 right after creating the
-// app, rather than triggering the deploy itself and racing its own
-// unmount — this page owns the deploy mutation, so the pending/error UI
-// below (amber badge, error callout) covers the very first deploy too.
+// app (image source), rather than triggering the deploy itself and
+// racing its own unmount — this page owns the deploy mutation, so the
+// pending/error UI below (amber badge, error callout) covers the very
+// first deploy too. The upload source instead navigates with
+// ?buildLog=<number> (it already triggered its own tarball deploy before
+// navigating) — the two query shapes are mutually exclusive, one per
+// source picker branch in NewApp.vue.
 onMounted(() => {
   if (route.query.autodeploy === '1') {
     void router.replace({ name: 'app-detail', params: { slug: slug.value }, query: {} })
     deployMutation.mutate(undefined)
+    return
+  }
+
+  if (typeof route.query.buildLog === 'string') {
+    const number = Number(route.query.buildLog)
+    if (Number.isInteger(number)) {
+      autoExpandDeploymentNumber.value = number
+      activeTab.value = 'deployments'
+    }
+    void router.replace({ name: 'app-detail', params: { slug: slug.value }, query: {} })
   }
 })
 
@@ -305,7 +325,7 @@ const deleteMutation = useMutation({
         </div>
 
         <div v-else-if="activeTab === 'deployments'">
-          <DeploymentList :slug="slug" :deployments="app.deployments" />
+          <DeploymentList :slug="slug" :deployments="app.deployments" :auto-expand-number="autoExpandDeploymentNumber" />
         </div>
 
         <!-- v-if (not v-show): the log stream must actually tear down —

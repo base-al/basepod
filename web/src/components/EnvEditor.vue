@@ -14,6 +14,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useToast } from '@nuxt/ui/composables'
 
 import { api, ApiError, type EnvVar } from '../lib/api'
+import { parseDotEnv, type ParsedEnvEntry } from '../lib/envparse'
 
 const props = defineProps<{ slug: string; redeployRequired: boolean; deploying: boolean }>()
 
@@ -135,37 +136,15 @@ function cancelBulkMode() {
   bulkText.value = ''
 }
 
-/** Parses .env-format text: blank lines and lines whose first non-blank
- * character is '#' are ignored; every other line splits on the FIRST '='
- * (so values may themselves contain '='); both key and value are
- * trimmed. Lines with no '=' at all are skipped (nothing sane to do with
- * them). Later duplicate keys within the text win over earlier ones,
- * matching typical .env tooling. Surrounding quotes in values are left
- * as-is — this parser doesn't attempt shell-style quote stripping. */
-function parseEnvText(text: string): Map<string, string> {
-  const out = new Map<string, string>()
-  for (const rawLine of text.split('\n')) {
-    const line = rawLine.trim()
-    if (!line || line.startsWith('#')) continue
-    const eq = line.indexOf('=')
-    if (eq === -1) continue
-    const key = line.slice(0, eq).trim()
-    const value = line.slice(eq + 1).trim()
-    if (!key) continue
-    out.set(key, value)
-  }
-  return out
-}
-
 // Bulk-apply that would demote an existing secret to a plain value (see
 // applyBulk below) is confirmed first, listing exactly which keys — set
 // by applyBulk, read/cleared by the confirm modal in the template.
 const bulkDemoteConfirmOpen = ref(false)
 const bulkDemoteKeys = ref<string[]>([])
 
-function performBulkApply(parsed: Map<string, string>) {
-  const keptSecrets = rows.value.filter((r) => r.isSecret && !parsed.has(r.key))
-  const newPublicRows: EnvRow[] = [...parsed.entries()].map(([key, value]) => ({
+function performBulkApply(parsed: ParsedEnvEntry[]) {
+  const keptSecrets = rows.value.filter((r) => r.isSecret && !parsed.some((e) => e.key === r.key))
+  const newPublicRows: EnvRow[] = parsed.map(({ key, value }) => ({
     id: nextId++,
     key,
     value,
@@ -189,8 +168,8 @@ function performBulkApply(parsed: Map<string, string>) {
  * ignoring it. Any such demotion is confirmed first, by name, since it's
  * otherwise an easy way to lose a secret without meaning to. */
 function applyBulk() {
-  const parsed = parseEnvText(bulkText.value)
-  const demoted = rows.value.filter((r) => r.isSecret && parsed.has(r.key)).map((r) => r.key)
+  const parsed = parseDotEnv(bulkText.value)
+  const demoted = rows.value.filter((r) => r.isSecret && parsed.some((e) => e.key === r.key)).map((r) => r.key)
   if (demoted.length) {
     bulkDemoteKeys.value = demoted
     bulkDemoteConfirmOpen.value = true
@@ -200,7 +179,7 @@ function applyBulk() {
 }
 
 function confirmBulkDemote() {
-  performBulkApply(parseEnvText(bulkText.value))
+  performBulkApply(parseDotEnv(bulkText.value))
 }
 
 function cancelBulkDemote() {
