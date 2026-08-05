@@ -152,7 +152,7 @@ func (e *Engine) fail(ctx context.Context, app *store.App, dep *store.Deployment
 	dep.Error = cause.Error()
 
 	status := "error"
-	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.app": app.Slug})
+	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
 	if err != nil {
 		fmt.Fprintf(e.log, "deploy: list containers for %s: %v\n", app.Slug, err)
 	} else {
@@ -227,6 +227,16 @@ func (e *Engine) probeUntilUp(ctx context.Context, upstream string) error {
 // re-applies the route set so its hostname is dropped from Caddy. It
 // does not touch the store; the caller (API layer) owns deleting the
 // app's row.
+//
+// Stop/remove is best-effort per container, mirroring
+// removeOldContainers: a container that fails to stop or remove is
+// logged and skipped rather than aborting the whole call, so one
+// misbehaving container can never strand the rest, and — critically —
+// can never skip the Routes()+router.Apply step below, which is what
+// actually drops the app's stale route from Caddy. Only a failure to
+// list containers in the first place (a precondition we can't work
+// around) or a failure in Routes()/router.Apply itself is returned as
+// an error.
 func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.app": app.Slug})
 	if err != nil {
@@ -237,7 +247,7 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 			fmt.Fprintf(e.log, "deploy: stop container %s: %v\n", c.Name, err)
 		}
 		if err := e.rt.RemoveContainer(ctx, c.ID, true); err != nil {
-			return fmt.Errorf("deploy: remove container %s: %w", c.Name, err)
+			fmt.Fprintf(e.log, "deploy: remove container %s: %v\n", c.Name, err)
 		}
 	}
 

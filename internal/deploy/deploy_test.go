@@ -30,6 +30,11 @@ type fakeRuntime struct {
 	startErr  error
 	stopErr   error
 	removeErr error
+
+	// removeErrIDs, if set, overrides removeErr for specific container
+	// IDs — used to make exactly one container in a multi-container
+	// teardown fail while the rest succeed.
+	removeErrIDs map[string]error
 }
 
 func newFakeRuntime(ops *[]string) *fakeRuntime {
@@ -85,6 +90,9 @@ func (f *fakeRuntime) StopContainer(ctx context.Context, id string, timeoutSec i
 
 func (f *fakeRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
 	f.record("remove:" + id)
+	if err, ok := f.removeErrIDs[id]; ok {
+		return err
+	}
 	if f.removeErr != nil {
 		return f.removeErr
 	}
@@ -395,6 +403,54 @@ func TestFailedPull(t *testing.T) {
 	}
 	if gotApp.Status != "error" {
 		t.Errorf("app.Status = %q, want error (no containers at all)", gotApp.Status)
+	}
+}
+
+// TestRemoveAppBestEffortTeardown is a regression test: RemoveApp must
+// not abort teardown (or skip re-applying routes) just because one
+// container's removal errors. It should keep going for every remaining
+// container and always reach Routes()+router.Apply, since that's the
+// step that actually drops the app's stale hostname from Caddy.
+func TestRemoveAppBestEffortTeardown(t *testing.T) {
+	st := openStore(t)
+	eng, rt, router, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppStatus(app.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two containers for the app (as if a prior deploy's teardown had
+	// itself been interrupted), inserted directly since RemoveApp is
+	// exercised in isolation here.
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID: "c1", Name: "bp-blog-1", State: "running",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "1"},
+	}
+	rt.containers["c2"] = podman.ContainerInfo{
+		ID: "c2", Name: "bp-blog-2", State: "running",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "2"},
+	}
+	// fakeRuntime.ListContainers sorts by Name, so bp-blog-1 (c1) is
+	// processed first — make exactly that one fail.
+	rt.removeErrIDs = map[string]error{"c1": errors.New("remove c1 boom")}
+
+	if err := eng.RemoveApp(ctx, app); err != nil {
+		t.Fatalf("RemoveApp: %v", err)
+	}
+
+	if _, stillThere := rt.containers["c1"]; !stillThere {
+		t.Error("c1's RemoveContainer errored, so the fake never deletes it — sanity check failed")
+	}
+	if _, stillThere := rt.containers["c2"]; stillThere {
+		t.Error("c2 should have been removed despite c1's error")
+	}
+	if router.calls != 1 {
+		t.Fatalf("router.calls = %d, want 1 (Routes()+Apply must still run after a per-container error)", router.calls)
 	}
 }
 
