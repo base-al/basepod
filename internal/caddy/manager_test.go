@@ -112,11 +112,31 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	if spec.NetworkName != NetworkName {
 		t.Errorf("spec.NetworkName = %q, want %q", spec.NetworkName, NetworkName)
 	}
+	// Command must create /var/run/caddy (AdminSocket's parent dir, which
+	// the image doesn't ship) on the container's own filesystem before
+	// handing off to caddy: see the comment on this Command in manager.go
+	// for why that directory can't be a bind mount.
+	wantCommand := []string{"sh", "-c", "mkdir -p /var/run/caddy && exec caddy run --config /etc/caddy/current.json"}
+	if !reflect.DeepEqual(spec.Command, wantCommand) {
+		t.Errorf("spec.Command = %v, want %v", spec.Command, wantCommand)
+	}
 
 	dataDir := filepath.Join(filepath.Dir(configDir), "caddy-data")
+	// Mount sources are resolved to their real (symlink-free) path (see
+	// manager.go's create): on macOS, t.TempDir() lives under /var/folders,
+	// itself a symlink to /private/var/folders, so the resolved path
+	// differs from configDir/dataDir as constructed above.
+	wantConfigSrc, err := filepath.EvalSymlinks(configDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(configDir): %v", err)
+	}
+	wantDataSrc, err := filepath.EvalSymlinks(dataDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(dataDir): %v", err)
+	}
 	wantMounts := []podman.BindMount{
-		{Source: configDir, Dest: "/etc/caddy"},
-		{Source: dataDir, Dest: "/data"},
+		{Source: wantConfigSrc, Dest: "/etc/caddy"},
+		{Source: wantDataSrc, Dest: "/data"},
 	}
 	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
 		t.Errorf("spec.Mounts = %+v, want %+v", spec.Mounts, wantMounts)

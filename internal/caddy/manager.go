@@ -123,19 +123,43 @@ func (m *Manager) create(ctx context.Context) error {
 		return fmt.Errorf("caddy: pull %s: %w", Image, err)
 	}
 
+	// Resolve bind-mount sources to their real (symlink-free) path.
+	// Podman machine (macOS) shares host directories into its VM by
+	// their canonical path (e.g. /private/tmp), not through
+	// macOS-only symlinks like /tmp -> /private/tmp; passing the
+	// symlinked path straight through as a bind-mount source fails
+	// inside the VM with "no such file or directory" even though the
+	// path exists on the host.
+	configSrc, err := filepath.EvalSymlinks(m.configDir)
+	if err != nil {
+		return fmt.Errorf("caddy: resolve config dir %q: %w", m.configDir, err)
+	}
+	dataSrc, err := filepath.EvalSymlinks(dataDir)
+	if err != nil {
+		return fmt.Errorf("caddy: resolve data dir %q: %w", dataDir, err)
+	}
+
 	spec := podman.CreateSpec{
-		Name:        ContainerName,
-		Image:       Image,
-		Labels:      map[string]string{"basepod.managed": "true"},
-		Command:     []string{"caddy", "run", "--config", "/etc/caddy/current.json"},
+		Name:   ContainerName,
+		Image:  Image,
+		Labels: map[string]string{"basepod.managed": "true"},
+		// The image doesn't ship /var/run/caddy, the parent directory
+		// AdminSocket's unix socket binds into, and Caddy can't create
+		// it itself ("bind: no such file or directory"). It must live
+		// on the container's own filesystem rather than a bind mount:
+		// setting the socket's permission bits on a virtiofs-shared
+		// directory (as every other mount here is, under podman
+		// machine on macOS) fails with EINVAL. `exec` hands off PID 1
+		// to caddy once the directory exists.
+		Command:     []string{"sh", "-c", "mkdir -p /var/run/caddy && exec caddy run --config /etc/caddy/current.json"},
 		NetworkName: NetworkName,
 		PortMappings: []podman.PortMapping{
 			{ContainerPort: 80, HostPort: uint16(m.httpPort)},
 			{ContainerPort: 443, HostPort: uint16(m.httpsPort)},
 		},
 		Mounts: []podman.BindMount{
-			{Source: m.configDir, Dest: "/etc/caddy"},
-			{Source: dataDir, Dest: "/data"},
+			{Source: configSrc, Dest: "/etc/caddy"},
+			{Source: dataSrc, Dest: "/data"},
 		},
 		RestartPolicy: "always",
 	}
