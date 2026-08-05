@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -68,9 +69,7 @@ func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpe
 	f.nextID++
 	id := fmt.Sprintf("c%d", f.nextID)
 	labels := map[string]string{}
-	for k, v := range spec.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, spec.Labels)
 	f.containers[id] = podman.ContainerInfo{ID: id, Name: spec.Name, State: "created", Labels: labels}
 	if f.createdSpecs == nil {
 		f.createdSpecs = map[string]podman.CreateSpec{}
@@ -530,6 +529,77 @@ func TestDeployFailsOnDecryptError(t *testing.T) {
 		}
 		if c.Name == "bp-blog-2" {
 			t.Errorf("bp-blog-2 should never have been created (decrypt fails before CreateContainer), got %+v", c)
+		}
+	}
+	if oldID == "" {
+		t.Fatal("bp-blog-1 (old, healthy) should still exist")
+	}
+	if got := rt.containers[oldID]; got.State != "running" {
+		t.Errorf("bp-blog-1 state = %q, want still running (untouched)", got.State)
+	}
+
+	gotApp, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "running" {
+		t.Errorf("app.Status = %q, want running (old container still up)", gotApp.Status)
+	}
+	if gotApp.ImageRef != "nginx:v1" {
+		t.Errorf("app.ImageRef = %q, want unchanged nginx:v1", gotApp.ImageRef)
+	}
+}
+
+// TestDeployFailsWhenEnvInjectionDisabled proves that an app with stored
+// env vars fails to deploy when the Engine has no decrypt func (env
+// injection disabled) — a container must never start silently missing
+// its configured env, so this must go through the fail() path exactly
+// like a decrypt error: deployment marked failed, no new container ever
+// created, and an existing old container left untouched.
+func TestDeployFailsWhenEnvInjectionDisabled(t *testing.T) {
+	st := openStore(t)
+	ops := &[]string{}
+	rt := newFakeRuntime(ops)
+	router := &fakeRouter{ops: ops}
+	prober := &fakeProber{ops: ops}
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil) // decrypt disabled
+	eng.probeInterval = time.Millisecond
+	eng.probeAttempts = 5
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First deploy has no env vars yet, so it succeeds even with decrypt
+	// disabled, giving us a healthy "old" container to assert stays
+	// untouched below.
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+
+	if err := st.UpsertEnvVar(app.ID, "FOO", "enc-foo", false); err != nil {
+		t.Fatal(err)
+	}
+
+	dep2, err := eng.Deploy(ctx, app, "nginx:v2")
+	if err == nil {
+		t.Fatal("expected error: app has env vars but env injection is disabled")
+	}
+	if dep2.Status != "failed" {
+		t.Errorf("dep2.Status = %q, want failed", dep2.Status)
+	}
+	if dep2.Error == "" {
+		t.Error("dep2.Error empty, want env-injection-disabled failure message")
+	}
+
+	var oldID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			oldID = id
+		}
+		if c.Name == "bp-blog-2" {
+			t.Errorf("bp-blog-2 should never have been created (env-injection-disabled check runs before CreateContainer), got %+v", c)
 		}
 	}
 	if oldID == "" {
