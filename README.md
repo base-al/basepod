@@ -9,6 +9,72 @@ a single Go binary.
 > [`docs/plan/`](docs/plan/) — start with
 > [01 — Overview & Architecture](docs/plan/01.overview-and-architecture.md).
 
+## Quickstart
+
+> **v0.1 is API-only.** There's no CLI deploy command or web dashboard
+> yet — the walking skeleton proves the control plane end-to-end over
+> its REST API. `docs/plan/` describes where the rest is headed.
+
+### Prerequisites
+
+- **Go** 1.26+ (to build from source)
+- **Podman**, with a reachable socket:
+  - macOS: `podman machine init && podman machine start`
+  - Linux (rootless): `systemctl --user enable --now podman.socket`
+- **curl** and **jq** (for the flow below)
+
+### Build from source
+
+```bash
+go build -o basepod ./cmd/basepod
+```
+
+### First-run setup
+
+```bash
+./basepod setup \
+  --config ~/.config/basepod/config.yaml \
+  --data-dir ~/.local/share/basepod \
+  --root-domain apps.localhost \
+  --admin-email admin@example.com \
+  --admin-password change-me-please
+```
+
+### Run the control plane
+
+```bash
+./basepod server --config ~/.config/basepod/config.yaml
+```
+
+By default the API listens on `127.0.0.1:3080`, and BasePod's own
+Caddy container serves apps on ports 80/443 (override with
+`BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` if those clash on your
+machine).
+
+### Deploy an app via curl
+
+```bash
+TOKEN=$(curl -s localhost:3080/api/v1/auth/login \
+  -d '{"email":"admin@example.com","password":"change-me-please"}' | jq -r .token)
+
+curl -s -H "Authorization: Bearer $TOKEN" localhost:3080/api/v1/apps \
+  -d '{"name":"hello","image":"docker.io/traefik/whoami:latest","port":80}'
+
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  localhost:3080/api/v1/apps/hello/deploy
+
+curl -sk --resolve hello.apps.localhost:443:127.0.0.1 \
+  https://hello.apps.localhost/
+```
+
+That last request is served over HTTPS (BasePod's internal CA) by the
+`hello` app's container, routed automatically by Caddy. Tear it down
+with `curl -X DELETE -H "Authorization: Bearer $TOKEN"
+localhost:3080/api/v1/apps/hello`.
+
+See [`scripts/e2e-local.sh`](scripts/e2e-local.sh) for this whole flow
+scripted end-to-end (also run in CI on every push/PR).
+
 ## Why BasePod
 
 - **Rootless Podman** instead of a privileged Docker daemon; apps are
