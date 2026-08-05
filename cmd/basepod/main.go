@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/base-al/basepod/internal/cli"
 	"github.com/base-al/basepod/internal/config"
 	"github.com/base-al/basepod/internal/server"
 )
@@ -21,6 +22,7 @@ func main() {
 		newServerCmd(),
 		newSetupCmd(),
 	)
+	root.AddCommand(cli.Commands()...)
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
