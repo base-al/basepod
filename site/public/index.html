@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BasePod — a self-hosted PaaS on Podman &amp; Caddy</title>
+<meta name="description" content="BasePod is an open-source, self-hosted PaaS. Push a container image, get a running app with automatic HTTPS — rootless Podman, Caddy, one Go binary.">
+<meta name="color-scheme" content="dark light">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%230a0e14'/%3E%3Cpath d='M7 8.5C7 6.567 8.567 5 10.5 5h1C13.433 5 15 6.567 15 8.5v0c0 .966-.784 1.75-1.75 1.75h-4.5C7.784 10.25 7 9.466 7 8.5v0Z' fill='%2334d399'/%3E%3Crect x='7' y='12.5' width='10' height='6.5' rx='2' fill='%2334d399' fill-opacity='.35'/%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="#top">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M7 8.5C7 6.567 8.567 5 10.5 5h1C13.433 5 15 6.567 15 8.5v0c0 .966-.784 1.75-1.75 1.75h-4.5C7.784 10.25 7 9.466 7 8.5v0Z"/>
+        <rect x="7" y="12.5" width="10" height="6.5" rx="2" opacity=".4"/>
+      </svg>
+      <span class="brand-word">basepod</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a href="#why">Why</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="https://github.com/base-al/basepod" class="nav-gh">
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span>GitHub</span>
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section id="top" class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">open source · apache-2.0</p>
+        <h1>Push an image.<br>Get <span class="accent-text">HTTPS</span>.</h1>
+        <p class="lede">
+          BasePod is a self-hosted PaaS built on rootless Podman and Caddy.
+          Deploy a container image and get a running app with automatic
+          TLS — no privileged daemon, no reverse-proxy config, one Go binary.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/base-al/basepod">
+            View on GitHub
+            <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          </a>
+          <a class="btn btn-ghost" href="#quickstart">Read the quickstart →</a>
+        </div>
+        <p class="hero-meta">
+          <span class="tag">v0.2.0</span>
+          <span class="dot" aria-hidden="true">·</span>
+          Linux (amd64/arm64) &amp; macOS (Intel/Apple Silicon)
+          <span class="dot" aria-hidden="true">·</span>
+          early &amp; evolving
+        </p>
+      </div>
+
+      <aside class="hero-panel" aria-label="Illustrative deploy output">
+        <div class="mock-window">
+          <div class="mock-titlebar">
+            <span class="mock-dot" aria-hidden="true"></span>
+            <span class="mock-dot" aria-hidden="true"></span>
+            <span class="mock-dot" aria-hidden="true"></span>
+            <span class="mock-title">deploy</span>
+          </div>
+          <pre class="mock-body"><code><span class="c-muted">$</span> curl -X POST .../apps/hello/deploy
+<span class="c-muted">{"status":"running"}</span>
+
+<span class="c-accent">●</span> hello.apps.example.com
+  <span class="c-accent">HTTPS</span> · auto-issued cert
+  <span class="c-accent">200 OK</span></code></pre>
+        </div>
+        <p class="mock-caption">Illustrative — output shape, not a live screenshot</p>
+      </aside>
+    </div>
+  </section>
+
+  <section id="why" class="section">
+    <div class="wrap">
+      <p class="eyebrow">// why basepod</p>
+      <h2>What you get in one binary</h2>
+      <div class="grid-cards">
+        <article class="card">
+          <h3>Rootless Podman</h3>
+          <p>No privileged daemon. Containers run under your own user and are supervised outside the control plane, so they survive restarts.</p>
+        </article>
+        <article class="card">
+          <h3>Caddy at the edge</h3>
+          <p>Automatic HTTPS via ACME, on-demand TLS for custom domains, and zero-downtime config swaps through Caddy's admin API.</p>
+        </article>
+        <article class="card">
+          <h3>Single Go binary</h3>
+          <p>One binary with SQLite embedded. Install it on any Linux VPS or a Mac — no external database, no sidecar services.</p>
+        </article>
+        <article class="card">
+          <h3>Web dashboard</h3>
+          <p>A Vue 3 SPA embedded in the same binary: apps, a new-app wizard, deployment history — nothing extra to host.</p>
+        </article>
+        <article class="card">
+          <h3>Encrypted env vars</h3>
+          <p>Secrets are encrypted at rest and injected into containers at deploy time. Once set, they're write-only.</p>
+        </article>
+        <article class="card">
+          <h3>Custom domains</h3>
+          <p>Point a domain at an app and BasePod wires up routing and a certificate automatically — no manual Caddy edits.</p>
+        </article>
+        <article class="card">
+          <h3>Live log streaming</h3>
+          <p>Watch container logs in real time from the dashboard or over SSE, without shelling in.</p>
+        </article>
+        <article class="card">
+          <h3>Open source</h3>
+          <p>Apache-2.0, developed in the open on GitHub. Read the code, file an issue, send a PR.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="quickstart" class="section section-alt">
+    <div class="wrap">
+      <p class="eyebrow">// quickstart</p>
+      <h2>Bare VPS to running app</h2>
+      <p class="section-lede">The real commands — copied straight from the README. Swap the release asset for your platform.</p>
+
+      <ol class="steps">
+        <li class="step">
+          <div class="step-head"><span class="step-num">1</span><h3>Download &amp; install</h3></div>
+          <pre class="code-block"><code>curl -LO https://github.com/base-al/basepod/releases/download/v0.2.0/basepod_v0.2.0_linux_amd64.tar.gz
+tar xzf basepod_v0.2.0_linux_amd64.tar.gz
+chmod +x basepod</code></pre>
+          <p class="step-note">macOS: use <code>basepod_v0.2.0_darwin_arm64.tar.gz</code> (Apple Silicon) or <code>_darwin_amd64</code> (Intel). All four platform archives and <code>checksums.txt</code> are on the <a href="https://github.com/base-al/basepod/releases">releases page</a>.</p>
+        </li>
+        <li class="step">
+          <div class="step-head"><span class="step-num">2</span><h3>First-run setup</h3></div>
+          <pre class="code-block"><code>./basepod setup \
+  --config ~/.config/basepod/config.yaml \
+  --data-dir ~/.local/share/basepod \
+  --root-domain apps.example.com \
+  --admin-email admin@example.com \
+  --admin-password change-me-please</code></pre>
+        </li>
+        <li class="step">
+          <div class="step-head"><span class="step-num">3</span><h3>Run the control plane</h3></div>
+          <pre class="code-block"><code>./basepod server --config ~/.config/basepod/config.yaml</code></pre>
+          <p class="step-note">The API listens on <code>127.0.0.1:3080</code>; BasePod's own Caddy serves apps on 80/443.</p>
+        </li>
+        <li class="step">
+          <div class="step-head"><span class="step-num">4</span><h3>Deploy — dashboard or API</h3></div>
+          <p class="step-note">Open <code>http://localhost:3080</code>, sign in, and create an app from an image — or drive it with curl:</p>
+          <pre class="code-block"><code>TOKEN=$(curl -s localhost:3080/api/v1/auth/login \
+  -d '{"email":"admin@example.com","password":"change-me-please"}' | jq -r .token)
+
+curl -s -H "Authorization: Bearer $TOKEN" localhost:3080/api/v1/apps \
+  -d '{"name":"hello","image":"docker.io/traefik/whoami:latest","port":80}'
+
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  localhost:3080/api/v1/apps/hello/deploy</code></pre>
+        </li>
+      </ol>
+
+      <div class="mock-window terminal-mock">
+        <div class="mock-titlebar">
+          <span class="mock-dot" aria-hidden="true"></span>
+          <span class="mock-dot" aria-hidden="true"></span>
+          <span class="mock-dot" aria-hidden="true"></span>
+          <span class="mock-title">bare VPS → live HTTPS</span>
+        </div>
+        <pre class="mock-body"><code><span class="c-muted">$</span> ./basepod setup --root-domain apps.example.com ...
+<span class="c-muted">✓</span> podman socket reachable
+<span class="c-muted">✓</span> caddy provisioned
+<span class="c-muted">✓</span> admin account created
+
+<span class="c-muted">$</span> ./basepod server
+<span class="c-muted">listening on 127.0.0.1:3080</span>
+
+<span class="c-muted">$</span> curl -X POST .../apps/hello/deploy
+<span class="c-accent">✓ hello.apps.example.com — HTTPS live</span></code></pre>
+      </div>
+      <p class="mock-caption">Illustrative — condensed flow, see steps above for the real commands</p>
+    </div>
+  </section>
+
+  <section id="roadmap" class="section">
+    <div class="wrap">
+      <p class="eyebrow">// roadmap</p>
+      <h2>Where it's headed</h2>
+      <ol class="roadmap-strip">
+        <li class="rm-item rm-done">
+          <span class="rm-marker" aria-hidden="true">✓</span>
+          <span class="rm-label">v0.1</span>
+          <span class="rm-desc">core API</span>
+        </li>
+        <li class="rm-item rm-done">
+          <span class="rm-marker" aria-hidden="true">✓</span>
+          <span class="rm-label">v0.2</span>
+          <span class="rm-desc">dashboard</span>
+        </li>
+        <li class="rm-item rm-current">
+          <span class="rm-marker" aria-hidden="true">→</span>
+          <span class="rm-label">v0.3</span>
+          <span class="rm-desc">builds + CLI</span>
+        </li>
+        <li class="rm-item rm-future">
+          <span class="rm-marker" aria-hidden="true">○</span>
+          <span class="rm-label">later</span>
+          <span class="rm-desc">teams · git deploys · plugins · multi-server</span>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <div class="footer-brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M7 8.5C7 6.567 8.567 5 10.5 5h1C13.433 5 15 6.567 15 8.5v0c0 .966-.784 1.75-1.75 1.75h-4.5C7.784 10.25 7 9.466 7 8.5v0Z"/>
+        <rect x="7" y="12.5" width="10" height="6.5" rx="2" opacity=".4"/>
+      </svg>
+      <span class="brand-word">basepod</span>
+    </div>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="https://github.com/base-al/basepod">GitHub</a>
+      <a href="https://github.com/base-al/basepod/releases">Releases</a>
+      <a href="https://github.com/base-al/basepod/blob/main/LICENSE">Apache-2.0</a>
+    </nav>
+  </div>
+  <div class="wrap">
+    <p class="footer-note">This site is deployed on BasePod.</p>
+  </div>
+</footer>
+
+</body>
+</html>
