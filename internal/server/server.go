@@ -92,6 +92,9 @@ func Run(ctx context.Context, cfgPath string) error {
 	decrypt := func(sealed string) (string, error) {
 		return crypto.Open(encKey, sealed)
 	}
+	encrypt := func(plaintext string) (string, error) {
+		return crypto.Seal(encKey, plaintext)
+	}
 
 	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt)
 
@@ -108,7 +111,7 @@ func Run(ctx context.Context, cfgPath string) error {
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
-		Handler: api.New(st, engine, pc.Ping, Version),
+		Handler: api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine),
 	}
 
 	log.Printf("basepod: listening on %s", cfg.Listen)

@@ -33,6 +33,15 @@ type Deployer interface {
 // by (*podman.Client).Ping.
 type Pinger func(ctx context.Context) error
 
+// RoutesApplier recomputes and pushes the current route set to the router
+// (Caddy). It is declared here (rather than the API depending on package
+// deploy's concrete Engine type) so handlers can be tested against a fake
+// instead of a real container runtime. *deploy.Engine satisfies this
+// interface; see the compile-time assertion in api_test.go.
+type RoutesApplier interface {
+	ApplyRoutes(ctx context.Context) error
+}
+
 // deployTimeout bounds a single deploy request. v0.1 deploys run
 // synchronously inside the HTTP handler (no SSE build-log streaming until
 // v0.2's real builds), so a stuck pull or health-probe loop must not hang
@@ -56,16 +65,29 @@ type api struct {
 	ping    Pinger
 	version string
 	limiter *rateLimiter
+
+	// seal/open encrypt and decrypt EnvVar.ValueEncrypted values. They
+	// close over the process's encryption key (see internal/crypto) so
+	// this package never handles the raw key itself.
+	seal func(string) (string, error)
+	open func(string) (string, error)
+
+	// routes recomputes and pushes the current route set to the router
+	// (Caddy) after a domain is added or removed.
+	routes RoutesApplier
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
-func New(st *store.Store, dep Deployer, ping Pinger, version string) http.Handler {
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier) http.Handler {
 	a := &api{
 		st:      st,
 		dep:     dep,
 		ping:    ping,
 		version: version,
 		limiter: newRateLimiter(loginRateLimit, loginRateWindow),
+		seal:    seal,
+		open:    open,
+		routes:  routes,
 	}
 
 	r := chi.NewRouter()
@@ -81,6 +103,11 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string) http.Handle
 			r.Get("/apps/{slug}", a.handleGetApp)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)
+			r.Get("/apps/{slug}/env", a.handleGetEnv)
+			r.Put("/apps/{slug}/env", a.handlePutEnv)
+			r.Get("/apps/{slug}/domains", a.handleListDomains)
+			r.Post("/apps/{slug}/domains", a.handleAddDomain)
+			r.Delete("/apps/{slug}/domains/{id}", a.handleDeleteDomain)
 		})
 	})
 	return r
