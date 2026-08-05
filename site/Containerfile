@@ -1,0 +1,5 @@
+FROM docker.io/library/caddy:2.10-alpine
+
+# The official Caddy image's default Caddyfile serves /usr/share/caddy on :80
+# via file_server, so no extra Caddyfile is needed for a static site.
+COPY public/ /usr/share/caddy/
