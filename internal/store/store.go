@@ -138,6 +138,13 @@ func (s *Store) UserByEmail(email string) (*User, error) {
 	return scanUser(row)
 }
 
+// CountUsers returns the total number of users in the database.
+func (s *Store) CountUsers() (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count)
+	return count, err
+}
+
 // CreateSession inserts a new session for userID with the given token hash
 // and expiry time (stored as RFC3339 UTC).
 func (s *Store) CreateSession(userID int64, tokenHash string, expires time.Time) error {

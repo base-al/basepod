@@ -160,3 +160,18 @@ func TestAppBySlugNotFound(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
+
+func TestCountUsers(t *testing.T) {
+	s := open(t)
+	if count, err := s.CountUsers(); err != nil || count != 0 {
+		t.Fatalf("expected 0 users, got %d (err: %v)", count, err)
+	}
+	s.CreateUser("a@b.c", "Alice", "hash", true)
+	if count, err := s.CountUsers(); err != nil || count != 1 {
+		t.Fatalf("expected 1 user, got %d (err: %v)", count, err)
+	}
+	s.CreateUser("c@d.e", "Charlie", "hash", false)
+	if count, err := s.CountUsers(); err != nil || count != 2 {
+		t.Fatalf("expected 2 users, got %d (err: %v)", count, err)
+	}
+}
