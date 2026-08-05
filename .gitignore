@@ -1,0 +1,14 @@
+# binaries
+/basepod
+/dist/
+
+# frontend
+node_modules/
+web/dist/
+
+# local state
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
