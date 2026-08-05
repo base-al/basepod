@@ -26,3 +26,20 @@ func TestSocketPathParsesUnixURI(t *testing.T) {
 		t.Fatalf("got %q", p)
 	}
 }
+
+// TestMachineForwardedSocketRuns exercises machineForwardedSocket against
+// whatever `podman` binary is on PATH (if any). It only asserts the
+// call doesn't panic and, when it succeeds, that the output is trimmed of
+// trailing whitespace/newlines — the actual exec + `podman machine
+// inspect` behavior is covered end-to-end by TestRealPing (behind
+// BASEPOD_TEST_PODMAN=1), which exercises the full DetectSocket fallback
+// chain including this step against a real daemon.
+func TestMachineForwardedSocketRuns(t *testing.T) {
+	p, err := machineForwardedSocket()
+	if err != nil {
+		t.Skipf("podman machine inspect unavailable in this environment: %v", err)
+	}
+	if strings.TrimSpace(p) != p {
+		t.Fatalf("machineForwardedSocket did not trim output: %q", p)
+	}
+}

@@ -23,10 +23,18 @@ import (
 	"strings"
 )
 
+// apiVersion is the libpod API version segment requests are made against.
+// Real podman daemons (verified against podman 6.0.1 client / 5.7.1
+// server) only serve the unversioned "/libpod/..." path for "/_ping";
+// every other libpod route requires a versioned prefix
+// ("/v{version}/libpod/..."), so requests must include one. v5.0.0 is the
+// floor of libpod's stable v5 API and works against this server.
+const apiVersion = "v5.0.0"
+
 // baseURL is the libpod API base path. All requests are made against this
 // fixed virtual host ("d" for "daemon") over the Unix socket transport;
 // only the path after /libpod varies per call.
-const baseURL = "http://d/libpod"
+const baseURL = "http://d/" + apiVersion + "/libpod"
 
 // Client talks to a local Podman daemon over its libpod REST API.
 type Client struct {
@@ -97,11 +105,14 @@ type connectionEntry struct {
 //     its URI is a "unix://" socket.
 //  2. $XDG_RUNTIME_DIR/podman/podman.sock (Linux rootless).
 //  3. /run/podman/podman.sock (Linux root).
+//  4. `podman machine inspect`'s forwarded local socket path (macOS,
+//     where the default connection is typically "ssh://" but podman
+//     machine also exposes a local unix socket for direct API access).
 //
 // If the default connection exists but uses a non-unix scheme (e.g.
-// "ssh://", the common shape for a macOS `podman machine`) and neither
-// fallback path exists, DetectSocket returns an actionable error rather
-// than silently failing.
+// "ssh://", the common shape for a macOS `podman machine`) and none of
+// the fallback paths exist, DetectSocket returns an actionable error
+// rather than silently failing.
 func DetectSocket() (string, error) {
 	defaultURI, _ := defaultConnectionURI() // best-effort; absence is not fatal
 	if defaultURI != "" {
@@ -121,6 +132,10 @@ func DetectSocket() (string, error) {
 		return "unix:///run/podman/podman.sock", nil
 	}
 
+	if p, err := machineForwardedSocket(); err == nil && p != "" && fileExists(p) {
+		return "unix://" + p, nil
+	}
+
 	if defaultURI != "" {
 		if u, err := url.Parse(defaultURI); err == nil && u.Scheme != "" && u.Scheme != "unix" {
 			return "", fmt.Errorf(
@@ -133,9 +148,22 @@ func DetectSocket() (string, error) {
 	}
 
 	return "", fmt.Errorf(
-		"podman: no local podman unix socket found (checked $XDG_RUNTIME_DIR/podman/podman.sock and /run/podman/podman.sock) — " +
-			"run `podman machine start` or set podman_socket in the basepod config",
+		"podman: no local podman unix socket found (checked $XDG_RUNTIME_DIR/podman/podman.sock, /run/podman/podman.sock, " +
+			"and `podman machine inspect`) — run `podman machine start` or set podman_socket in the basepod config",
 	)
+}
+
+// machineForwardedSocket runs
+// `podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}'`
+// to find the local Unix socket a `podman machine` (macOS/Windows)
+// forwards API traffic to. Returns "" if no machine is configured or the
+// command fails.
+func machineForwardedSocket() (string, error) {
+	out, err := exec.Command("podman", "machine", "inspect", "--format", "{{.ConnectionInfo.PodmanSocket.Path}}").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // defaultConnectionURI runs `podman system connection list --format json`

@@ -48,7 +48,7 @@ func fakeDaemon(t *testing.T, mux *http.ServeMux) *Client {
 func TestCreateContainerSpec(t *testing.T) {
 	var got map[string]any
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /libpod/containers/create", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v5.0.0/libpod/containers/create", func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&got)
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(map[string]string{"Id": "abc123"})
@@ -78,7 +78,7 @@ func TestCreateContainerSpec(t *testing.T) {
 
 func TestStopAlreadyStoppedIsSuccess(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /libpod/containers/x/stop", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /v5.0.0/libpod/containers/x/stop", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(304)
 	})
 	c := fakeDaemon(t, mux)
@@ -96,7 +96,7 @@ func TestInspectNotFound(t *testing.T) {
 
 func TestPullImageStreamError(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /libpod/images/pull", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /v5.0.0/libpod/images/pull", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 		w.Write([]byte("{\"stream\":\"x\"}\n{\"error\":\"manifest unknown\"}\n"))
 	})
@@ -109,7 +109,7 @@ func TestPullImageStreamError(t *testing.T) {
 
 func TestRemoveContainerAlreadyGoneIsSuccess(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("DELETE /libpod/containers/x", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("DELETE /v5.0.0/libpod/containers/x", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]any{"cause": "no such container", "message": "no such container", "response": 404})
 	})
@@ -123,11 +123,11 @@ func TestEnsureNetworkCreatesWhenMissing(t *testing.T) {
 	var createBody map[string]any
 	existsCalls, createCalls := 0, 0
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
 		existsCalls++
 		w.WriteHeader(404)
 	})
-	mux.HandleFunc("POST /libpod/networks/create", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v5.0.0/libpod/networks/create", func(w http.ResponseWriter, r *http.Request) {
 		createCalls++
 		json.NewDecoder(r.Body).Decode(&createBody)
 		w.WriteHeader(200)
@@ -152,10 +152,10 @@ func TestEnsureNetworkCreatesWhenMissing(t *testing.T) {
 func TestEnsureNetworkNoopWhenPresent(t *testing.T) {
 	createCalls := 0
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(204)
 	})
-	mux.HandleFunc("POST /libpod/networks/create", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /v5.0.0/libpod/networks/create", func(w http.ResponseWriter, _ *http.Request) {
 		createCalls++
 		w.WriteHeader(200)
 	})
@@ -170,7 +170,7 @@ func TestEnsureNetworkNoopWhenPresent(t *testing.T) {
 
 func TestListContainersFiltersByLabel(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /libpod/containers/json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/json", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("all") != "true" {
 			t.Errorf("expected all=true, got %q", r.URL.Query().Get("all"))
 		}
@@ -195,7 +195,7 @@ func TestListContainersFiltersByLabel(t *testing.T) {
 
 func TestInspectContainer(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /libpod/containers/bp-blog-1/json", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v5.0.0/libpod/containers/bp-blog-1/json", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(map[string]any{
 			"Id":   "c1",
@@ -220,7 +220,7 @@ func TestInspectContainer(t *testing.T) {
 
 func TestPingSuccess(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /libpod/_ping", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v5.0.0/libpod/_ping", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 	})
 	c := fakeDaemon(t, mux)
