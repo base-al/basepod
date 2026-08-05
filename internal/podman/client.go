@@ -336,8 +336,9 @@ func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
 	}
 
 	body := networkCreate{
-		Name:   name,
-		Labels: map[string]string{"basepod.managed": "true"},
+		Name:       name,
+		Labels:     map[string]string{"basepod.managed": "true"},
+		DNSEnabled: true,
 	}
 	status, data, err = c.request(ctx, http.MethodPost, "/networks/create", body)
 	if err != nil {

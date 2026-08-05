@@ -75,8 +75,14 @@ type specMount struct {
 	Options     []string `json:"options,omitempty"` // ["ro"] when ReadOnly
 }
 
-// networkCreate is the body for POST /libpod/networks/create.
+// networkCreate is the body for POST /libpod/networks/create. DNSEnabled
+// must be set explicitly: unlike `podman network create` (whose CLI
+// defaults to DNS-enabled), the raw libpod API defaults dns_enabled to
+// false, which would leave containers unable to resolve each other by
+// name/alias — the mechanism the Caddy manager and deploy engine rely on
+// for routing to app containers (e.g. "bp-hello:80").
 type networkCreate struct {
-	Name   string            `json:"name"`
-	Labels map[string]string `json:"labels,omitempty"`
+	Name       string            `json:"name"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	DNSEnabled bool              `json:"dns_enabled"`
 }

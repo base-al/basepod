@@ -164,6 +164,12 @@ func TestEnsureNetworkCreatesWhenMissing(t *testing.T) {
 	if labels["basepod.managed"] != "true" {
 		t.Fatalf("create body labels: %v", createBody)
 	}
+	// DNS must be explicitly requested: unlike the podman CLI, the raw
+	// libpod API defaults dns_enabled to false, which would leave
+	// containers unable to resolve each other by name/alias.
+	if createBody["dns_enabled"] != true {
+		t.Fatalf("create body dns_enabled: %v, want true", createBody["dns_enabled"])
+	}
 }
 
 func TestEnsureNetworkNoopWhenPresent(t *testing.T) {
