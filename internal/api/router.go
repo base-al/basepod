@@ -141,6 +141,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 			r.Use(bodyLimit)
 			r.Use(a.requireAuth)
 			r.Get("/auth/me", a.handleMe)
+			r.Post("/auth/logout", a.handleLogout)
 			r.Get("/system", a.handleSystem)
 			r.Post("/apps", a.handleCreateApp)
 			r.Get("/apps", a.handleListApps)

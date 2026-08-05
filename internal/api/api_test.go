@@ -231,6 +231,33 @@ func TestLoginAndMe(t *testing.T) {
 	}
 }
 
+func TestLogout(t *testing.T) {
+	st := newTestStore(t)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+
+	_, body := login(t, srv, testPassword)
+
+	logoutResp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/auth/logout", body.Token, nil, nil)
+	if logoutResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("logout: got status %d, want 204", logoutResp.StatusCode)
+	}
+
+	meResp := doJSON(t, http.MethodGet, srv.URL+"/api/v1/auth/me", body.Token, nil, nil)
+	if meResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("/me after logout: got status %d, want 401", meResp.StatusCode)
+	}
+}
+
+func TestLogoutWithoutTokenUnauthorized(t *testing.T) {
+	st := newTestStore(t)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/auth/logout", "", nil, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("logout without token: got status %d, want 401", resp.StatusCode)
+	}
+}
+
 func TestAuthRequired(t *testing.T) {
 	st := newTestStore(t)
 	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})

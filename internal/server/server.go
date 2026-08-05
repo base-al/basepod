@@ -41,6 +41,14 @@ var Version = "dev"
 // finish once a shutdown signal arrives.
 const shutdownTimeout = 10 * time.Second
 
+// pruneInterval is how often expired sessions are swept from the store.
+// pruneInitialDelay defers the first sweep past boot, so it doesn't
+// compete with the rest of Run's startup work.
+const (
+	pruneInterval     = time.Hour
+	pruneInitialDelay = time.Minute
+)
+
 // readHeaderTimeout and idleTimeout bound the http.Server built by
 // newHTTPServer. There is deliberately no ReadTimeout or WriteTimeout:
 // see newHTTPServer's doc comment for why.
@@ -150,6 +158,8 @@ func Run(ctx context.Context, cfgPath string) error {
 	log.Printf("basepod: root domain %s", rootDomain)
 	log.Printf("basepod: data dir %s", cfg.DataDir)
 
+	go pruneSessions(ctx, st, pruneInitialDelay, pruneInterval)
+
 	serveErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -199,6 +209,37 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
+	}
+}
+
+// pruneSessions runs a ticking loop that sweeps expired sessions from st
+// via store.PruneExpiredSessions, stopping cleanly when ctx is done. The
+// first sweep fires after initialDelay (pruneInitialDelay in Run); every
+// sweep after that is spaced interval (pruneInterval in Run) apart. A
+// sweep's row count is only logged when it removed something, so a quiet,
+// healthy system doesn't get an hourly "pruned 0 sessions" log line
+// forever.
+//
+// This is its own function — called from Run as a goroutine, but not
+// itself doing any other Run setup — so tests can drive the loop directly
+// with a real (temp-file) store and short durations, without needing to
+// run all of Run against a fake podman daemon.
+func pruneSessions(ctx context.Context, st *store.Store, initialDelay, interval time.Duration) {
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if n, err := st.PruneExpiredSessions(); err != nil {
+				log.Printf("basepod: prune expired sessions: %v", err)
+			} else if n > 0 {
+				log.Printf("basepod: pruned %d expired session(s)", n)
+			}
+			timer.Reset(interval)
+		}
 	}
 }
 

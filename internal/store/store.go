@@ -183,6 +183,24 @@ func (s *Store) UserBySessionTokenHash(hash string) (*User, error) {
 	return scanUser(row)
 }
 
+// DeleteSessionByTokenHash removes the session with the given token hash, if
+// any. It is a no-op success (nil error) if no session matches — logout is
+// idempotent, not a lookup that must find something.
+func (s *Store) DeleteSessionByTokenHash(tokenHash string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
+	return err
+}
+
+// PruneExpiredSessions deletes every session whose expiry has passed and
+// returns the number of rows removed.
+func (s *Store) PruneExpiredSessions() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, time.Now().UTC().Format(timeFormat))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // CreateApp inserts a new app with status "created" and returns it.
 func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	res, err := s.db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, slug, imageRef, port)

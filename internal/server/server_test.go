@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/base-al/basepod/internal/store"
 )
 
 // TestRunFailsFastWithoutSetup verifies that Run refuses to start against a
@@ -92,6 +95,60 @@ func TestCheckPodmanVersion(t *testing.T) {
 		if err != nil {
 			t.Errorf("version %q: expected no error, got: %v", tc.version, err)
 		}
+	}
+}
+
+// TestPruneSessionsRemovesExpired proves pruneSessions's ticking loop
+// actually calls through to store.PruneExpiredSessions (removing only
+// expired rows) once its initial delay elapses, and that the goroutine
+// exits promptly once ctx is canceled — driven with millisecond-scale
+// durations rather than the real hourly interval Run uses.
+func TestPruneSessionsRemovesExpired(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	uid, err := st.CreateUser("a@b.c", "A", "hash", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(uid, "expired", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(uid, "live", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pruneSessions(ctx, st, 10*time.Millisecond, time.Hour)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := st.UserBySessionTokenHash("expired"); err == store.ErrNotFound {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("expired session was not pruned in time")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, err := st.UserBySessionTokenHash("live"); err != nil {
+		t.Fatalf("live session was pruned: %v", err)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pruneSessions did not stop after ctx cancellation")
 	}
 }
 

@@ -42,6 +42,68 @@ func TestSessionExpiry(t *testing.T) {
 	}
 }
 
+func TestDeleteSessionByTokenHash(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+	s.CreateSession(uid, "th1", time.Now().Add(time.Hour))
+	s.CreateSession(uid, "th2", time.Now().Add(time.Hour))
+
+	if err := s.DeleteSessionByTokenHash("th1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if _, err := s.UserBySessionTokenHash("th1"); err != ErrNotFound {
+		t.Fatalf("deleted session still valid: %v", err)
+	}
+	if _, err := s.UserBySessionTokenHash("th2"); err != nil {
+		t.Fatalf("unrelated session was also removed: %v", err)
+	}
+
+	// Deleting an absent hash is a no-op success, not an error.
+	if err := s.DeleteSessionByTokenHash("does-not-exist"); err != nil {
+		t.Fatalf("delete of absent hash: %v", err)
+	}
+}
+
+func TestPruneExpiredSessions(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+	s.CreateSession(uid, "live1", time.Now().Add(time.Hour))
+	s.CreateSession(uid, "live2", time.Now().Add(time.Hour))
+	s.CreateSession(uid, "dead1", time.Now().Add(-time.Hour))
+	s.CreateSession(uid, "dead2", time.Now().Add(-2*time.Hour))
+
+	n, err := s.PruneExpiredSessions()
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("pruned %d rows, want 2", n)
+	}
+
+	if _, err := s.UserBySessionTokenHash("live1"); err != nil {
+		t.Fatalf("live session was pruned: %v", err)
+	}
+	if _, err := s.UserBySessionTokenHash("live2"); err != nil {
+		t.Fatalf("live session was pruned: %v", err)
+	}
+	if _, err := s.UserBySessionTokenHash("dead1"); err != ErrNotFound {
+		t.Fatalf("expired session survived prune: %v", err)
+	}
+	if _, err := s.UserBySessionTokenHash("dead2"); err != ErrNotFound {
+		t.Fatalf("expired session survived prune: %v", err)
+	}
+
+	// Second run finds nothing left to prune.
+	n, err = s.PruneExpiredSessions()
+	if err != nil {
+		t.Fatalf("second prune: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("second prune removed %d rows, want 0", n)
+	}
+}
+
 func TestDeploymentNumbering(t *testing.T) {
 	s := open(t)
 	app, _ := s.CreateApp("blog", "nginx:alpine", 80)

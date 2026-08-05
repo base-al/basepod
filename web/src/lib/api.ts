@@ -204,6 +204,11 @@ export const api = {
 
   me: () => request<User>('/auth/me'),
 
+  /** Revokes the current session server-side. Called best-effort by the
+   * auth store's logout() — local state is cleared regardless of whether
+   * this succeeds. */
+  logout: () => request<void>('/auth/logout', { method: 'POST' }),
+
   listApps: () => request<App[]>('/apps'),
 
   createApp: (name: string, image: string, port: number) =>
