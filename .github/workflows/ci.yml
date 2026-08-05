@@ -13,7 +13,7 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: cd web && npm ci && npm run build && npm run type-check
+      - run: cd web && npm ci && npm run build && npm run type-check && npm test
       - uses: actions/setup-go@v5
         with: {go-version: 'stable'}
       - run: go vet ./...
