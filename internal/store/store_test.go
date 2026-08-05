@@ -131,6 +131,88 @@ func TestDeploymentNumbering(t *testing.T) {
 	}
 }
 
+// TestCreateDeploymentDefaultsToImageSource proves the original
+// CreateDeployment (used by the registry-pull path) still defaults
+// Source to "image" and TriggerKind to "api", now that it delegates to
+// CreateDeploymentFull.
+func TestCreateDeploymentDefaultsToImageSource(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("blog", "nginx:alpine", 80)
+	d, err := s.CreateDeployment(app.ID, "nginx:alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Source != "image" || d.TriggerKind != "api" {
+		t.Fatalf("d = %+v, want Source=image TriggerKind=api", d)
+	}
+	if d.BuildLogPath != "" {
+		t.Fatalf("d.BuildLogPath = %q, want empty", d.BuildLogPath)
+	}
+}
+
+// TestCreateDeploymentFullTarballSource proves CreateDeploymentFull
+// persists an explicit source/triggerKind, and that a "" imageRef (the
+// tarball path's shape before the build produces a tag) round-trips
+// through ListDeployments untouched.
+func TestCreateDeploymentFullTarballSource(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("blog", "nginx:alpine", 80)
+	d, err := s.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Source != "tarball" || d.ImageRef != "" || d.TriggerKind != "api" {
+		t.Fatalf("d = %+v, want Source=tarball ImageRef=\"\" TriggerKind=api", d)
+	}
+
+	ds, err := s.ListDeployments(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ds) != 1 || ds[0].Source != "tarball" || ds[0].ImageRef != "" {
+		t.Fatalf("ListDeployments = %+v, want one tarball deployment with empty image_ref", ds)
+	}
+}
+
+// TestSetDeploymentImageAndBuildLog proves both setters persist and are
+// visible through both ListDeployments and DeploymentByNumber.
+func TestSetDeploymentImageAndBuildLog(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("blog", "nginx:alpine", 80)
+	d, err := s.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetDeploymentImage(d.ID, "localhost/basepod/blog:1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetDeploymentBuildLog(d.ID, "/data/apps/blog/builds/1.log"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.DeploymentByNumber(app.ID, d.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ImageRef != "localhost/basepod/blog:1" {
+		t.Fatalf("ImageRef = %q, want localhost/basepod/blog:1", got.ImageRef)
+	}
+	if got.BuildLogPath != "/data/apps/blog/builds/1.log" {
+		t.Fatalf("BuildLogPath = %q, want /data/apps/blog/builds/1.log", got.BuildLogPath)
+	}
+}
+
+// TestDeploymentByNumberNotFound proves an unknown (appID, number) pair
+// returns ErrNotFound.
+func TestDeploymentByNumberNotFound(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("blog", "nginx:alpine", 80)
+	if _, err := s.DeploymentByNumber(app.ID, 99); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestUserByEmailNotFound(t *testing.T) {
 	s := open(t)
 	if _, err := s.UserByEmail("nobody@example.com"); err != ErrNotFound {
