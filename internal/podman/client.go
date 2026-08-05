@@ -303,6 +303,15 @@ func (c *Client) PullImage(ctx context.Context, ref string) error {
 			if err == io.EOF {
 				break
 			}
+			// A stream-reported error (libpod's normal way of surfacing
+			// pull failures inside an HTTP-200 body) takes precedence
+			// over anything that goes wrong decoding the rest of the
+			// stream afterwards — e.g. a trailing non-JSON line — since
+			// the error line is the actionable signal and the decode
+			// failure is just noise past the point of failure.
+			if streamErr != nil {
+				break
+			}
 			return fmt.Errorf("podman: pull %s: reading stream: %w", ref, err)
 		}
 		if line.Error != "" {

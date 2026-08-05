@@ -107,6 +107,23 @@ func TestPullImageStreamError(t *testing.T) {
 	}
 }
 
+// TestPullImageStreamErrorSurvivesTrailingGarbage regression-tests that a
+// captured stream error is not discarded when the stream ends with a
+// decode failure (e.g. a trailing non-JSON line from an
+// interrupted/malformed stream) after the error line.
+func TestPullImageStreamErrorSurvivesTrailingGarbage(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/images/pull", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("{\"stream\":\"x\"}\n{\"error\":\"manifest unknown\"}\nnot-json-trailer\n"))
+	})
+	c := fakeDaemon(t, mux)
+	err := c.PullImage(context.Background(), "example.com/missing:latest")
+	if err == nil || !strings.Contains(err.Error(), "manifest unknown") {
+		t.Fatalf("want error containing %q, got %v", "manifest unknown", err)
+	}
+}
+
 func TestRemoveContainerAlreadyGoneIsSuccess(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("DELETE /v5.0.0/libpod/containers/x", func(w http.ResponseWriter, _ *http.Request) {
