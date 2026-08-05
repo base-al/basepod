@@ -66,6 +66,11 @@ const deployMutation = useMutation({
   },
   onError: (err) => {
     deployError.value = err instanceof ApiError ? err.message : 'Deploy failed — try again'
+    // The server has already flipped the app's status (e.g. to "error")
+    // by the time this rejects — refetch so the badge/facts reflect that
+    // immediately instead of showing the stale pre-deploy status for up
+    // to POLL_SLOW_MS.
+    void queryClient.invalidateQueries({ queryKey: ['app', slug.value] })
   },
 })
 
