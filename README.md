@@ -5,15 +5,11 @@ image, a git repo, or a compose file — and get a running app with
 automatic HTTPS. Like CapRover, but rootless, daemonless, and shipped as
 a single Go binary.
 
-> **Status: planning.** The detailed design lives in
-> [`docs/plan/`](docs/plan/) — start with
+> **Status: v0.1 shipped, v0.2 (dashboard) is the current milestone.**
+> The detailed design lives in [`docs/plan/`](docs/plan/) — start with
 > [01 — Overview & Architecture](docs/plan/01.overview-and-architecture.md).
 
 ## Quickstart
-
-> **v0.1 is API-only.** There's no CLI deploy command or web dashboard
-> yet — the walking skeleton proves the control plane end-to-end over
-> its REST API. `docs/plan/` describes where the rest is headed.
 
 ### Prerequisites
 
@@ -51,7 +47,23 @@ Caddy container serves apps on ports 80/443 (override with
 `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` if those clash on your
 machine).
 
-### Deploy an app via curl
+### Dashboard
+
+Once the server is running, open **http://localhost:3080** and sign in
+with the admin email/password from `basepod setup` above. From there you
+can create an app from an image, deploy it, and manage its env vars,
+custom domains, and live logs — everything the API subsection below
+does, without curl.
+
+> Screenshots are deferred until the UI settles a bit further; see
+> [docs/plan/07 — Web Dashboard](docs/plan/07.dashboard.md) for what's
+> shipped in this milestone versus deferred to later ones.
+
+### API
+
+Everything the dashboard does is also available directly over the REST
+API — useful for scripting, CI, or just poking at BasePod without a
+browser:
 
 ```bash
 TOKEN=$(curl -s localhost:3080/api/v1/auth/login \
@@ -73,9 +85,10 @@ with `curl -X DELETE -H "Authorization: Bearer $TOKEN"
 localhost:3080/api/v1/apps/hello`.
 
 See [`scripts/e2e-local.sh`](scripts/e2e-local.sh) for this whole flow
-scripted end-to-end (also run in CI on every push/PR).
+(plus env vars, custom domains, and log streaming) scripted end-to-end
+(also run in CI on every push/PR).
 
-## Known issues (v0.1)
+## Known issues
 
 - If the first `basepod server` boot fails because port 80/443 is
   already taken, a created-but-never-started `bp-caddy` container with
@@ -108,6 +121,9 @@ a real `make ui` build**; CI builds the dashboard fresh on every run.
   domains, zero-downtime config swaps via its admin API.
 - **One binary** — installs on any Linux VPS and on macOS (Intel &
   Apple Silicon), with SQLite embedded. No external dependencies.
+- **Web dashboard** — a Vue SPA embedded in the same binary: apps,
+  new-app wizard, live logs, env vars, and custom domains, no separate
+  frontend deployment.
 - **Teams & RBAC** — users, teams, roles, scoped API tokens, audit log.
 - **Extensible** — lifecycle webhooks, one-click app templates, and
   OCI-image plugins.
