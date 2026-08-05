@@ -22,6 +22,16 @@ export const router = createRouter({
       name: 'apps',
       component: () => import('./pages/Apps.vue'),
     },
+    {
+      path: '/apps/new',
+      name: 'new-app',
+      component: () => import('./pages/NewApp.vue'),
+    },
+    {
+      path: '/apps/:slug',
+      name: 'app-detail',
+      component: () => import('./pages/AppDetail.vue'),
+    },
   ],
 })
 

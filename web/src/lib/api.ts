@@ -9,7 +9,7 @@
 
 import { useAuthStore } from '../stores/auth'
 import { router } from '../router'
-import type { AppStatus } from '../theme'
+import type { AppStatus, DeploymentStatus } from '../theme'
 
 const BASE_URL = '/api/v1'
 
@@ -28,6 +28,31 @@ export interface App {
   image: string
   port: number
   status: AppStatus
+}
+
+/** One deploy attempt for an app. Note: the API does not return any
+ * started/finished timestamps (internal/store.Deployment has no time
+ * fields at all) — there is no data to render a "relative time" column
+ * from, so the UI omits one rather than fabricate it. */
+export interface Deployment {
+  number: number
+  image: string
+  status: DeploymentStatus
+  error: string
+}
+
+export interface AppDetail extends App {
+  deployments: Deployment[]
+}
+
+export interface Domain {
+  id: number
+  hostname: string
+}
+
+export interface DomainsList {
+  generated: string
+  custom: Domain[]
 }
 
 export interface SystemInfo {
@@ -103,6 +128,28 @@ export const api = {
   me: () => request<User>('/auth/me'),
 
   listApps: () => request<App[]>('/apps'),
+
+  createApp: (name: string, image: string, port: number) =>
+    request<App>('/apps', {
+      method: 'POST',
+      body: JSON.stringify({ name, image, port }),
+    }),
+
+  getApp: (slug: string) => request<AppDetail>(`/apps/${slug}`),
+
+  /** Triggers a deploy. Omitting `image` redeploys the app's current
+   * image. This call is synchronous server-side and can take minutes
+   * (image pull + health probe) — request() sets no client-side timeout,
+   * so the mutation just waits for it. */
+  deploy: (slug: string, image?: string) =>
+    request<Deployment>(`/apps/${slug}/deploy`, {
+      method: 'POST',
+      body: JSON.stringify(image ? { image } : {}),
+    }),
+
+  deleteApp: (slug: string) => request<void>(`/apps/${slug}`, { method: 'DELETE' }),
+
+  domains: (slug: string) => request<DomainsList>(`/apps/${slug}/domains`),
 
   system: () => request<SystemInfo>('/system'),
 }

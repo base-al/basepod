@@ -31,9 +31,22 @@ export const fontMono =
 
 export type AppStatus = 'created' | 'deploying' | 'running' | 'stopped' | 'error'
 
-/** Badge styling per app status, per the design language's color semantics. */
+/** A single deployment's own status, distinct from (and narrower than)
+ * AppStatus — see internal/deploy/deploy.go: a deployment lands in
+ * "deploying" -> "healthy" (success) or "failed" (error), while the
+ * *app's* status separately tracks "running"/"error" based on what's
+ * actually alive after that deploy resolves. */
+export type DeploymentStatus = 'deploying' | 'healthy' | 'failed'
+
+/** Union covering every status string StatusBadge might be asked to
+ * render, whether it came from an App or a Deployment. */
+export type Status = AppStatus | DeploymentStatus
+
+/** Badge styling per status, per the design language's color semantics.
+ * Keyed by the union above — AppStatus and DeploymentStatus share the
+ * "deploying" member, so it appears once. */
 export const statusStyles: Record<
-  AppStatus,
+  Status,
   { label: string; color: 'neutral' | 'warning' | 'success' | 'error'; dotClass: string; pulse: boolean }
 > = {
   created: { label: 'Created', color: 'neutral', dotClass: 'bg-slate-400', pulse: false },
@@ -41,6 +54,8 @@ export const statusStyles: Record<
   running: { label: 'Running', color: 'success', dotClass: 'bg-emerald-400', pulse: false },
   stopped: { label: 'Stopped', color: 'neutral', dotClass: 'bg-slate-400', pulse: false },
   error: { label: 'Error', color: 'error', dotClass: 'bg-red-400', pulse: false },
+  healthy: { label: 'Healthy', color: 'success', dotClass: 'bg-emerald-400', pulse: false },
+  failed: { label: 'Failed', color: 'error', dotClass: 'bg-red-400', pulse: false },
 }
 
 /** localStorage keys used across the app — centralized to avoid typos/drift. */

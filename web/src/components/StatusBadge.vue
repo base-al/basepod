@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { statusStyles, type AppStatus } from '../theme'
+import { statusStyles, type Status } from '../theme'
 
-const props = defineProps<{ status: AppStatus }>()
+// Accepts both AppStatus (Apps.vue list, AppDetail header/overview) and
+// DeploymentStatus (AppDetail's deployments table) — see theme.ts for why
+// these are separate-but-overlapping enums.
+const props = defineProps<{ status: Status }>()
 </script>
 
 <template>
