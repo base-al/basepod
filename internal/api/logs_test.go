@@ -376,3 +376,68 @@ func loginOnly(t *testing.T, st *store.Store) (*http.Response, loginResponse) {
 	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
 	return login(t, srv, testPassword)
 }
+
+// TestHandleAppLogsQueryTokenAuth proves the logs endpoint accepts a valid
+// session token passed as ?access_token=, the fallback native EventSource
+// needs since it cannot set an Authorization header.
+func TestHandleAppLogsQueryTokenAuth(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+
+	logsFn := func(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	srv := newTestServerWithLogs(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{}, logsFn)
+	_, session := login(t, srv, testPassword)
+	token := session.Token
+
+	// No Authorization header at all — only the query param, exactly as a
+	// browser's native EventSource would connect.
+	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=" + token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestHandleAppLogsQueryTokenRejectedElsewhere proves the ?access_token=
+// fallback is wired to the logs route only: a query token that would
+// authenticate /logs must not authenticate any other endpoint, since
+// query strings leak into access logs, browser history, and Referer
+// headers far more readily than headers do.
+func TestHandleAppLogsQueryTokenRejectedElsewhere(t *testing.T) {
+	st := newTestStore(t)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+	token := session.Token
+
+	resp, err := http.Get(srv.URL + "/api/v1/apps?access_token=" + token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (query token must not authenticate non-logs routes)", resp.StatusCode)
+	}
+}
+
+// TestHandleAppLogsBadQueryToken proves an invalid/unknown ?access_token=
+// value is rejected with 401 rather than silently falling through as
+// unauthenticated (or, worse, authenticated).
+func TestHandleAppLogsBadQueryToken(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+
+	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=not-a-real-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}

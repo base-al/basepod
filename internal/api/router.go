@@ -119,12 +119,20 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 			r.Get("/apps/{slug}", a.handleGetApp)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)
-			r.Get("/apps/{slug}/logs", a.handleAppLogs)
 			r.Get("/apps/{slug}/env", a.handleGetEnv)
 			r.Put("/apps/{slug}/env", a.handlePutEnv)
 			r.Get("/apps/{slug}/domains", a.handleListDomains)
 			r.Post("/apps/{slug}/domains", a.handleAddDomain)
 			r.Delete("/apps/{slug}/domains/{id}", a.handleDeleteDomain)
+		})
+
+		// The logs route gets its own auth middleware rather than
+		// requireAuth: native EventSource cannot set an Authorization
+		// header, so this route (and only this route) also accepts the
+		// session token via ?access_token=. See requireAuthLogs.
+		r.Group(func(r chi.Router) {
+			r.Use(a.requireAuthLogs)
+			r.Get("/apps/{slug}/logs", a.handleAppLogs)
 		})
 	})
 	return r
@@ -143,6 +151,42 @@ func (a *api) requireAuth(next http.Handler) http.Handler {
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || token == "" {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization header")
+			return
+		}
+
+		user, err := a.st.UserBySessionTokenHash(auth.HashToken(token))
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired session")
+			return
+		}
+
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
+	})
+}
+
+// requireAuthLogs is requireAuth's variant for the log-streaming route
+// only: native EventSource cannot set request headers, so a browser
+// client has no way to send "Authorization: Bearer <token>" when opening
+// the stream. This middleware therefore also accepts the session token as
+// a ?access_token= query parameter, tried only after the Authorization
+// header comes up empty, and validated through the exact same
+// UserBySessionTokenHash lookup as requireAuth — a query token is not a
+// weaker credential, just an alternate transport for the same one.
+//
+// This fallback is deliberately wired to this one route (see the router
+// group above) rather than folded into requireAuth: query strings end up
+// in access logs, browser history, and Referer headers far more readily
+// than headers do, so every other endpoint should keep requiring the
+// header. The token itself is never logged or echoed back by this
+// middleware or handleAppLogs's error paths.
+func (a *api) requireAuthLogs(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || token == "" {
+			token = r.URL.Query().Get("access_token")
+		}
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization")
 			return
 		}
 
