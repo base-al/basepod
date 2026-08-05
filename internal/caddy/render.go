@@ -23,8 +23,8 @@ type Upstream struct {
 }
 
 type ReverseProxyHandler struct {
-	Handler   string       `json:"handler"`
-	Upstreams []Upstream   `json:"upstreams"`
+	Handler   string     `json:"handler"`
+	Upstreams []Upstream `json:"upstreams"`
 }
 
 type HostMatch struct {
@@ -32,9 +32,9 @@ type HostMatch struct {
 }
 
 type Route struct {
-	Match    []HostMatch          `json:"match"`
+	Match    []HostMatch           `json:"match"`
 	Handle   []ReverseProxyHandler `json:"handle"`
-	Terminal bool                 `json:"terminal"`
+	Terminal bool                  `json:"terminal"`
 }
 
 type Server struct {
