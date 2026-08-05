@@ -424,6 +424,38 @@ func TestHandleAppLogsQueryTokenRejectedElsewhere(t *testing.T) {
 	}
 }
 
+// TestHandleAppLogsBearerPrecedenceOverQueryToken proves requireAuthLogs's
+// "header first, else query" ordering holds even when both are present: a
+// valid Authorization header authenticates the request regardless of what
+// (if anything) garbage sits in ?access_token=, since a real client only
+// ever sends one or the other and the header — being harder to leak via
+// logs/history/Referer — must not lose to a spoofed/stale query value.
+func TestHandleAppLogsBearerPrecedenceOverQueryToken(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+
+	logsFn := func(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	srv := newTestServerWithLogs(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{}, logsFn)
+	_, session := login(t, srv, testPassword)
+	token := session.Token
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/apps/blog/logs?access_token=bogus-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (valid Bearer header must take precedence over a bogus query token)", resp.StatusCode)
+	}
+}
+
 // TestHandleAppLogsBadQueryToken proves an invalid/unknown ?access_token=
 // value is rejected with 401 rather than silently falling through as
 // unauthenticated (or, worse, authenticated).

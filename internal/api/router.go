@@ -142,6 +142,23 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 // set by requireAuth.
 type userContextKey struct{}
 
+// validateToken resolves a raw session token (however it was transported)
+// into its *store.User via the session-hash lookup, or reports false if
+// the token is missing/unknown/expired. Shared by requireAuth and
+// requireAuthLogs so their validation logic — which must stay identical,
+// a query token being an alternate transport for the same credential, not
+// a weaker one — can't silently drift apart.
+func (a *api) validateToken(token string) (*store.User, bool) {
+	if token == "" {
+		return nil, false
+	}
+	user, err := a.st.UserBySessionTokenHash(auth.HashToken(token))
+	if err != nil {
+		return nil, false
+	}
+	return user, true
+}
+
 // requireAuth resolves "Authorization: Bearer <token>" into a *store.User
 // and attaches it to the request context, or fails the request with 401
 // "unauthorized" if the header is missing, malformed, or names a session
@@ -154,8 +171,8 @@ func (a *api) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		user, err := a.st.UserBySessionTokenHash(auth.HashToken(token))
-		if err != nil {
+		user, ok := a.validateToken(token)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired session")
 			return
 		}
@@ -169,9 +186,10 @@ func (a *api) requireAuth(next http.Handler) http.Handler {
 // client has no way to send "Authorization: Bearer <token>" when opening
 // the stream. This middleware therefore also accepts the session token as
 // a ?access_token= query parameter, tried only after the Authorization
-// header comes up empty, and validated through the exact same
-// UserBySessionTokenHash lookup as requireAuth — a query token is not a
-// weaker credential, just an alternate transport for the same one.
+// header comes up empty (so a valid header always wins over a query
+// token, bogus or not — see TestHandleAppLogsBearerPrecedenceOverQueryToken
+// in logs_test.go), and validated through the exact same validateToken
+// helper requireAuth uses.
 //
 // This fallback is deliberately wired to this one route (see the router
 // group above) rather than folded into requireAuth: query strings end up
@@ -190,8 +208,8 @@ func (a *api) requireAuthLogs(next http.Handler) http.Handler {
 			return
 		}
 
-		user, err := a.st.UserBySessionTokenHash(auth.HashToken(token))
-		if err != nil {
+		user, ok := a.validateToken(token)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired session")
 			return
 		}
