@@ -209,6 +209,16 @@ auth_curl() {
 	curl -s --max-time 10 -H "Authorization: Bearer ${TOKEN}" "$@"
 }
 
+# deploy_curl is auth_curl's variant for /deploy calls specifically: a
+# deploy pulls an image and polls health probes synchronously inside the
+# handler (bounded server-side by deployTimeout, 5 minutes — see
+# internal/api.deployTimeout), so it can legitimately take much longer
+# than the 10s budget every other call in this script gets, especially on
+# a loaded CI runner doing its second or third cutover in a row.
+deploy_curl() {
+	curl -s --max-time 90 -H "Authorization: Bearer ${TOKEN}" "$@"
+}
+
 # ---------------------------------------------------------------------------
 # Create app
 # ---------------------------------------------------------------------------
@@ -222,7 +232,7 @@ created_slug=$(printf '%s' "${create_resp}" | jq -r '.slug // empty')
 # First deploy
 # ---------------------------------------------------------------------------
 log "deploying (1st generation)..."
-deploy1_resp=$(auth_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
+deploy1_resp=$(deploy_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
 deploy1_status=$(printf '%s' "${deploy1_resp}" | jq -r '.status // empty')
 [ "${deploy1_status}" = "healthy" ] || fail "first deploy failed: ${deploy1_resp}"
 
@@ -242,7 +252,7 @@ gen1_names=$(podman ps --filter "label=basepod.app=${SLUG}" --format '{{.Names}}
 # Second deploy — same image, must cut over to bp-<slug>-2 and remove -1
 # ---------------------------------------------------------------------------
 log "deploying (2nd generation)..."
-deploy2_resp=$(auth_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
+deploy2_resp=$(deploy_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
 deploy2_status=$(printf '%s' "${deploy2_resp}" | jq -r '.status // empty')
 [ "${deploy2_status}" = "healthy" ] || fail "second deploy failed: ${deploy2_resp}"
 
@@ -275,7 +285,7 @@ put_foo_value=$(printf '%s' "${env_put_resp}" | jq -r '.[] | select(.key=="E2E_F
 [ "${put_foo_value}" = "bar123" ] || fail "PUT env: E2E_FOO value wrong in response: ${env_put_resp}"
 
 log "redeploying to pick up env vars (3rd generation)..."
-deploy3_resp=$(auth_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
+deploy3_resp=$(deploy_curl -X POST "${API_BASE}/api/v1/apps/${SLUG}/deploy")
 deploy3_status=$(printf '%s' "${deploy3_resp}" | jq -r '.status // empty')
 [ "${deploy3_status}" = "healthy" ] || fail "env redeploy failed: ${deploy3_resp}"
 
