@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/base-al/basepod/internal/podman"
 )
@@ -174,8 +175,26 @@ func (m *Manager) create(ctx context.Context) error {
 	return nil
 }
 
+// reloadAttempts and reloadBackoff bound the retry below. reloadBackoff is
+// a var (not a const) so tests can shrink it to keep the retry path fast.
+const reloadAttempts = 5
+
+var reloadBackoff = 100 * time.Millisecond
+
 // Apply renders routes into current.json (written atomically) and tells
 // the running Caddy instance to reload it over its Unix-socket admin API.
+//
+// The reload exec is retried up to reloadAttempts times on failure.
+// Observed on podman machine's virtiofs-backed bind mounts (macOS): the
+// container's view of a file just written+renamed on the host can lag
+// behind by a short, bounded window, so `caddy reload` occasionally
+// reports /etc/caddy/current.json missing immediately after
+// writeFileAtomic has already returned successfully on the host side —
+// most reliably reproduced right after this Manager's container-facing
+// RemoveApp caller has just stopped/removed other containers on the same
+// podman machine. A bare retry a few milliseconds later reliably
+// succeeds, and `caddy reload` is idempotent (it just re-reads and
+// re-applies the same file), so retrying here is safe.
 func (m *Manager) Apply(ctx context.Context, routes []AppRoute) error {
 	data, err := Render(routes)
 	if err != nil {
@@ -184,10 +203,23 @@ func (m *Manager) Apply(ctx context.Context, routes []AppRoute) error {
 	if err := writeFileAtomic(m.configPath(), data); err != nil {
 		return fmt.Errorf("caddy: write config: %w", err)
 	}
-	if err := m.exec(ctx, ContainerName, "caddy", "reload", "--config", "/etc/caddy/current.json", "--address", AdminSocket); err != nil {
-		return fmt.Errorf("caddy: reload: %w", err)
+
+	var reloadErr error
+	for attempt := 1; attempt <= reloadAttempts; attempt++ {
+		reloadErr = m.exec(ctx, ContainerName, "caddy", "reload", "--config", "/etc/caddy/current.json", "--address", AdminSocket)
+		if reloadErr == nil {
+			return nil
+		}
+		if attempt == reloadAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("caddy: reload: %w", ctx.Err())
+		case <-time.After(reloadBackoff):
+		}
 	}
-	return nil
+	return fmt.Errorf("caddy: reload: %w", reloadErr)
 }
 
 // writeFileAtomic writes data to path via a temp-file-then-rename so a

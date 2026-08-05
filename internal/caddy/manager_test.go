@@ -2,11 +2,13 @@ package caddy
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/base-al/basepod/internal/podman"
 )
@@ -70,15 +72,23 @@ func (f *fakeRuntime) InspectContainer(ctx context.Context, nameOrID string) (*p
 }
 
 // fakeExecer is a test double for Execer: it records the argv of every
-// invocation.
+// invocation. If errSequence is set, each call pops and returns the next
+// entry (nil entries count as success); once exhausted, err (which may
+// itself be nil) is returned for every subsequent call.
 type fakeExecer struct {
-	calls [][]string
-	err   error
+	calls       [][]string
+	err         error
+	errSequence []error
 }
 
 func (f *fakeExecer) Exec(ctx context.Context, container string, cmd ...string) error {
 	args := append([]string{container}, cmd...)
 	f.calls = append(f.calls, args)
+	if len(f.errSequence) > 0 {
+		err := f.errSequence[0]
+		f.errSequence = f.errSequence[1:]
+		return err
+	}
 	return f.err
 }
 
@@ -228,5 +238,67 @@ func TestApplyWritesAndReloads(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fe.calls, wantCalls) {
 		t.Fatalf("exec calls = %v, want %v", fe.calls, wantCalls)
+	}
+}
+
+// TestApplyRetriesReloadOnTransientFailure covers the retry added after a
+// real, reproducible failure on podman machine (macOS): the reload exec
+// can transiently report the just-written config file missing (a
+// virtiofs bind-mount visibility race), most reliably right after other
+// containers on the same podman machine were just stopped/removed (as in
+// deploy.Engine.RemoveApp). Reload is idempotent, so Apply retries it a
+// bounded number of times rather than failing on the first error.
+func TestApplyRetriesReloadOnTransientFailure(t *testing.T) {
+	orig := reloadBackoff
+	reloadBackoff = time.Millisecond
+	t.Cleanup(func() { reloadBackoff = orig })
+
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := &fakeRuntime{}
+	transient := errors.New(`podman exec: exit status 1: Error: reading config from file: open /etc/caddy/current.json: no such file or directory`)
+	fe := &fakeExecer{errSequence: []error{transient, transient, nil}}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Apply(context.Background(), nil); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(fe.calls) != 3 {
+		t.Fatalf("exec called %d times, want 3 (2 failures + 1 success)", len(fe.calls))
+	}
+}
+
+// TestApplyFailsAfterExhaustingReloadRetries covers the case where the
+// reload exec keeps failing: Apply must give up after reloadAttempts
+// tries and surface the last error, rather than retrying forever.
+func TestApplyFailsAfterExhaustingReloadRetries(t *testing.T) {
+	orig := reloadBackoff
+	reloadBackoff = time.Millisecond
+	t.Cleanup(func() { reloadBackoff = orig })
+
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := &fakeRuntime{}
+	persistent := errors.New("permanent failure")
+	fe := &fakeExecer{err: persistent}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	err := mgr.Apply(context.Background(), nil)
+	if err == nil {
+		t.Fatal("Apply: expected error, got nil")
+	}
+	if !errors.Is(err, persistent) {
+		t.Fatalf("Apply error = %v, want wrapping %v", err, persistent)
+	}
+	if len(fe.calls) != reloadAttempts {
+		t.Fatalf("exec called %d times, want %d", len(fe.calls), reloadAttempts)
 	}
 }
