@@ -430,11 +430,15 @@ TARBALL="${BUILD_DIR}.tar.gz"
 # CMD would exit 0 immediately and the container would never pass its
 # health probe), -v logs each request (so the CLI `logs` assertion further
 # down has a line to read), -p is the listen port (must match the app's
-# port set above, 80), -h is the document root COPY places index.txt
-# under.
+# port set above, 80), -h is the document root COPY places the fixture
+# under. The health probe (and every "does it serve the right content"
+# assertion below) requests "/" — busybox httpd's directory handler only
+# auto-serves a file named index.html, so the fixture must land at
+# /www/index.html, not /www/index.txt, or every request for "/" 404s and
+# the deploy never reaches "healthy".
 cat >"${BUILD_DIR}/Containerfile" <<'EOF'
 FROM docker.io/library/busybox:latest
-COPY index.txt /www/index.txt
+COPY index.txt /www/index.html
 CMD ["httpd", "-f", "-v", "-p", "80", "-h", "/www"]
 EOF
 printf '%s' "e2e-build-v1" >"${BUILD_DIR}/index.txt"
