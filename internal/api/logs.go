@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -39,6 +40,96 @@ const (
 	// it's still live) while a follow=1 stream is otherwise quiet.
 	logHeartbeatInterval = 15 * time.Second
 )
+
+// maxStreamsPerUser and maxStreamsGlobal bound the number of concurrently
+// open SSE streams (handleAppLogs, and handleDeploymentLog's "deploying"
+// branch via streamBuildLogSSE) — audit finding L6: each open stream
+// holds a goroutine, an open file or container-log read, and (for
+// handleAppLogs) a demux goroutine, for as long as the client stays
+// connected, so an unbounded number of them is a cheap resource-
+// exhaustion vector for anyone holding a valid session (or, on the logs
+// route, a valid stream/session token — see requireAuthLogs). 20 per user
+// comfortably covers a real admin with several browser tabs and CLI
+// `--follow`s open at once; 200 total is a generous backstop against a
+// single compromised or careless account taking down the whole control
+// plane for everyone else.
+const (
+	maxStreamsPerUser = 20
+	maxStreamsGlobal  = 200
+)
+
+// streamLimiter enforces maxStreamsPerUser and maxStreamsGlobal. It's a
+// package-level singleton (see defaultStreamLimiter) rather than a field
+// on *api: *api and its New constructor live in router.go, which — under
+// this milestone's concurrent-agent file-ownership split — belongs to
+// whoever is wiring up the auth routes at the same time as this change,
+// so adding a field there isn't safe to do here. Folding this into *api's
+// lifecycle (so tests can inject an isolated limiter instead of sharing
+// the package singleton) is a reasonable follow-up once router.go is free
+// to touch again.
+type streamLimiter struct {
+	mu       sync.Mutex
+	perUser  map[int64]int
+	total    int
+	userCap  int
+	totalCap int
+}
+
+func newStreamLimiter(userCap, totalCap int) *streamLimiter {
+	return &streamLimiter{perUser: make(map[int64]int), userCap: userCap, totalCap: totalCap}
+}
+
+// acquire reserves one stream slot for userID, reporting false (and
+// reserving nothing) if either the per-user or the global cap is already
+// at its limit.
+func (l *streamLimiter) acquire(userID int64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.total >= l.totalCap || l.perUser[userID] >= l.userCap {
+		return false
+	}
+	l.total++
+	l.perUser[userID]++
+	return true
+}
+
+// release returns the slot a prior successful acquire(userID) reserved.
+// Safe to call even without a matching acquire (a no-op at zero) so a
+// defer'd release can never underflow the counters.
+func (l *streamLimiter) release(userID int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.perUser[userID] > 0 {
+		l.perUser[userID]--
+		if l.perUser[userID] == 0 {
+			delete(l.perUser, userID)
+		}
+	}
+	if l.total > 0 {
+		l.total--
+	}
+}
+
+// defaultStreamLimiter is the process-wide streamLimiter every SSE
+// handler acquires/releases against — see streamLimiter's doc comment for
+// why it's a package singleton rather than an *api field.
+var defaultStreamLimiter = newStreamLimiter(maxStreamsPerUser, maxStreamsGlobal)
+
+// acquireStreamSlot reserves a concurrent-stream slot for the request's
+// authenticated user (see userFromContext) against defaultStreamLimiter,
+// writing 503 "too_many_streams" and returning ok=false if the per-user
+// or global cap is already exhausted. On success it returns a release
+// func the caller must defer immediately — every exit path (normal
+// completion, client disconnect, any early return) must call it exactly
+// once so the reserved slot is always given back.
+func (a *api) acquireStreamSlot(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
+	userID := userFromContext(r.Context()).ID
+	if !defaultStreamLimiter.acquire(userID) {
+		writeError(w, http.StatusServiceUnavailable, "too_many_streams", "too many concurrent log streams; close some and retry")
+		return nil, false
+	}
+	return func() { defaultStreamLimiter.release(userID) }, true
+}
 
 // logEventPayload is the JSON body of each `event: log` SSE message.
 type logEventPayload struct {
@@ -105,6 +196,15 @@ func (a *api) handleAppLogs(w http.ResponseWriter, r *http.Request) {
 	// once this handler returns — via any path: normal stream end,
 	// client disconnect, or an unexpected error.
 	defer src.Close()
+
+	// Reserve a concurrent-stream slot (audit finding L6) only once the
+	// stream is actually about to open — a failed lookup above (404/409/
+	// 502) never reaches here, so it never consumes one.
+	release, slotOK := a.acquireStreamSlot(w, r)
+	if !slotOK {
+		return
+	}
+	defer release()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -259,6 +359,15 @@ func (a *api) handleDeploymentLog(w http.ResponseWriter, r *http.Request) {
 // stops (after a final drain of whatever was written) as soon as the
 // status is no longer "deploying", or the client disconnects.
 func (a *api) streamBuildLogSSE(w http.ResponseWriter, r *http.Request, appID int64, number int, path string) {
+	// Reserve a concurrent-stream slot (audit finding L6) — see
+	// acquireStreamSlot's doc comment; the same cap handleAppLogs enforces
+	// applies here too, since this is just as long-lived a stream.
+	release, slotOK := a.acquireStreamSlot(w, r)
+	if !slotOK {
+		return
+	}
+	defer release()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "internal", "streaming unsupported")
@@ -303,7 +412,24 @@ func (a *api) streamBuildLogSSE(w http.ResponseWriter, r *http.Request, appID in
 		for {
 			line, err := reader.ReadString('\n')
 			if len(line) > 0 {
-				fmt.Fprintf(w, "event: log\ndata: %s\n\n", strings.TrimSuffix(line, "\n"))
+				clean := strings.TrimSuffix(line, "\n")
+				// Strip any embedded \r (audit finding L2): the SSE spec
+				// treats CR, LF, and CRLF all as line terminators, but
+				// reader.ReadString('\n') above only splits on LF — a bare
+				// \r inside build output (progress bars, \r-based spinners,
+				// or a hostile Containerfile RUN step) would otherwise pass
+				// straight through into this "data:" line and be
+				// interpreted by the client's SSE parser as ending it
+				// early, letting attacker-controlled build output inject
+				// additional event:/data: lines into the stream. The
+				// container-log route (handleAppLogs, above) sidesteps this
+				// by JSON-encoding its payload instead, but that's not an
+				// option here without also changing BuildLogPanel.vue's
+				// wire format, which is documented as intentionally raw
+				// text, not JSON (see its top-of-file comment) — so this
+				// route strips instead.
+				clean = strings.ReplaceAll(clean, "\r", "")
+				fmt.Fprintf(w, "event: log\ndata: %s\n\n", clean)
 				flusher.Flush()
 			}
 			if err != nil {

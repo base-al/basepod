@@ -573,9 +573,18 @@ func writeFileAtomic(path string, data []byte) error {
 // PodmanExec is the production Execer: it shells out to `podman exec`
 // rather than using the libpod exec API, since that API requires stream
 // hijacking and shelling out is five lines, used only for reloads.
+//
+// The binary is resolved via podman.BinPath (audit finding L3) rather
+// than the bare "podman" command name, so this never trusts whatever
+// $PATH happens to resolve at call time — see BinPath's doc comment for
+// the resolution order and the BASEPOD_PODMAN_BIN override.
 func PodmanExec(ctx context.Context, container string, cmd ...string) error {
+	bin, err := podman.BinPath()
+	if err != nil {
+		return err
+	}
 	args := append([]string{"exec", container}, cmd...)
-	c := exec.CommandContext(ctx, "podman", args...)
+	c := exec.CommandContext(ctx, bin, args...)
 	var stderr bytes.Buffer
 	c.Stderr = &stderr
 	if err := c.Run(); err != nil {

@@ -6,6 +6,59 @@ import (
 	"time"
 )
 
+// TestDummyHashNeverVerifies proves auth.DummyHash (see its doc comment —
+// audit finding L1) is a well-formed argon2id hash that never verifies
+// against any password a real login attempt would plausibly send —
+// exactly the property the L1 fix relies on: calling
+// VerifyPassword(attackerSuppliedPassword, DummyHash) on the
+// unknown-email path must always return false, the same as a real
+// "wrong password" outcome.
+func TestDummyHashNeverVerifies(t *testing.T) {
+	if !strings.HasPrefix(DummyHash, "$argon2id$") {
+		t.Fatalf("DummyHash = %q, want a well-formed argon2id encoding", DummyHash)
+	}
+	for _, pw := range []string{"", "password", "correct horse battery staple", "hunter2"} {
+		if VerifyPassword(pw, DummyHash) {
+			t.Fatalf("VerifyPassword(%q, DummyHash) = true, want false (DummyHash must never verify)", pw)
+		}
+	}
+}
+
+// TestDummyHashCostsComparableTime proves VerifyPassword against
+// DummyHash pays the same argon2 cost as verifying against a real
+// user's hash — the entire point of L1's fix: an unknown-email login
+// must cost the same as a known-email one. Compares wall-clock time
+// against a generous ratio bound (5x) rather than a tight one, since CI
+// scheduling jitter makes an exact-timing assertion flaky; the two calls
+// use identical argon2 parameters (see HashPassword/DummyHash), so any
+// gap this test would actually catch (e.g. DummyHash silently using
+// cheaper parameters) is far larger than scheduling noise.
+func TestDummyHashCostsComparableTime(t *testing.T) {
+	realHash, err := HashPassword("some-real-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timeIt := func(hash string) time.Duration {
+		start := time.Now()
+		VerifyPassword("wrong-guess", hash)
+		return time.Since(start)
+	}
+
+	// Warm up (first call on a cold CPU cache/scheduler can be an outlier).
+	timeIt(realHash)
+	timeIt(DummyHash)
+
+	realElapsed := timeIt(realHash)
+	dummyElapsed := timeIt(DummyHash)
+
+	ratio := float64(dummyElapsed) / float64(realElapsed)
+	if ratio < 0.2 || ratio > 5 {
+		t.Fatalf("dummy/real verify time ratio = %.2f (dummy=%v real=%v), want roughly comparable (0.2x-5x)",
+			ratio, dummyElapsed, realElapsed)
+	}
+}
+
 func TestPasswordRoundtrip(t *testing.T) {
 	h, err := HashPassword("s3cret")
 	if err != nil || !strings.HasPrefix(h, "$argon2id$") {

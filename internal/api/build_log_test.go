@@ -277,3 +277,72 @@ func TestHandleDeploymentLogSSEStreamsThenTerminatesOnStatusFlip(t *testing.T) {
 		t.Fatal("stream did not terminate after the deployment's status flipped away from \"deploying\"")
 	}
 }
+
+// TestHandleDeploymentLogSSEStripsCarriageReturn proves build output
+// containing a bare \r cannot forge additional SSE frames (audit finding
+// L2): the SSE spec treats \r, \n, and \r\n all as line terminators, so a
+// build log line like "data\revent: log\rdata: forged" — legitimate
+// build output, e.g. from a progress bar or spinner, or attacker-
+// controlled RUN-step output — would otherwise be interpreted by a
+// compliant SSE client as multiple additional event:/data: field lines
+// rather than the single literal line it actually is.
+func TestHandleDeploymentLogSSEStripsCarriageReturn(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	app, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "1.log")
+	// A single log line whose content itself contains bare \r bytes,
+	// crafted to look like it's injecting a second event/data pair.
+	forged := "data\revent: log\rdata: forged\n"
+	if err := os.WriteFile(logPath, []byte(forged), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		t.Fatal(err)
+	}
+	// Deployment status stays "deploying" (CreateDeploymentFull's default)
+	// for the whole test — no need to flip it; we just read the one frame
+	// and disconnect.
+
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/apps/blog/deployments/1/log", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+session.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	evLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading event line: %v", err)
+	}
+	if evLine != "event: log\n" {
+		t.Fatalf("event line = %q, want exactly %q (a bare \\r in the payload must never split into a second frame)", evLine, "event: log\n")
+	}
+	dataLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading data line: %v", err)
+	}
+	wantData := "data: dataevent: logdata: forged\n"
+	if dataLine != wantData {
+		t.Fatalf("data line = %q, want %q (\\r stripped, not treated as a line terminator)", dataLine, wantData)
+	}
+	if strings.Contains(dataLine, "\r") {
+		t.Fatalf("data line still contains a bare \\r: %q", dataLine)
+	}
+}

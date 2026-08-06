@@ -2,6 +2,8 @@ package api
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -13,8 +15,24 @@ import (
 )
 
 // hostnamePattern is the lowercase-FQDN shape a custom domain hostname
-// must have.
+// must have. It bounds each individual label to 63 characters (DNS's own
+// per-label limit) but says nothing about the overall FQDN length — see
+// maxHostnameLength below (audit finding L7).
 var hostnamePattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$`)
+
+// maxHostnameLength and maxCustomDomainsPerApp bound a custom domain add
+// (audit finding L7): hostnamePattern already caps each DNS label at 63
+// characters, but nothing capped the *overall* FQDN — RFC 1035's 253-byte
+// ceiling — so an absurdly long (but per-label-valid) hostname could
+// still be accepted. maxCustomDomainsPerApp exists because every custom
+// domain this app gets is a hostname Caddy will attempt to provision a
+// Let's Encrypt certificate for: without a cap, a single stolen session
+// token could add enough domains to burn through the root domain's ACME
+// rate-limit quota for everyone.
+const (
+	maxHostnameLength      = 253
+	maxCustomDomainsPerApp = 20
+)
 
 type domainResponse struct {
 	ID       int64  `json:"id"`
@@ -84,6 +102,22 @@ func (a *api) handleAddDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "validation", "hostname must be a valid lowercase FQDN")
 		return
 	}
+	if len(hostname) > maxHostnameLength {
+		writeError(w, http.StatusUnprocessableEntity, "validation",
+			fmt.Sprintf("hostname must be at most %d characters", maxHostnameLength))
+		return
+	}
+
+	existing, err := a.st.ListDomains(app.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to list domains")
+		return
+	}
+	if len(existing) >= maxCustomDomainsPerApp {
+		writeError(w, http.StatusUnprocessableEntity, "validation",
+			fmt.Sprintf("an app may have at most %d custom domains", maxCustomDomainsPerApp))
+		return
+	}
 
 	rootDomain, err := a.st.Setting("root_domain")
 	if err != nil {
@@ -141,7 +175,8 @@ func (a *api) handleAddDomain(w http.ResponseWriter, r *http.Request) {
 		// nothing more to do here; the stale row surfaces on the next
 		// list/reconcile rather than being silently invisible.
 		_ = a.st.DeleteDomain(domain.ID)
-		writeError(w, http.StatusBadGateway, "routes_failed", err.Error())
+		log.Printf("api: apply routes after adding domain %q to app %s: %v", hostname, app.Slug, err)
+		writeError(w, http.StatusBadGateway, "routes_failed", "failed to apply routes")
 		return
 	}
 
@@ -195,7 +230,8 @@ func (a *api) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 		// restored row gets a new ID — callers must re-fetch via GET
 		// rather than assuming the deleted ID still applies.
 		_, _ = a.st.AddDomain(app.ID, hostname)
-		writeError(w, http.StatusBadGateway, "routes_failed", err.Error())
+		log.Printf("api: apply routes after deleting domain %q from app %s: %v", hostname, app.Slug, err)
+		writeError(w, http.StatusBadGateway, "routes_failed", "failed to apply routes")
 		return
 	}
 

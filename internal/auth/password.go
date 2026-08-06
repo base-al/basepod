@@ -38,6 +38,28 @@ const (
 	maxArgon2Threads = 16
 )
 
+// DummyHash is a valid argon2id-encoded hash (same shape and cost
+// parameters as HashPassword produces) of a fixed, non-secret string —
+// not tied to any real user's credential; the salt and plaintext are
+// both published right here in source, so anyone can trivially confirm
+// it doesn't correspond to a real password.
+//
+// It exists for audit finding L1 (login timing enumeration): the login
+// handler's unknown-email path currently returns before ever calling
+// VerifyPassword, while the "known email, wrong password" path always
+// pays argon2's real cost — an attacker measuring response latency can
+// use that gap to enumerate valid emails without guessing a single
+// password. VerifyPassword(pw, DummyHash) costs the same as verifying
+// against a real user's hash (same m/t/p parameters), so calling it
+// (and discarding the result — it must never succeed) on the
+// unknown-email path closes the timing gap.
+//
+// This file only provides the primitive: internal/api/auth.go — this
+// milestone's file-ownership split puts it under a different agent
+// working concurrently — is where the actual call-site fix belongs. See
+// the security-sweep report for the exact change.
+const DummyHash = "$argon2id$v=19$m=65536,t=3,p=2$YmFzZXBvZC1kdW1teS1zeA$9pNVKgjvwoMRRFduPCoPQwJrz+OHUbVFSUh6gB8JSHs"
+
 // HashPassword hashes pw using argon2id with fixed parameters and a random
 // 16-byte salt, returning the PHC-style encoded string:
 //

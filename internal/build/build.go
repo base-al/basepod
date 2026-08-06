@@ -403,6 +403,11 @@ func validateTar(path string) (dockerfile string, mf *manifest.Manifest, warning
 		if !safeTarPath(hdr.Name) {
 			return "", nil, nil, ErrBadPath
 		}
+		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
+			if !safeTarLink(hdr.Name, hdr.Linkname) {
+				return "", nil, nil, ErrBadPath
+			}
+		}
 		clean := filepath.ToSlash(filepath.Clean(hdr.Name))
 		switch clean {
 		case "Containerfile":
@@ -462,6 +467,34 @@ func safeTarPath(name string) bool {
 	}
 	clean := filepath.ToSlash(filepath.Clean(name))
 	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return false
+	}
+	return true
+}
+
+// safeTarLink reports whether a TypeSymlink/TypeLink tar entry's target is
+// safe: an absolute Linkname is always rejected (audit finding M6 — e.g. a
+// symlink into the data dir's secret.key), and a relative Linkname is
+// rejected if, resolved against the entry's own directory within the
+// build context and cleaned, it would escape the context root (a leading
+// ".." segment after cleaning). Nothing is ever extracted host-side from
+// this tar (see ErrBadPath's doc comment) — libpod's build endpoint is
+// handed the validated stream — but validating here means BasePod never
+// relies solely on containers/storage's own extraction hardening.
+//
+// A relative link that stays inside the context (e.g.
+// "node_modules/.bin/x" -> "../pkg/bin.js") is legitimate in real build
+// contexts and remains allowed — only linkname is checked here; hdr.Name
+// itself is already validated by safeTarPath above.
+func safeTarLink(name, linkname string) bool {
+	if linkname == "" {
+		return false
+	}
+	if filepath.IsAbs(linkname) || strings.HasPrefix(linkname, "/") {
+		return false
+	}
+	target := filepath.ToSlash(filepath.Clean(filepath.Join(filepath.Dir(name), linkname)))
+	if target == ".." || strings.HasPrefix(target, "../") {
 		return false
 	}
 	return true
