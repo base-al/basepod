@@ -805,8 +805,8 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 8 {
-		t.Fatalf("db version after migrating = %d, want 8 (00001..00008)", version)
+	if version != 9 {
+		t.Fatalf("db version after migrating = %d, want 9 (00001..00009)", version)
 	}
 
 	var appliedCount int
@@ -815,8 +815,8 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	}
 	// goose_db_version always carries a synthetic version-0 bootstrap row in
 	// addition to one row per applied migration file.
-	if appliedCount != 9 {
-		t.Fatalf("applied migration rows = %d, want 9 (bootstrap + 8 migrations)", appliedCount)
+	if appliedCount != 10 {
+		t.Fatalf("applied migration rows = %d, want 10 (bootstrap + 9 migrations)", appliedCount)
 	}
 
 	// apps.alias_scheme (migration 00005_alias_scheme.sql, from
@@ -2021,5 +2021,174 @@ func TestUpdateGitDeliveryStatus(t *testing.T) {
 	// Unknown id: no error, no rows affected.
 	if err := s.UpdateGitDeliveryStatus(999999, "error", "should not apply", nil); err != nil {
 		t.Fatalf("update of unknown id should be a no-op, got err: %v", err)
+	}
+}
+
+// TestMigrationComposeDefaultsAppliesToExistingApp mirrors
+// TestMigrationVolumesStrategyDefaultsAppliesToExistingApp for migration
+// 00009_compose.sql (v0.5's Task 8): an app row inserted before that
+// migration ever ran must come out the other side of an upgrade with
+// ComposeProject == "", ComposeService == "", and Internal == false —
+// never NULL, never a migration failure — matching v0.4/early-v0.5
+// behavior identically (a hand-created app was never compose-managed).
+func TestMigrationComposeDefaultsAppliesToExistingApp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, "migrations", 8); err != nil {
+		t.Fatalf("migrate to version 8: %v", err)
+	}
+
+	// Insert exactly as version-8 schema's apps table would have
+	// accepted — no compose_project/compose_service/internal columns
+	// exist yet at this point.
+	if _, err := db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, "preexisting9", "nginx:alpine", 80); err != nil {
+		t.Fatalf("insert pre-migration-9 row: %v", err)
+	}
+
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	got, err := s.AppBySlug("preexisting9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ComposeProject != "" || got.ComposeService != "" || got.Internal {
+		t.Fatalf("pre-existing row's compose fields = project=%q service=%q internal=%v, want all zero-value", got.ComposeProject, got.ComposeService, got.Internal)
+	}
+}
+
+// TestCreateComposeApp proves CreateComposeApp sets compose_project/
+// compose_service/internal at insert time (unlike CreateApp, which
+// leaves all three at their schema defaults).
+func TestCreateComposeApp(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateComposeApp("shop-db", "", 0, true, "shop", "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.ComposeProject != "shop" || app.ComposeService != "db" || !app.Internal {
+		t.Fatalf("unexpected app: %+v", app)
+	}
+
+	got, err := s.AppBySlug("shop-db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ComposeProject != "shop" || got.ComposeService != "db" || !got.Internal {
+		t.Fatalf("AppBySlug round-trip: %+v", got)
+	}
+}
+
+// TestUpdateAppInternal proves UpdateAppInternal round-trips through both
+// values, independent of a hand-created app's own zero-value default.
+func TestUpdateAppInternal(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("web", "nginx:alpine", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Internal {
+		t.Fatal("expected a hand-created app to start non-internal")
+	}
+
+	if err := s.UpdateAppInternal(app.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AppBySlug("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Internal {
+		t.Fatal("expected Internal=true after UpdateAppInternal(true)")
+	}
+
+	if err := s.UpdateAppInternal(app.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.AppBySlug("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Internal {
+		t.Fatal("expected Internal=false after UpdateAppInternal(false)")
+	}
+}
+
+// TestListAppsByComposeProject proves it returns only apps whose
+// compose_project matches, ignoring both hand-created apps and other
+// projects' apps.
+func TestListAppsByComposeProject(t *testing.T) {
+	s := open(t)
+	if _, err := s.CreateComposeApp("shop-db", "postgres:16", 0, true, "shop", "db"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateComposeApp("shop-web", "nginx:alpine", 80, false, "shop", "web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateComposeApp("blog-web", "nginx:alpine", 80, false, "blog", "web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateApp("standalone", "nginx:alpine", 80); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListAppsByComposeProject("shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 apps for project shop, got %+v", got)
+	}
+	slugs := map[string]bool{got[0].Slug: true, got[1].Slug: true}
+	if !slugs["shop-db"] || !slugs["shop-web"] {
+		t.Fatalf("unexpected slugs for project shop: %+v", got)
+	}
+}
+
+// TestListComposeApps proves it returns every compose-managed app across
+// every project, and none of a hand-created app.
+func TestListComposeApps(t *testing.T) {
+	s := open(t)
+	if _, err := s.CreateComposeApp("shop-db", "postgres:16", 0, true, "shop", "db"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateComposeApp("blog-web", "nginx:alpine", 80, false, "blog", "web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateApp("standalone", "nginx:alpine", 80); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListComposeApps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 compose apps, got %+v", got)
+	}
+	for _, app := range got {
+		if app.Slug == "standalone" {
+			t.Fatal("ListComposeApps must never include a hand-created app")
+		}
 	}
 }

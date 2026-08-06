@@ -39,6 +39,7 @@ func Commands() []*cobra.Command {
 		newAppsCmd(),
 		newInitCmd(),
 		newDeployCmd(),
+		newComposeCmd(),
 		newLogsCmd(),
 		newEnvCmd(),
 		newRollbackCmd(),
@@ -605,6 +606,160 @@ func pollDeploymentUntilTerminal(ctx context.Context, client *Client, appSlug st
 		case <-time.After(deployPollInterval):
 		}
 	}
+}
+
+// newComposeCmd builds `basepod compose` and its `up` subcommand (v0.5
+// Task 8).
+func newComposeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "compose",
+		Short: "Deploy a compose.yaml project as one BasePod app per service",
+	}
+	cmd.AddCommand(newComposeUpCmd())
+	return cmd
+}
+
+// newComposeUpCmd builds `basepod compose up [path] [--project name] [--dry-run]`.
+func newComposeUpCmd() *cobra.Command {
+	var project string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:          "up [path]",
+		Short:        "Parse and apply a compose.yaml (or compose.yml/docker-compose.yml) project",
+		Args:         cobra.MaximumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := deployPathArg(args)
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			return composeUp(cmd, client, path, project, dryRun)
+		},
+	}
+	cmd.Flags().StringVar(&project, "project", "", "compose project name (default: the compose file's top-level `name:`)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the plan without deploying anything")
+	addContextFlag(cmd)
+	return cmd
+}
+
+// composeUp implements `basepod compose up`: pack path (respecting
+// .basepodignore, same packer `basepod deploy` uses) into a single
+// gzipped tar — compose.yaml plus every service's own build context, all
+// as one upload, matching what POST /compose/up expects — upload it, and
+// print the resulting plan. For a real (non-dry-run) apply, it then
+// follows every service's deployment to a terminal status, in the same
+// dependency order the server deployed them, and returns a non-nil error
+// naming which service(s) failed if any did — matching `basepod deploy`'s
+// own "exit non-zero on failure" contract.
+func composeUp(cmd *cobra.Command, client *Client, path, project string, dryRun bool) error {
+	out := cmd.OutOrStdout()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("compose path %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("compose path %s is not a directory", path)
+	}
+
+	f, size, err := packToTempFile(path)
+	if err != nil {
+		return fmt.Errorf("pack compose project: %w", err)
+	}
+	defer func() {
+		f.Close()
+		os.Remove(f.Name())
+	}()
+
+	if size > sizeWarnThreshold {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: upload is %s (over 64 MiB) — this may take a while to upload\n", humanBytes(size))
+	}
+	fmt.Fprintf(out, "Uploading %s...\n", humanBytes(size))
+
+	result, err := client.ComposeUp(cmd.Context(), project, dryRun, f, size)
+	if err != nil {
+		return err
+	}
+
+	printComposePlan(out, result)
+
+	if dryRun {
+		return nil
+	}
+	return followComposeServices(cmd, client, result)
+}
+
+// printComposePlan prints a compose apply/dry-run response as a table
+// (one row per service: name, slug, action, routing, deploy strategy)
+// followed by every warning — per-service, then plan-level — and every
+// orphaned service, so nothing the server flagged is silently invisible
+// (doc 06's "warn loudly, never silently drop" ruling applies to this CLI
+// output too, not just the future dashboard preview).
+func printComposePlan(out io.Writer, result *ComposeResult) {
+	fmt.Fprintf(out, "project: %s", result.Project)
+	if result.DryRun {
+		fmt.Fprint(out, " (dry run — nothing changed)")
+	}
+	fmt.Fprintln(out)
+
+	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "SERVICE\tSLUG\tACTION\tROUTING\tSTRATEGY")
+	for _, s := range result.Services {
+		routing := fmt.Sprintf("port %d", s.Port)
+		if s.Internal {
+			routing = "internal"
+		}
+		strategy := s.DeployStrategy
+		if strategy == "" {
+			strategy = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Slug, s.Action, routing, strategy)
+	}
+	tw.Flush()
+
+	for _, s := range result.Services {
+		for _, w := range s.Warnings {
+			fmt.Fprintf(out, "warning (%s): %s\n", s.Name, w)
+		}
+	}
+	for _, w := range result.Warnings {
+		fmt.Fprintf(out, "warning: %s\n", w)
+	}
+	for _, o := range result.Orphans {
+		fmt.Fprintf(out, "orphan: %s is no longer in the compose file — left running untouched; delete it explicitly if it's no longer needed\n", o)
+	}
+}
+
+// followComposeServices polls each service's deployment (in the same
+// dependency order the response lists them, matching what the server
+// actually deployed in) until it reaches a terminal status, printing each
+// as it lands. A service with DeploymentNumber 0 was never reached (an
+// earlier service in the chain failed — see internal/api/compose.go's
+// partial-failure contract) and is skipped, its own deployment record
+// (status "failed", "aborted: ...") already speaking for itself via the
+// per-service loop above having printed nothing further to add here.
+func followComposeServices(cmd *cobra.Command, client *Client, result *ComposeResult) error {
+	out := cmd.OutOrStdout()
+	var failed []string
+	for _, s := range result.Services {
+		if s.DeploymentNumber == 0 {
+			continue
+		}
+		fmt.Fprintf(out, "%s: waiting for deployment #%d...\n", s.Name, s.DeploymentNumber)
+		dep, err := pollDeploymentUntilTerminal(cmd.Context(), client, s.Slug, s.DeploymentNumber)
+		if err != nil {
+			return fmt.Errorf("%s: %w", s.Name, err)
+		}
+		printDeployment(out, dep)
+		if dep.Status != "healthy" {
+			failed = append(failed, s.Name)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("compose apply finished with failed service(s): %s", strings.Join(failed, ", "))
+	}
+	return nil
 }
 
 // newLogsCmd builds `basepod logs <slug> [-f] [--tail N]`.

@@ -110,7 +110,7 @@ func giteaSig(secret string, body []byte) string {
 // used to synchronize on a fake's background goroutine (DeployGitCloneAsync
 // runs its fetch/onDone asynchronously, exactly like the real engine)
 // without sleeping a fixed, potentially-flaky duration.
-func waitForCondition(t *testing.T, cond func() bool) {
+func waitForWebhookCondition(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -181,13 +181,13 @@ func TestWebhookValidGitHubPushDeploys(t *testing.T) {
 		t.Fatalf("got status %d, want 202", resp.StatusCode)
 	}
 
-	waitForCondition(t, func() bool { return fetcher.callCount() == 1 })
+	waitForWebhookCondition(t, func() bool { return fetcher.callCount() == 1 })
 	call := fetcher.lastCall()
 	if call.url != "https://github.com/example/repo.git" || call.branch != "main" {
 		t.Fatalf("Fetch called with %+v, want the stored config's url/branch", call)
 	}
 
-	waitForCondition(t, func() bool {
+	waitForWebhookCondition(t, func() bool {
 		list, _ := st.ListGitDeliveries(app.ID, 10)
 		return len(list) == 1 && list[0].Status == "deployed"
 	})
@@ -204,7 +204,7 @@ func TestWebhookValidGiteaPushDeploys(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("got status %d, want 202", resp.StatusCode)
 	}
-	waitForCondition(t, func() bool { return fetcher.callCount() == 1 })
+	waitForWebhookCondition(t, func() bool { return fetcher.callCount() == 1 })
 }
 
 func TestWebhookValidGitLabPushDeploys(t *testing.T) {
@@ -218,7 +218,7 @@ func TestWebhookValidGitLabPushDeploys(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("got status %d, want 202", resp.StatusCode)
 	}
-	waitForCondition(t, func() bool { return fetcher.callCount() == 1 })
+	waitForWebhookCondition(t, func() bool { return fetcher.callCount() == 1 })
 }
 
 // TestWebhookForgedSignatureRejected proves a forged/mismatched signature
@@ -570,7 +570,7 @@ func TestWebhookFloodCoalescesToAtMostTwoDeploys(t *testing.T) {
 	// pending push, #5) should now run, and only that one.
 	close(block)
 
-	waitForCondition(t, func() bool { return fetcher.callCount() == 2 })
+	waitForWebhookCondition(t, func() bool { return fetcher.callCount() == 2 })
 	// Give any (incorrect) extra chained deploy a moment to show up.
 	time.Sleep(200 * time.Millisecond)
 	if got := fetcher.callCount(); got != 2 {
@@ -578,7 +578,7 @@ func TestWebhookFloodCoalescesToAtMostTwoDeploys(t *testing.T) {
 	}
 
 	var list []store.GitDelivery
-	waitForCondition(t, func() bool {
+	waitForWebhookCondition(t, func() bool {
 		var err error
 		list, err = st.ListGitDeliveries(app.ID, 20)
 		if err != nil {
@@ -634,7 +634,7 @@ func TestWebhookHostileCloneURLIgnored(t *testing.T) {
 		t.Fatalf("got status %d, want 202", resp.StatusCode)
 	}
 
-	waitForCondition(t, func() bool { return fetcher.callCount() == 1 })
+	waitForWebhookCondition(t, func() bool { return fetcher.callCount() == 1 })
 	call := fetcher.lastCall()
 	if call.url != "https://github.com/example/repo.git" {
 		t.Fatalf("Fetch called with url %q — the payload's hostile clone_url must NEVER be used, only the stored config's", call.url)

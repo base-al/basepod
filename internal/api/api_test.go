@@ -119,6 +119,23 @@ type fakeDeployer struct {
 
 	rollbackCalledApp    string
 	rollbackCalledNumber int
+
+	// deployExistingErr/deployBuildExistingErr, if set, are returned by
+	// DeployExisting/DeployBuildExisting as-is (after finishing the
+	// caller-supplied deployment row "failed") — v0.5 Task 8's compose
+	// orchestrator additions. deployExistingCalls/deployBuildExistingCalls
+	// record every app slug each was called with, in call order, so a
+	// test can assert dependency-order sequencing without a real
+	// container runtime. compose_test.go defines its own richer fake for
+	// scripting per-service failures; this default behavior (always
+	// succeed, unless the single shared err is set) only needs to prove
+	// every OTHER test in this package that constructs a bare
+	// &fakeDeployer{} still compiles and behaves reasonably against the
+	// full Deployer interface.
+	deployExistingErr        error
+	deployBuildExistingErr   error
+	deployExistingCalls      []string
+	deployBuildExistingCalls []string
 }
 
 func (f *fakeDeployer) Deploy(ctx context.Context, app *store.App, imageRef string) (*store.Deployment, error) {
@@ -281,6 +298,37 @@ func (f *fakeDeployer) Rollback(ctx context.Context, app *store.App, targetNumbe
 func (f *fakeDeployer) RemoveApp(ctx context.Context, app *store.App) error {
 	f.removeCalled = true
 	return f.removeErr
+}
+
+// DeployExisting is a lightweight stand-in for
+// deploy.Engine.DeployExisting (v0.5 Task 8): it finishes the
+// caller-supplied deployment row itself (mirroring how the real engine's
+// runRollout ultimately calls store.FinishDeployment), rather than
+// creating a new one the way Deploy above does — reusing an
+// already-created row is the whole point of DeployExisting.
+func (f *fakeDeployer) DeployExisting(ctx context.Context, app *store.App, dep *store.Deployment, imageRef string) (*store.Deployment, error) {
+	f.deployExistingCalls = append(f.deployExistingCalls, app.Slug)
+	if f.deployExistingErr != nil {
+		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployExistingErr.Error())
+		return nil, f.deployExistingErr
+	}
+	_ = f.st.UpdateAppStatus(app.ID, "running")
+	_ = f.st.FinishDeployment(dep.ID, "healthy", "")
+	dep.Status = "healthy"
+	return dep, nil
+}
+
+// DeployBuildExisting is DeployExisting's build-from-tar twin.
+func (f *fakeDeployer) DeployBuildExisting(ctx context.Context, app *store.App, dep *store.Deployment, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
+	f.deployBuildExistingCalls = append(f.deployBuildExistingCalls, app.Slug)
+	if f.deployBuildExistingErr != nil {
+		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployBuildExistingErr.Error())
+		return nil, f.deployBuildExistingErr
+	}
+	_ = f.st.UpdateAppStatus(app.ID, "running")
+	_ = f.st.FinishDeployment(dep.ID, "healthy", "")
+	dep.Status = "healthy"
+	return dep, nil
 }
 
 func fakePinger(err error) Pinger {

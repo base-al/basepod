@@ -74,6 +74,19 @@ type Deployer interface {
 	// status/error codes — see writeRollbackError in apps.go.
 	Rollback(ctx context.Context, app *store.App, targetNumber int) (*store.Deployment, error)
 	RemoveApp(ctx context.Context, app *store.App) error
+
+	// --- v0.5 Task 8: compose apply additions ---
+	//
+	// DeployExisting and DeployBuildExisting drive the same pull/build+
+	// rollout pipeline as Deploy/DeployBuildAsync, but against a
+	// deployment row the caller (the compose orchestrator, internal/api/
+	// compose.go) has already created via the store directly — so its
+	// 202 response can report every service's real deployment number
+	// immediately, in dependency order, before any of the actual work
+	// has run. See deploy.Engine.DeployExisting/DeployBuildExisting's
+	// doc comments for the full contract.
+	DeployExisting(ctx context.Context, app *store.App, dep *store.Deployment, imageRef string) (*store.Deployment, error)
+	DeployBuildExisting(ctx context.Context, app *store.App, dep *store.Deployment, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error)
 }
 
 // Pinger checks that the container runtime is reachable. It is satisfied
@@ -221,6 +234,15 @@ type api struct {
 	// gitsource.ErrGitUnavailable, mapped to 503 "git_unavailable") —
 	// tests that don't exercise git deploys simply omit it.
 	gitFetcher GitFetcher
+	// composeWG tracks every background compose-orchestration goroutine
+	// started by handleComposeUp (v0.5 Task 8), mirroring
+	// deploy.Engine.wg's purpose: nothing production-critical waits on it
+	// today (an in-flight compose apply is left to run to completion on
+	// process shutdown, same as any other in-flight background deploy),
+	// but tests use it to deterministically wait for an orchestration run
+	// to finish before asserting on its effects, rather than polling or
+	// sleeping.
+	composeWG sync.WaitGroup
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
@@ -318,6 +340,12 @@ func newRouter(a *api) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(a.requireAuth)
 			r.Post("/apps/{slug}/deploy/tarball", a.handleDeployTarball)
+			// Compose apply (v0.5 Task 8) needs the same large, non-JSON
+			// body cap as the tarball upload above — the request body is
+			// a gzipped tar carrying compose.yaml plus any per-service
+			// build contexts — so it's registered in this same
+			// requireAuth-only group rather than bodyLimit's 1 MiB one.
+			r.Post("/compose/up", a.handleComposeUp)
 		})
 
 		// The two SSE routes get their own, route-specific auth

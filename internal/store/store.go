@@ -60,6 +60,13 @@ type User struct {
 // apps require to avoid two containers writing one named volume at once,
 // at the cost of a failed deploy leaving the app down with no old
 // container to fall back to.
+// ComposeProject/ComposeService key an app back to the compose.yaml
+// service it was created from (both "" for a hand-created app — see
+// migration 00009_compose.sql). Internal is true for a service that had no
+// `expose:` entries: no Caddy route (internal/deploy's Routes() skips it)
+// and no HTTP health probe target (runRollout skips probing it) — see the
+// migration's doc comment. Only internal/api's compose apply ever sets any
+// of the three.
 type App struct {
 	ID             int64
 	Slug           string
@@ -71,6 +78,9 @@ type App struct {
 	PidsLimit      int64
 	AliasScheme    string
 	DeployStrategy string
+	ComposeProject string
+	ComposeService string
+	Internal       bool
 }
 
 // AliasSchemeLegacy and AliasSchemeV2 are the two values App.AliasScheme
@@ -522,7 +532,7 @@ const (
 
 // appColumns is the column list (in scan order) shared by CreateApp's
 // implicit row shape, scanApp, and ListApps.
-const appColumns = `id, slug, image_ref, port, status, memory_limit_mb, cpu_limit, pids_limit, alias_scheme, deploy_strategy`
+const appColumns = `id, slug, image_ref, port, status, memory_limit_mb, cpu_limit, pids_limit, alias_scheme, deploy_strategy, compose_project, compose_service, internal`
 
 // CreateApp inserts a new app with status "created", the schema's default
 // resource limits (see defaultMemoryLimitMB etc.), the schema's default
@@ -547,15 +557,49 @@ func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	}, nil
 }
 
+// CreateComposeApp is CreateApp's compose-aware twin (v0.5 Task 8): it
+// additionally sets compose_project/compose_service (the (project,
+// service) key a re-apply looks the app up by — see migration
+// 00009_compose.sql) and internal (no Caddy route, no HTTP probe — see the
+// App.Internal doc comment) at insert time, since a compose-created app
+// must carry this metadata from the moment it exists, not as a later
+// PATCH. imageRef may be "" for a build-sourced service (no image tag
+// exists until the first build completes). Only internal/api's compose
+// apply calls this; every other app-creation path (handleCreateApp) still
+// goes through CreateApp, which leaves all three at their schema defaults
+// ("", "", false).
+func (s *Store) CreateComposeApp(slug, imageRef string, port int, internal bool, project, service string) (*App, error) {
+	res, err := s.db.Exec(`INSERT INTO apps(slug, image_ref, port, compose_project, compose_service, internal) VALUES(?, ?, ?, ?, ?, ?)`,
+		slug, imageRef, port, project, service, internal)
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &App{
+		ID: id, Slug: slug, ImageRef: imageRef, Port: port, Status: "created",
+		MemoryLimitMB: DefaultMemoryLimitMB, CPULimit: DefaultCPULimit, PidsLimit: DefaultPidsLimit,
+		AliasScheme:    AliasSchemeLegacy,
+		DeployStrategy: DeployStrategyZeroDowntime,
+		ComposeProject: project,
+		ComposeService: service,
+		Internal:       internal,
+	}, nil
+}
+
 func scanApp(row *sql.Row) (*App, error) {
 	var a App
-	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy)
+	var internal int
+	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy, &a.ComposeProject, &a.ComposeService, &internal)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	a.Internal = internal != 0
 	return &a, nil
 }
 
@@ -585,9 +629,11 @@ func (s *Store) ListApps() ([]App, error) {
 	var apps []App
 	for rows.Next() {
 		var a App
-		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy); err != nil {
+		var internal int
+		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy, &a.ComposeProject, &a.ComposeService, &internal); err != nil {
 			return nil, err
 		}
+		a.Internal = internal != 0
 		apps = append(apps, a)
 	}
 	return apps, rows.Err()
@@ -1266,4 +1312,77 @@ func (s *Store) ListVolumes(appID int64) ([]Volume, error) {
 		volumes = append(volumes, v)
 	}
 	return volumes, rows.Err()
+}
+
+// ---------------------------------------------------------------------
+// v0.5 Task 8: compose apply (migration 00009_compose.sql) — kept in its
+// own block for the same reason as the git sources/deliveries and
+// volumes/deploy_strategy blocks above it.
+// ---------------------------------------------------------------------
+
+// UpdateAppInternal sets an app's internal flag (see App's doc comment)
+// and bumps updated_at. Compose re-applies this on every apply (a service
+// can gain or lose its `expose:` entry between compose.yaml revisions), so
+// this is idempotent by design rather than a one-time creation-only
+// setting.
+func (s *Store) UpdateAppInternal(id int64, internal bool) error {
+	_, err := s.db.Exec(`UPDATE apps SET internal = ?, updated_at = ? WHERE id = ?`,
+		internal, time.Now().UTC().Format(timeFormat), id)
+	return err
+}
+
+// ListAppsByComposeProject returns every app whose compose_project equals
+// project, ordered by id. Used by internal/api/compose.go to build
+// compose.PlanContext.ExistingApps (this project's apps from a prior
+// apply, so BuildPlan can tell create from update and detect orphans — a
+// service present in the store for this project but absent from the
+// compose file being applied now) and to compute an app slug's remaining
+// membership when reporting orphans.
+func (s *Store) ListAppsByComposeProject(project string) ([]App, error) {
+	rows, err := s.db.Query(`SELECT `+appColumns+` FROM apps WHERE compose_project = ? ORDER BY id`, project)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var apps []App
+	for rows.Next() {
+		var a App
+		var internal int
+		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy, &a.ComposeProject, &a.ComposeService, &internal); err != nil {
+			return nil, err
+		}
+		a.Internal = internal != 0
+		apps = append(apps, a)
+	}
+	return apps, rows.Err()
+}
+
+// ListComposeApps returns every app with a non-empty compose_service —
+// i.e. every service, across every compose project, that some prior
+// compose apply created — ordered by id. Used by internal/api/compose.go
+// to build compose.PlanContext.TakenAliases: only a compose service's
+// container ever carries a bare-service-name network alias (see
+// internal/deploy's runRollout), so this (not every app) is the full set
+// of existing bare-alias claims a new apply's aliases must be checked
+// against (audit finding M1's regression risk — see the v0.5 plan's
+// self-review notes).
+func (s *Store) ListComposeApps() ([]App, error) {
+	rows, err := s.db.Query(`SELECT ` + appColumns + ` FROM apps WHERE compose_service != '' ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var apps []App
+	for rows.Next() {
+		var a App
+		var internal int
+		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy, &a.ComposeProject, &a.ComposeService, &internal); err != nil {
+			return nil, err
+		}
+		a.Internal = internal != 0
+		apps = append(apps, a)
+	}
+	return apps, rows.Err()
 }
