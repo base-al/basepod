@@ -112,6 +112,16 @@ type RoutesApplier interface {
 // documented HTTP status/error codes.
 type LogSource func(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error)
 
+// StatsSource streams a running app's raw (still-wire-format — see
+// podman.StreamStats) container resource-usage stats by slug (v0.5 plan
+// Task 11). It is declared here for the same reason LogSource is (so
+// handlers can be tested against a fake instead of a real container
+// runtime); *deploy.Engine's AppStats method satisfies it, and must return
+// store.ErrNotFound for an unknown slug and deploy.ErrNotRunning when the
+// app has no running container, exactly like LogSource — handleAppStats
+// maps both to the documented HTTP status/error codes.
+type StatsSource func(ctx context.Context, slug string) (io.ReadCloser, error)
+
 // deployTimeout bounds a single deploy request. v0.1 deploys run
 // synchronously inside the HTTP handler (no SSE build-log streaming until
 // v0.2's real builds), so a stuck pull or health-probe loop must not hang
@@ -221,6 +231,10 @@ type api struct {
 	// demux into SSE events.
 	logs LogSource
 
+	// stats streams an app's raw container resource-usage stats for
+	// handleAppStats to decode into SSE events (v0.5 plan Task 11).
+	stats StatsSource
+
 	// builder is the shared tarball-build pipeline, passed straight
 	// through to every Deployer.DeployBuild call by handleDeployTarball —
 	// see the Deployer.DeployBuild doc comment for why it's threaded
@@ -251,7 +265,7 @@ type api struct {
 // production caller (internal/server.Run) always passes a real
 // *gitsource.Cloner, itself gracefully degraded (not nil) when the git
 // binary isn't installed.
-func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher) http.Handler {
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource) http.Handler {
 	a := &api{
 		st:             st,
 		dep:            dep,
@@ -267,6 +281,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(a
 		logs:           logs,
 		builder:        builder,
 		gitFetcher:     gitFetcher,
+		stats:          stats,
 	}
 	return newRouter(a)
 }
@@ -358,6 +373,17 @@ func newRouter(a *api) http.Handler {
 		// only the header form accepts one, same as everywhere else.
 		r.With(a.requireAuthAppLogs).Get("/apps/{slug}/logs", a.handleAppLogs)
 		r.With(a.requireAuthBuildLog).Get("/apps/{slug}/deployments/{number}/log", a.handleDeploymentLog)
+		// GET .../apps/{slug}/stats (v0.5 plan Task 11): a third SSE route,
+		// same shape as the two above — requireAuthStats accepts either a
+		// session Authorization header or a stream token scoped "stats" for
+		// this exact slug via ?access_token=.
+		r.With(a.requireAuthStats).Get("/apps/{slug}/stats", a.handleAppStats)
+
+		// The OpenAPI spec is served publicly (no auth) — it documents the
+		// route table itself, so gating it behind a login would be
+		// security theater (v0.5 plan Task 11): the source file at
+		// api/openapi.yaml is public in the repo regardless.
+		r.Get("/openapi.yaml", a.handleOpenAPISpec)
 	})
 	return r
 }

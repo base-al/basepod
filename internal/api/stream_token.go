@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -13,13 +14,18 @@ import (
 	"github.com/base-al/basepod/internal/store"
 )
 
-// Stream-token scopes: the only two shapes an SSE route in this API
-// authenticates. See store.StreamToken's doc comment for what each one
-// carries, and requireAuthAppLogs/requireAuthBuildLog below for where
+// Stream-token scopes: the shapes an SSE route in this API authenticates.
+// See store.StreamToken's doc comment for what each one carries, and
+// requireAuthAppLogs/requireAuthBuildLog/requireAuthStats below for where
 // they're checked against an incoming request.
 const (
 	streamScopeAppLogs  = "app_logs"
 	streamScopeBuildLog = "build_log"
+	// streamScopeStats is the stats SSE route's scope (v0.5 plan Task 11):
+	// like streamScopeAppLogs, it names a slug and no deployment number.
+	// The stream_tokens.scope column is free TEXT (see store.StreamToken),
+	// so adding this scope needs no migration.
+	streamScopeStats = "stats"
 )
 
 // streamTokenDuration is how long a minted stream token remains valid.
@@ -67,8 +73,8 @@ func (a *api) handleCreateStreamToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Scope != streamScopeAppLogs && req.Scope != streamScopeBuildLog {
-		writeError(w, http.StatusUnprocessableEntity, "validation", `scope must be "app_logs" or "build_log"`)
+	if req.Scope != streamScopeAppLogs && req.Scope != streamScopeBuildLog && req.Scope != streamScopeStats {
+		writeError(w, http.StatusUnprocessableEntity, "validation", `scope must be "app_logs", "build_log", or "stats"`)
 		return
 	}
 
@@ -84,9 +90,9 @@ func (a *api) handleCreateStreamToken(w http.ResponseWriter, r *http.Request) {
 
 	var deploymentNumber *int64
 	switch req.Scope {
-	case streamScopeAppLogs:
+	case streamScopeAppLogs, streamScopeStats:
 		if req.DeploymentNumber != nil {
-			writeError(w, http.StatusUnprocessableEntity, "validation", "deployment_number must not be set for scope \"app_logs\"")
+			writeError(w, http.StatusUnprocessableEntity, "validation", fmt.Sprintf("deployment_number must not be set for scope %q", req.Scope))
 			return
 		}
 	case streamScopeBuildLog:
@@ -230,5 +236,18 @@ func (a *api) requireAuthBuildLog(next http.Handler) http.Handler {
 			return nil, false
 		}
 		return a.validateStreamToken(token, streamScopeBuildLog, chi.URLParam(r, "slug"), &number)
+	})(next)
+}
+
+// requireAuthStats is requireAuthAppLogs's twin for
+// GET .../apps/{slug}/stats (v0.5 plan Task 11): a query-string stream
+// token must have been minted with scope "stats" for this exact slug — a
+// token minted for "app_logs" or "build_log" (even for the same app and
+// user) does not authenticate this route, and vice versa, since each SSE
+// route's stream token is its own separate credential (see
+// handleCreateStreamToken and validateStreamToken).
+func (a *api) requireAuthStats(next http.Handler) http.Handler {
+	return a.requireAuthSSE(func(r *http.Request, token string) (*store.User, bool) {
+		return a.validateStreamToken(token, streamScopeStats, chi.URLParam(r, "slug"), nil)
 	})(next)
 }

@@ -83,6 +83,12 @@ type fakeRuntime struct {
 	logsReader io.ReadCloser
 	logsErr    error
 	logsCalls  []loggedCall
+
+	// statsReader/statsErr script ContainerStats; statsCalls records every
+	// call's nameOrID — mirrors logsReader/logsErr/logsCalls above.
+	statsReader io.ReadCloser
+	statsErr    error
+	statsCalls  []string
 }
 
 // loggedCall records one ContainerLogs invocation.
@@ -301,6 +307,20 @@ func (f *fakeRuntime) ContainerLogs(ctx context.Context, nameOrID string, follow
 	}
 	if f.logsReader != nil {
 		return f.logsReader, nil
+	}
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (f *fakeRuntime) ContainerStats(ctx context.Context, nameOrID string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.statsCalls = append(f.statsCalls, nameOrID)
+	if f.statsErr != nil {
+		return nil, f.statsErr
+	}
+	if f.statsReader != nil {
+		return f.statsReader, nil
 	}
 	return io.NopCloser(strings.NewReader("")), nil
 }
@@ -1767,6 +1787,99 @@ func TestAppLogsPropagatesRuntimeError(t *testing.T) {
 	_, err = eng.AppLogs(ctx, "blog", false, 200)
 	if err == nil || !strings.Contains(err.Error(), "logs boom") {
 		t.Fatalf("err = %v, want it to wrap %q", err, "logs boom")
+	}
+}
+
+// TestAppStatsAppNotFound proves AppStats passes store.ErrNotFound through
+// unchanged for an unknown slug, mirroring AppLogs' identical handling.
+func TestAppStatsAppNotFound(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	_, err := eng.AppStats(context.Background(), "nope")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("err = %v, want store.ErrNotFound", err)
+	}
+}
+
+// TestAppStatsNotRunning proves AppStats returns ErrNotRunning for an app
+// that exists but has no running container (never deployed) — mirrors
+// TestAppLogsNotRunning.
+func TestAppStatsNotRunning(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+
+	if _, err := st.CreateApp("blog", "nginx:v1", 80); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := eng.AppStats(context.Background(), "blog")
+	if !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("err = %v, want ErrNotRunning", err)
+	}
+}
+
+// TestAppStatsRunning proves AppStats finds the app's running container and
+// returns Runtime.ContainerStats' reader for it — mirrors TestAppLogsRunning.
+func TestAppStatsRunning(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	wantReader := io.NopCloser(strings.NewReader("scripted stats data"))
+	rt.statsReader = wantReader
+
+	rc, err := eng.AppStats(ctx, "blog")
+	if err != nil {
+		t.Fatalf("AppStats: %v", err)
+	}
+	if rc != wantReader {
+		t.Errorf("AppStats returned a different reader than Runtime.ContainerStats supplied")
+	}
+
+	if len(rt.statsCalls) != 1 {
+		t.Fatalf("statsCalls = %+v, want exactly 1 call", rt.statsCalls)
+	}
+	var wantID string
+	for id, c := range rt.containers {
+		if c.Name == "bp-blog-1" {
+			wantID = id
+		}
+	}
+	if rt.statsCalls[0] != wantID {
+		t.Errorf("statsCalls[0] = %q, want %q (bp-blog-1's container ID)", rt.statsCalls[0], wantID)
+	}
+}
+
+// TestAppStatsPropagatesRuntimeError proves a Runtime.ContainerStats error
+// surfaces from AppStats rather than being swallowed — mirrors
+// TestAppLogsPropagatesRuntimeError.
+func TestAppStatsPropagatesRuntimeError(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	rt.statsErr = errors.New("stats boom")
+
+	_, err = eng.AppStats(ctx, "blog")
+	if err == nil || !strings.Contains(err.Error(), "stats boom") {
+		t.Fatalf("err = %v, want it to wrap %q", err, "stats boom")
 	}
 }
 

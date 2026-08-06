@@ -38,6 +38,11 @@ type Runtime interface {
 	InspectContainer(ctx context.Context, nameOrID string) (*podman.ContainerInfo, error)
 	ListContainers(ctx context.Context, labelFilters map[string]string) ([]podman.ContainerInfo, error)
 	ContainerLogs(ctx context.Context, nameOrID string, follow bool, tail int) (io.ReadCloser, error)
+	// ContainerStats streams a container's resource-usage stats — used by
+	// AppStats exactly like ContainerLogs is used by AppLogs. See
+	// podman.Client.ContainerStats's doc comment for the wire format and
+	// its verification trail.
+	ContainerStats(ctx context.Context, nameOrID string) (io.ReadCloser, error)
 }
 
 // Prober checks that an upstream ("host:port" reachable on the basepod

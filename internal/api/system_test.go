@@ -20,7 +20,7 @@ func TestHandleSystemRedactsPodmanError(t *testing.T) {
 	// build a server directly (bypassing that helper) with a failing
 	// pinger to exercise the error path.
 	leaky := errors.New("dial unix /run/podman/podman.sock: connect: no such file or directory")
-	srv := httptest.NewServer(New(st, &fakeDeployer{st: st}, fakePinger(leaky), "test-version", testSeal, testOpen, &fakeRoutesApplier{}, unusedLogSource, nil, nil))
+	srv := httptest.NewServer(New(st, &fakeDeployer{st: st}, fakePinger(leaky), "test-version", testSeal, testOpen, &fakeRoutesApplier{}, unusedLogSource, nil, nil, unusedStatsSource))
 	t.Cleanup(srv.Close)
 
 	_, session := login(t, srv, testPassword)

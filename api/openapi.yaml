@@ -1,0 +1,1078 @@
+openapi: 3.1.0
+info:
+  title: BasePod API
+  version: "0.5.0"
+  description: |
+    BasePod's control-plane REST API — session auth, app lifecycle, deploys
+    (image/tarball/git/compose), env/domains, and streaming logs/build-log/
+    stats over Server-Sent Events.
+
+    **This document is hand-written and enforced, not generated.** A test
+    (`internal/api/openapi_test.go`) walks the real chi router with
+    `chi.Walk` and asserts every registered route+method appears here, and
+    every path+method here exists in the router — in both directions. If
+    this file and the router ever disagree, that test fails. Treat any
+    change to `internal/api/router.go`'s route table as also owing a change
+    here.
+
+    **Error envelope.** Every non-2xx JSON response uses the same shape:
+    `{"error":{"code":"...","message":"..."}}` — see the shared `Error`
+    schema referenced from every operation's error responses below.
+
+    **Auth.** Two independent schemes exist:
+    - `sessionAuth` — `Authorization: Bearer <session-token>`, minted by
+      `POST /auth/login` and valid up to 30 days. Used by every
+      authenticated route except the two noted below.
+    - `streamTokenAuth` — `?access_token=<stream-token>` on the query
+      string, accepted **only** on the three SSE routes
+      (`.../logs`, `.../deployments/{number}/log`, `.../stats`), because a
+      native browser `EventSource` cannot set request headers. A stream
+      token is minted via `POST /stream-token`, is scoped to exactly one
+      (scope, slug[, deployment_number]) triple, and expires in 5 minutes.
+      A session token placed in `?access_token=` is rejected — this
+      parameter accepts stream tokens only. This is a non-standard,
+      route-specific scheme; OpenAPI's `apiKey`-in-query type is used here
+      as the closest fit, not because it behaves like a typical API key
+      (it is single-use-scope and short-lived).
+    - `POST /webhooks/git/{hookID}` carries **no** BasePod auth at all — see
+      that operation's description for its own security model
+      (HMAC/token signature verification instead).
+    - `GET /openapi.yaml` (this document) is also unauthenticated.
+
+servers:
+  - url: /api/v1
+
+security:
+  - sessionAuth: []
+
+tags:
+  - name: auth
+  - name: system
+  - name: apps
+  - name: deploy
+  - name: env
+  - name: domains
+  - name: git
+  - name: webhooks
+  - name: compose
+  - name: streaming
+  - name: meta
+
+paths:
+  /auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      summary: Log in with email + password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /auth/me:
+    get:
+      operationId: getMe
+      tags: [auth]
+      summary: Get the authenticated user
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: Invalidate the current session
+      responses:
+        "204": { description: Logged out }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/sessions:
+    get:
+      operationId: listSessions
+      tags: [auth]
+      summary: List the authenticated user's active sessions
+      responses:
+        "200":
+          description: Sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/sessions/{id}:
+    delete:
+      operationId: deleteSession
+      tags: [auth]
+      summary: Revoke a session (e.g. remote sign-out of another device)
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "204": { description: Revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /auth/password:
+    post:
+      operationId: changePassword
+      tags: [auth]
+      summary: Change the authenticated user's password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChangePasswordRequest" }
+      responses:
+        "204": { description: Password changed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /stream-token:
+    post:
+      operationId: createStreamToken
+      tags: [streaming]
+      summary: Mint a short-lived, single-purpose SSE stream token
+      description: |
+        Scoped to exactly one (scope, slug[, deployment_number]) triple —
+        see the top-level auth description for how it's used on the three
+        SSE routes. Expires in 5 minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StreamTokenRequest" }
+      responses:
+        "200":
+          description: Minted token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StreamTokenResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /system:
+    get:
+      operationId: getSystemStatus
+      tags: [system]
+      summary: Version, podman connectivity, and app count
+      responses:
+        "200":
+          description: System status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SystemStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /apps:
+    get:
+      operationId: listApps
+      tags: [apps]
+      summary: List every app
+      responses:
+        "200":
+          description: Apps
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: createApp
+      tags: [apps]
+      summary: Register a new app (does not deploy it)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAppRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { description: "Slug already in use", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /apps/{slug}:
+    parameters:
+      - $ref: "#/components/parameters/Slug"
+    get:
+      operationId: getApp
+      tags: [apps]
+      summary: Get one app plus its deployment history
+      responses:
+        "200":
+          description: App detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: patchApp
+      tags: [apps]
+      summary: Update an app's resource limits / deploy strategy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatchAppRequest" }
+      responses:
+        "200":
+          description: Updated app
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+    delete:
+      operationId: deleteApp
+      tags: [apps]
+      summary: Delete an app and tear down its container(s)
+      description: |
+        Named volumes survive app deletion by design (data outlives the
+        app row) — see the response `warnings` field for any that remain
+        and require manual `podman volume rm` cleanup.
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /apps/{slug}/deployments/{number}:
+    get:
+      operationId: getDeployment
+      tags: [deploy]
+      summary: Get one deployment by number
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+        - $ref: "#/components/parameters/DeploymentNumber"
+      responses:
+        "200":
+          description: Deployment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /apps/{slug}/volumes:
+    get:
+      operationId: listAppVolumes
+      tags: [apps]
+      summary: List an app's named volumes (read-only; compose is the only writer)
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      responses:
+        "200":
+          description: Volumes
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Volume" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /apps/{slug}/deploy:
+    post:
+      operationId: deployImage
+      tags: [deploy]
+      summary: Deploy an app from a registry image reference
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeployRequest" }
+      responses:
+        "200":
+          description: Deployment result (synchronous — image deploys complete inline)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "502": { description: "Deploy failed (pull/health-check failure)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /apps/{slug}/deploy/tarball:
+    post:
+      operationId: deployTarball
+      tags: [deploy]
+      summary: Deploy an app by uploading a gzipped-tar build context
+      description: |
+        Body is a raw gzipped tar (Content-Type `application/gzip` or
+        `application/x-gzip`) containing a Containerfile at its root — not
+        multipart form data. Capped at 256 MiB. Runs asynchronously: the
+        response is returned once the upload is spooled and validated, with
+        the deployment row's status still `"deploying"`; poll
+        `GET .../deployments/{number}` or follow
+        `GET .../deployments/{number}/log` (SSE) for the outcome.
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema: { type: string, format: binary }
+      responses:
+        "202":
+          description: Build queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "400": { description: "Invalid Content-Type or malformed tar", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { description: "Body exceeds the 256 MiB cap", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /apps/{slug}/deploy/git:
+    post:
+      operationId: deployGit
+      tags: [git]
+      summary: Manually trigger a deploy from the app's connected git repo
+      description: |
+        Clones the configured repo/branch synchronously (so a bad
+        connection — auth failure, missing branch — fails fast with an
+        actionable 4xx/5xx) then hands off to the same async build/rollout
+        pipeline as `deploy/tarball`.
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      responses:
+        "202":
+          description: Build queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "No git source connected for this app", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "502": { description: "git_clone_failed", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "git_unavailable (git binary not installed)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /apps/{slug}/rollback:
+    post:
+      operationId: rollbackApp
+      tags: [deploy]
+      summary: Redeploy an app to an earlier deployment's exact image
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RollbackRequest" }
+      responses:
+        "200":
+          description: Rollback result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: "Unknown app or rollback target deployment", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "Rollback target is unhealthy or its image is gone", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /apps/{slug}/env:
+    parameters:
+      - $ref: "#/components/parameters/Slug"
+    get:
+      operationId: getEnv
+      tags: [env]
+      summary: Get an app's environment variables
+      description: Secret values are never returned — `value` reads `""` when `is_secret` is true.
+      responses:
+        "200":
+          description: Env vars
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/EnvVar" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      operationId: putEnv
+      tags: [env]
+      summary: Replace an app's full environment variable set
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: "#/components/schemas/EnvVar" }
+      responses:
+        "200":
+          description: The saved set (secret values masked, same as GET)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/EnvVar" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /apps/{slug}/domains:
+    parameters:
+      - $ref: "#/components/parameters/Slug"
+    get:
+      operationId: listDomains
+      tags: [domains]
+      summary: List an app's domains (the generated one plus any custom ones)
+      responses:
+        "200":
+          description: Domains
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DomainsList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: addDomain
+      tags: [domains]
+      summary: Add a custom domain to an app
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddDomainRequest" }
+      responses:
+        "201":
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Domain" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /apps/{slug}/domains/{id}:
+    delete:
+      operationId: deleteDomain
+      tags: [domains]
+      summary: Remove a custom domain
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /apps/{slug}/git:
+    parameters:
+      - $ref: "#/components/parameters/Slug"
+    put:
+      operationId: putGitSource
+      tags: [git]
+      summary: Connect (or update) an app's git push-to-deploy source
+      description: |
+        First connect generates a webhook `hook_id` and HMAC secret; a
+        re-PUT keeps both stable unless `rotate_secret` is set. Unlike most
+        of this API, the webhook **secret is readable** on both this
+        response and `GET` — the operator must paste it into the forge's
+        webhook settings UI, possibly repeatedly. The deploy `token`, by
+        contrast, is write-only (masked on every read).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PutGitSourceRequest" }
+      responses:
+        "200":
+          description: Git source (including the webhook URL and readable secret)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GitSource" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
+    get:
+      operationId: getGitSource
+      tags: [git]
+      summary: Get an app's connected git source
+      responses:
+        "200":
+          description: Git source (deploy token masked; secret readable — see PUT's description)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GitSource" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: "App not found, or no git source connected", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      operationId: deleteGitSource
+      tags: [git]
+      summary: Disconnect an app's git source
+      responses:
+        "204": { description: Disconnected }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /apps/{slug}/git/deliveries:
+    get:
+      operationId: listGitDeliveries
+      tags: [git]
+      summary: List an app's recent webhook delivery attempts
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        "200":
+          description: Deliveries, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/GitDelivery" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /webhooks/git/{hookID}:
+    post:
+      operationId: gitWebhookReceiver
+      tags: [webhooks]
+      summary: Forge webhook receiver (GitHub / GitLab / Gitea push events)
+      description: |
+        **Unauthenticated by BasePod's normal session/stream-token schemes
+        — deliberately the only such route in the API.** Its own security
+        battery, independent of `sessionAuth`/`streamTokenAuth`:
+        - Body capped at 1 MiB (its own limit, separate from every other
+          route's cap).
+        - Signature/token verified in constant time before any payload
+          parsing beyond headers: GitHub's/Gitea's `X-Hub-Signature-256`
+          (HMAC-SHA256 over the raw body, hex, compared via `hmac.Equal`),
+          Gitea's own `X-Gitea-Signature` (accepted as an alternative),
+          or GitLab's `X-Gitlab-Token` (the shared secret itself, compared
+          via `subtle.ConstantTimeCompare` — GitLab's protocol has no
+          HMAC). None present, or invalid → 401, without revealing whether
+          the hook itself exists.
+        - Event filtering via `X-GitHub-Event` / `X-Gitea-Event` /
+          `X-Gitlab-Event`: only `push` proceeds; `ping` and anything else
+          are acknowledged (200/202) without deploying.
+        - Branch filter against the app's configured branch, and a
+          per-hook rate limit (30/min) plus per-app flood coalescing (at
+          most one running + one queued deploy per app; newest commit
+          wins).
+        - The clone URL is **always** the stored `git_sources.url` —
+          **never** anything from the payload — closing the obvious SSRF
+          surface a forge-controlled body would otherwise open.
+        An unknown/malformed `hookID` returns a generic 404, indistinguishable
+        from any other unmatched route (no oracle for hook existence).
+      security: []
+      parameters:
+        - name: hookID
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: "Forge-specific push payload; only ref/head-SHA fields are read." }
+      responses:
+        "200": { description: "Acknowledged (e.g. a ping event) — no deploy triggered" }
+        "202": { description: "Accepted — push queued, ignored (wrong branch/event), rate-limited, or coalesced; see the delivery log for which" }
+        "401": { description: "Missing or invalid signature/token", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { description: "Body exceeds the 1 MiB cap", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /compose/up:
+    post:
+      operationId: composeUp
+      tags: [compose]
+      summary: Apply a compose.yaml — one BasePod app per service
+      description: |
+        Body is a gzipped tar (same 256 MiB cap as tarball deploys)
+        containing `compose.yaml`/`compose.yml`/`docker-compose.yml` at its
+        root, plus any per-service build contexts it references.
+        `?dry_run=1` returns the full plan (per-service actions +
+        warnings) and changes nothing. Applying deploys services
+        sequentially in `depends_on` order via the async pipeline, aborting
+        the remaining chain on the first failure.
+      parameters:
+        - name: project
+          in: query
+          description: "Falls back to the compose file's top-level `name:` if omitted; 422 if neither is present."
+          schema: { type: string }
+        - name: dry_run
+          in: query
+          schema: { type: string, enum: ["0", "1"], default: "0" }
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: Dry-run plan (dry_run=1 — nothing changed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComposePlan" }
+        "202":
+          description: Applied — per-service deployments queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComposePlan" }
+        "400": { description: "No compose file found in the upload, or malformed tar", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { description: "Body exceeds the 256 MiB cap", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /apps/{slug}/logs:
+    get:
+      operationId: streamAppLogs
+      tags: [streaming]
+      summary: Stream (or fetch a tail of) an app's container logs — SSE
+      description: |
+        Server-Sent Events; each message is `event: log` with a JSON
+        `{"stream":"stdout"|"stderr","line":"..."}` body. Accepts
+        `sessionAuth` OR `streamTokenAuth` with scope `"app_logs"` for this
+        exact slug (see the top-level auth description). Counts against
+        the per-user/global concurrent-stream caps.
+      security:
+        - sessionAuth: []
+        - streamTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+        - name: follow
+          in: query
+          description: "1/true to keep streaming as new lines arrive; omitted/false returns just the tail."
+          schema: { type: string, enum: ["0", "1", "true", "false"], default: "0" }
+        - name: tail
+          in: query
+          description: "Number of trailing lines when follow is off (or as backlog when follow is on). Default 200, clamped to [1, 5000]."
+          schema: { type: integer, default: 200 }
+      responses:
+        "200":
+          description: "SSE stream"
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "not_running — app has no running container", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "502": { description: "logs_failed", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/TooManyStreams" }
+
+  /apps/{slug}/deployments/{number}/log:
+    get:
+      operationId: streamBuildLog
+      tags: [streaming]
+      summary: Stream (while building) or fetch a tarball/git deployment's build log
+      description: |
+        While the deployment is `"deploying"`, streams as Server-Sent
+        Events (`event: log`, plain-text `data:` lines, not JSON — build
+        output is often not line-oriented the way container logs are).
+        Once the deploy reaches a terminal status, returns the whole log
+        as `text/plain` instead. Accepts `sessionAuth` OR
+        `streamTokenAuth` with scope `"build_log"` for this exact slug AND
+        deployment number.
+      security:
+        - sessionAuth: []
+        - streamTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+        - $ref: "#/components/parameters/DeploymentNumber"
+      responses:
+        "200":
+          description: "SSE stream (still building) or the full log (finished)"
+          content:
+            text/event-stream:
+              schema: { type: string }
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: "Unknown app/deployment, or this deployment has no build log", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/TooManyStreams" }
+
+  /apps/{slug}/stats:
+    get:
+      operationId: streamAppStats
+      tags: [streaming]
+      summary: Stream an app's container CPU/memory/network/block-IO stats — SSE
+      description: |
+        Server-Sent Events; each message is `event: stats` with a JSON
+        `StatsSample` body, emitted roughly once per libpod's own ~5s
+        sampling interval (not a rate BasePod controls). Accepts
+        `sessionAuth` OR `streamTokenAuth` with scope `"stats"` for this
+        exact slug. Counts against the same per-user/global concurrent-
+        stream caps as the other two SSE routes.
+      security:
+        - sessionAuth: []
+        - streamTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      responses:
+        "200":
+          description: "SSE stream"
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/StatsSample" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "not_running — app has no running container", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "502": { description: "stats_failed", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/TooManyStreams" }
+
+  /openapi.yaml:
+    get:
+      operationId: getOpenAPISpec
+      tags: [meta]
+      summary: This document
+      security: []
+      responses:
+        "200":
+          description: The OpenAPI 3.1 spec, verbatim
+          content:
+            application/yaml:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    sessionAuth:
+      type: http
+      scheme: bearer
+      description: "Session token from POST /auth/login, sent as `Authorization: Bearer <token>`."
+    streamTokenAuth:
+      type: apiKey
+      in: query
+      name: access_token
+      description: |
+        A stream token from POST /stream-token, scoped to one SSE route's
+        (scope, slug[, deployment_number]) — see the top-level auth
+        description. Accepted ONLY on the three SSE routes; a session
+        token here is rejected everywhere, including on those routes.
+
+  parameters:
+    Slug:
+      name: slug
+      in: path
+      required: true
+      schema: { type: string }
+      description: The app's slug.
+    SessionID:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    DeploymentNumber:
+      name: number
+      in: path
+      required: true
+      schema: { type: integer }
+      description: 1-based deployment number, scoped to the app.
+
+  responses:
+    Unauthorized:
+      description: Missing, malformed, or expired credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Validation:
+      description: Request failed validation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many attempts; retry later
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyStreams:
+      description: too_many_streams — per-user or global concurrent SSE stream cap reached
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, description: "Machine-readable error code, e.g. \"app_not_found\"." }
+            message: { type: string }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password, writeOnly: true }
+
+    User:
+      type: object
+      properties:
+        email: { type: string, format: email }
+        name: { type: string }
+
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string, description: Session token }
+        user: { $ref: "#/components/schemas/User" }
+
+    Session:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        current: { type: boolean, description: "True for the session the request itself is authenticated with." }
+
+    ChangePasswordRequest:
+      type: object
+      required: [current_password, new_password]
+      properties:
+        current_password: { type: string, format: password, writeOnly: true }
+        new_password: { type: string, format: password, writeOnly: true }
+
+    StreamTokenRequest:
+      type: object
+      required: [scope, slug]
+      properties:
+        scope: { type: string, enum: [app_logs, build_log, stats] }
+        slug: { type: string }
+        deployment_number:
+          type: integer
+          description: Required for scope "build_log", must be absent otherwise.
+
+    StreamTokenResponse:
+      type: object
+      properties:
+        token: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    SystemStatus:
+      type: object
+      properties:
+        version: { type: string }
+        podman: { type: string, description: "podman daemon status/version, or an error string if unreachable." }
+        apps: { type: integer }
+
+    Volume:
+      type: object
+      properties:
+        name: { type: string }
+        container_path: { type: string }
+
+    App:
+      type: object
+      properties:
+        slug: { type: string }
+        image: { type: string }
+        port: { type: integer }
+        status: { type: string, description: "e.g. \"running\", \"stopped\", \"deploying\", \"error\", \"never_deployed\"." }
+        memory_limit_mb: { type: integer, format: int64 }
+        cpu_limit: { type: number, description: "CPU cores, e.g. 1.5. 0 = unlimited." }
+        pids_limit: { type: integer, format: int64 }
+        deploy_strategy: { type: string, enum: [zero-downtime, replace] }
+        volumes:
+          type: array
+          items: { $ref: "#/components/schemas/Volume" }
+        compose_project: { type: string, description: "\"\" unless this app was created by compose apply." }
+        compose_service: { type: string }
+        internal: { type: boolean, description: "True for a compose service with no `expose:` — no Caddy route." }
+
+    CreateAppRequest:
+      type: object
+      required: [name, image, port]
+      properties:
+        name: { type: string, description: Becomes the app's slug. }
+        image: { type: string }
+        port: { type: integer }
+
+    PatchAppRequest:
+      type: object
+      properties:
+        memory_limit_mb: { type: integer, format: int64, nullable: true }
+        cpu_limit: { type: number, nullable: true }
+        pids_limit: { type: integer, format: int64, nullable: true }
+        deploy_strategy: { type: string, enum: [zero-downtime, replace], nullable: true }
+
+    Deployment:
+      type: object
+      properties:
+        number: { type: integer }
+        image: { type: string }
+        status: { type: string, description: "e.g. \"deploying\", \"healthy\", \"failed\"." }
+        error: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        source: { type: string, enum: [image, tarball, git] }
+        trigger: { type: string, enum: [api, webhook, compose] }
+        has_build_log: { type: boolean }
+        git_sha: { type: string, description: "\"\" unless source is \"git\"." }
+
+    AppDetail:
+      allOf:
+        - $ref: "#/components/schemas/App"
+        - type: object
+          properties:
+            deployments:
+              type: array
+              items: { $ref: "#/components/schemas/Deployment" }
+
+    DeployRequest:
+      type: object
+      required: [image]
+      properties:
+        image: { type: string, description: Registry image reference. }
+
+    RollbackRequest:
+      type: object
+      required: [number]
+      properties:
+        number: { type: integer, description: Target deployment number to roll back to. }
+
+    EnvVar:
+      type: object
+      required: [key]
+      properties:
+        key: { type: string }
+        value: { type: string, description: "Empty on GET when is_secret is true (write-only in effect)." }
+        is_secret: { type: boolean }
+
+    Domain:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        hostname: { type: string }
+
+    DomainsList:
+      type: object
+      properties:
+        generated: { type: string, description: "The app's always-on generated hostname." }
+        custom:
+          type: array
+          items: { $ref: "#/components/schemas/Domain" }
+
+    AddDomainRequest:
+      type: object
+      required: [hostname]
+      properties:
+        hostname: { type: string }
+
+    GitSource:
+      type: object
+      properties:
+        url: { type: string }
+        branch: { type: string }
+        provider: { type: string, enum: ["", github, gitlab, gitea] }
+        hook_id: { type: string }
+        secret: { type: string, description: "Readable — see PUT /apps/{slug}/git's description." }
+        token: { type: string, description: "Masked (\"set\" or \"\") on read.", writeOnly: false }
+        webhook_url: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+
+    PutGitSourceRequest:
+      type: object
+      required: [url, branch]
+      properties:
+        url: { type: string }
+        branch: { type: string }
+        token: { type: string, writeOnly: true, description: "https deploy token; omit/empty for a public repo." }
+        rotate_secret: { type: boolean, default: false }
+
+    GitDelivery:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        received_at: { type: string, format: date-time }
+        provider: { type: string, enum: [github, gitlab, gitea] }
+        event: { type: string }
+        ref: { type: string }
+        commit_sha: { type: string }
+        status:
+          type: string
+          enum: [deployed, ignored_branch, ignored_event, invalid_signature, rate_limited, coalesced, error]
+        detail: { type: string }
+        deployment_number: { type: integer, description: "Present only when status is \"deployed\"." }
+
+    ComposeService:
+      type: object
+      properties:
+        name: { type: string }
+        slug: { type: string }
+        action: { type: string, enum: [create, update] }
+        internal: { type: boolean }
+        port: { type: integer }
+        alias: { type: string, description: "Bare service-name network alias other services reach it by." }
+        deploy_strategy: { type: string }
+        deployment_number: { type: integer }
+        warnings:
+          type: array
+          items: { type: string }
+
+    ComposePlan:
+      type: object
+      properties:
+        project: { type: string }
+        dry_run: { type: boolean }
+        services:
+          type: array
+          items: { $ref: "#/components/schemas/ComposeService" }
+        orphans:
+          type: array
+          items: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+
+    StatsSample:
+      type: object
+      description: |
+        BasePod's own stable per-tick shape — deliberately independent of
+        libpod's/Docker's wire field names (cpu_stats/memory_stats/...) so
+        this contract doesn't move when podman changes. See
+        internal/podman.ContainerStatsSample.
+      properties:
+        cpu_percent: { type: number, description: "0-100 per core (a container fully using 2 cores reads 200)." }
+        mem_used_bytes: { type: integer, format: int64 }
+        mem_limit_bytes: { type: integer, format: int64 }
+        pids: { type: integer, format: int64 }
+        net_rx_bytes: { type: integer, format: int64 }
+        net_tx_bytes: { type: integer, format: int64 }
+        block_read_bytes: { type: integer, format: int64 }
+        block_write_bytes: { type: integer, format: int64 }

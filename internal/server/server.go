@@ -308,7 +308,7 @@ func Run(ctx context.Context, cfgPath string) error {
 	// there is no header or other client-controlled input that can spoof
 	// it, since a request reaching the loopback listener never touches
 	// TrustedProxyMiddleware at all.
-	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder, gitCloner))
+	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder, gitCloner, engine.AppStats))
 	srv := newHTTPServer(cfg.Listen, handler)
 
 	// dashboardSrv is a second *http.Server sharing every setting
