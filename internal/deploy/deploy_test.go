@@ -400,7 +400,7 @@ func newTestEngine(t *testing.T, st *store.Store) (*Engine, *fakeRuntime, *fakeR
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	return eng, rt, router, prober, ops
@@ -624,16 +624,21 @@ func TestFailedPull(t *testing.T) {
 }
 
 // TestDeployInjectsDecryptedEnv proves Deploy reads the app's env vars,
-// decrypts each ValueEncrypted through the Engine's decrypt func, and
-// passes the resulting plaintext map as CreateSpec.Env to CreateContainer.
+// decrypts each ValueEncrypted through the Engine's decrypt func — passing
+// through the owning app's ID and the var's own key, which is what lets
+// the real decrypt closure (internal/server.Run) verify the AEAD
+// additional-authenticated-data binding (audit finding L9) — and passes
+// the resulting plaintext map as CreateSpec.Env to CreateContainer.
 func TestDeployInjectsDecryptedEnv(t *testing.T) {
 	st := openStore(t)
 	ops := &[]string{}
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	decrypt := func(s string) (string, error) { return "plain-" + s, nil }
-	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil)
+	decrypt := func(appID int64, key, s string) (string, error) {
+		return fmt.Sprintf("plain-%d-%s-%s", appID, key, s), nil
+	}
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -657,7 +662,10 @@ func TestDeployInjectsDecryptedEnv(t *testing.T) {
 	if !ok {
 		t.Fatal("CreateContainer spec not recorded for bp-blog-1")
 	}
-	want := map[string]string{"FOO": "plain-enc-foo", "BAR": "plain-enc-bar"}
+	want := map[string]string{
+		"FOO": fmt.Sprintf("plain-%d-FOO-enc-foo", app.ID),
+		"BAR": fmt.Sprintf("plain-%d-BAR-enc-bar", app.ID),
+	}
 	if !reflect.DeepEqual(spec.Env, want) {
 		t.Errorf("spec.Env = %+v, want %+v", spec.Env, want)
 	}
@@ -781,8 +789,8 @@ func TestDeployFailsOnDecryptError(t *testing.T) {
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	decrypt := func(s string) (string, error) { return "", errors.New("bad key") }
-	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil)
+	decrypt := func(appID int64, key, s string) (string, error) { return "", errors.New("bad key") }
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -852,7 +860,7 @@ func TestDeployFailsWhenEnvInjectionDisabled(t *testing.T) {
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil) // decrypt disabled
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, nil) // decrypt disabled
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -955,7 +963,7 @@ func TestApplyRoutesPassesDashboardToRouter(t *testing.T) {
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
 	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: caddy.DashboardSockDial()}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, dashboard)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, dashboard)
 	ctx := context.Background()
 
 	if err := eng.ApplyRoutes(ctx); err != nil {
@@ -978,7 +986,7 @@ func TestRemoveAppPassesDashboardToRouter(t *testing.T) {
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
 	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: caddy.DashboardSockDial()}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, dashboard)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, dashboard)
 	ctx := context.Background()
 
 	app, err := st.CreateApp("blog", "nginx:v1", 80)
@@ -1184,7 +1192,7 @@ func TestFailDetachesCleanupFromCancelledContext(t *testing.T) {
 		return pctx.Err()
 	}
 
-	eng := New(st, rt, router, probe, "apps.localhost", nil, nil)
+	eng := New(st, rt, router, probe, "apps.localhost", nil, nil, nil)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 1
 

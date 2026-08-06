@@ -40,8 +40,18 @@ const testPassword = "correct-password"
 // keep-on-empty-secret semantics.
 var testKey = bytes.Repeat([]byte{0x42}, 32)
 
-func testSeal(plaintext string) (string, error) { return crypto.Seal(testKey, plaintext) }
-func testOpen(sealed string) (string, error)    { return crypto.Open(testKey, sealed) }
+// testSeal/testOpen mirror the AAD-bound seal/open closures
+// internal/server.Run builds (see its doc comment) — SealAAD/OpenAAD
+// under crypto.AAD(appID, key) — so tests exercising the API layer's env
+// endpoints go through the exact same L9 binding (audit finding L9:
+// every env value is bound to its owning app's ID and its own key) real
+// traffic does.
+func testSeal(appID int64, key, plaintext string) (string, error) {
+	return crypto.SealAAD(testKey, plaintext, crypto.AAD(appID, key))
+}
+func testOpen(appID int64, key, sealed string) (string, error) {
+	return crypto.OpenAAD(testKey, sealed, crypto.AAD(appID, key))
+}
 
 // fakeRoutesApplier is a test double for RoutesApplier that records how
 // many times ApplyRoutes was called and can be scripted to fail (to
@@ -580,7 +590,7 @@ func TestEnvRoundtrip(t *testing.T) {
 	if sealedAfter != sealedBefore {
 		t.Fatal("expected keep-on-empty-secret to leave the stored sealed value unchanged")
 	}
-	plain, err := testOpen(sealedAfter)
+	plain, err := testOpen(appID, "API_KEY", sealedAfter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +615,7 @@ func TestEnvRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain, err = testOpen(envVarByKey(storedFinal, "API_KEY").ValueEncrypted)
+	plain, err = testOpen(appID, "API_KEY", envVarByKey(storedFinal, "API_KEY").ValueEncrypted)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -52,7 +52,7 @@ func (a *api) envResponseFor(appID int64) ([]envVarResponse, error) {
 	for _, v := range vars {
 		ev := envVarResponse{Key: v.Key, IsSecret: v.IsSecret}
 		if !v.IsSecret {
-			plain, err := a.open(v.ValueEncrypted)
+			plain, err := a.open(appID, v.Key, v.ValueEncrypted)
 			if err != nil {
 				return nil, err
 			}
@@ -80,7 +80,7 @@ func (a *api) effectiveEnv(appID int64) (map[string]effectiveEnvEntry, error) {
 	}
 	out := make(map[string]effectiveEnvEntry, len(vars))
 	for _, v := range vars {
-		plain, err := a.open(v.ValueEncrypted)
+		plain, err := a.open(appID, v.Key, v.ValueEncrypted)
 		if err != nil {
 			return nil, err
 		}
@@ -153,10 +153,14 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 			if prior, ok := existingByKey[ev.Key]; ok && prior.IsSecret {
 				// keep-on-empty-secret: preserve the previously stored
 				// sealed value rather than overwriting it with an empty
-				// secret.
+				// secret. This intentionally does NOT re-seal (and so
+				// does not AAD-upgrade) an untouched legacy secret — see
+				// OpenAAD's legacy fallback, which keeps it readable
+				// regardless — since a key the caller isn't actually
+				// writing shouldn't churn its stored ciphertext.
 				valueEncrypted = prior.ValueEncrypted
 			} else {
-				sealed, err := a.seal("")
+				sealed, err := a.seal(app.ID, ev.Key, "")
 				if err != nil {
 					writeError(w, http.StatusInternalServerError, "internal", "failed to save env var")
 					return
@@ -164,7 +168,7 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 				valueEncrypted = sealed
 			}
 		} else {
-			sealed, err := a.seal(ev.Value)
+			sealed, err := a.seal(app.ID, ev.Key, ev.Value)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "internal", "failed to save env var")
 				return

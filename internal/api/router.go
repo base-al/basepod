@@ -130,11 +130,19 @@ type api struct {
 	limiter       *rateLimiter
 	globalLimiter *rateLimiter
 
-	// seal/open encrypt and decrypt EnvVar.ValueEncrypted values. They
-	// close over the process's encryption key (see internal/crypto) so
-	// this package never handles the raw key itself.
-	seal func(string) (string, error)
-	open func(string) (string, error)
+	// seal/open encrypt and decrypt EnvVar.ValueEncrypted values, given
+	// the owning app's ID and the var's key. They close over the
+	// process's encryption key (see internal/crypto) so this package
+	// never handles the raw key itself, and bind appID+key in as AEAD
+	// additional-authenticated-data (audit finding L9 — see
+	// internal/crypto's AAD/SealAAD/OpenAAD and the closures
+	// internal/server.Run builds) so a ciphertext relocated onto a
+	// different app's row, or a different key within the same row, fails
+	// to decrypt. open falls back to a legacy no-AAD open for rows sealed
+	// before this binding existed; every write through seal upgrades a
+	// row to AAD-bound going forward (lazy upgrade).
+	seal func(appID int64, key, value string) (string, error)
+	open func(appID int64, key, sealed string) (string, error)
 
 	// routes recomputes and pushes the current route set to the router
 	// (Caddy) after a domain is added or removed.
@@ -152,7 +160,7 @@ type api struct {
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
-func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder) http.Handler {
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder) http.Handler {
 	a := &api{
 		st:            st,
 		dep:           dep,

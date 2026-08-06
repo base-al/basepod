@@ -300,16 +300,20 @@ func (s *Store) UpdatePassword(userID int64, hash string) error {
 	return err
 }
 
-// defaultMemoryLimitMB, defaultCPULimit, and defaultPidsLimit mirror the
+// DefaultMemoryLimitMB, DefaultCPULimit, and DefaultPidsLimit mirror the
 // column defaults migration 00004_resource_limits.sql sets on the apps
 // table (memory_limit_mb, cpu_limit, pids_limit) — kept here as named
 // constants so CreateApp's returned App (built directly, not re-SELECTed
 // after INSERT) reports exactly what the row actually holds, without
-// hardcoding the same magic numbers twice.
+// hardcoding the same magic numbers twice. Exported so callers outside
+// this package (internal/deploy's applyManifestDefaults, resolving
+// issue #1) can tell "an app is still at the schema default" apart from
+// "an operator explicitly set this value" without duplicating these
+// numbers themselves.
 const (
-	defaultMemoryLimitMB int64   = 512
-	defaultCPULimit      float64 = 1.0
-	defaultPidsLimit     int64   = 512
+	DefaultMemoryLimitMB int64   = 512
+	DefaultCPULimit      float64 = 1.0
+	DefaultPidsLimit     int64   = 512
 )
 
 // appColumns is the column list (in scan order) shared by CreateApp's
@@ -329,7 +333,7 @@ func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	}
 	return &App{
 		ID: id, Slug: slug, ImageRef: imageRef, Port: port, Status: "created",
-		MemoryLimitMB: defaultMemoryLimitMB, CPULimit: defaultCPULimit, PidsLimit: defaultPidsLimit,
+		MemoryLimitMB: DefaultMemoryLimitMB, CPULimit: DefaultCPULimit, PidsLimit: DefaultPidsLimit,
 	}, nil
 }
 
@@ -377,6 +381,18 @@ func (s *Store) ListApps() ([]App, error) {
 func (s *Store) UpdateAppLimits(id int64, memoryLimitMB int64, cpuLimit float64, pidsLimit int64) error {
 	_, err := s.db.Exec(`UPDATE apps SET memory_limit_mb = ?, cpu_limit = ?, pids_limit = ?, updated_at = ? WHERE id = ?`,
 		memoryLimitMB, cpuLimit, pidsLimit, time.Now().UTC().Format(timeFormat), id)
+	return err
+}
+
+// UpdateAppPort sets an app's container port and bumps updated_at — used
+// by internal/deploy.applyManifestDefaults to apply a basepod.yaml
+// manifest's `port` onto an app that hasn't been explicitly configured
+// with one yet (see that function's doc comment for the precedence
+// rule). The caller owns deciding whether overwriting the app's current
+// port is appropriate; the store applies it as given.
+func (s *Store) UpdateAppPort(id int64, port int) error {
+	_, err := s.db.Exec(`UPDATE apps SET port = ?, updated_at = ? WHERE id = ?`,
+		port, time.Now().UTC().Format(timeFormat), id)
 	return err
 }
 

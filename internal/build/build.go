@@ -209,22 +209,12 @@ func (b *Builder) Build(ctx context.Context, slug string, deploymentNumber int, 
 // log's SSE stream) even if nothing downstream of BuildManifest ever
 // looks at Result.Warnings.
 //
-// TODO(#1): internal/deploy.Engine.runRollout (internal/deploy/deploy.go,
-// around the `tag, _, buildErr := builder.Build(...)` call in
-// DeployBuild) currently calls Build and so never sees the parsed
-// manifest. Once that package can be touched by this change, switch that
-// call site to:
-//
-//	res, buildErr := builder.BuildManifest(ctx, app.Slug, dep.Number, gzTar)
-//	tag := res.ImageTag
-//	if res.Manifest != nil {
-//	    applyManifestDefaults(app, res.Manifest) // port/healthcheck.path/resources iff app doesn't already override
-//	}
-//
-// (a small helper, not shown, that only fills in zero-valued fields on
-// app — an app's own stored config always wins over the manifest) and
-// keep the rest of runRollout unchanged; buildErr's error handling
-// doesn't change.
+// internal/deploy.Engine.DeployBuild (internal/deploy/deploy.go) calls
+// this — not Build — and applies Result.Manifest onto the app record via
+// applyManifestDefaults/applyManifestEnvDefaults (resolving issue #1)
+// before the rollout that follows builds its container spec, so a
+// basepod.yaml in the upload takes effect starting with that very
+// deploy.
 func (b *Builder) BuildManifest(ctx context.Context, slug string, deploymentNumber int, gzTar io.Reader) (Result, error) {
 	lock := b.appLock(slug)
 	lock.Lock()

@@ -22,6 +22,7 @@ import (
 
 	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/caddy"
+	"github.com/base-al/basepod/internal/manifest"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
 )
@@ -99,10 +100,25 @@ type Engine struct {
 	// step is under this lock.
 	routesMu sync.Mutex
 
-	// decrypt turns an EnvVar.ValueEncrypted into its plaintext value.
-	// nil disables env injection entirely: Deploy fails rather than ship
-	// a container silently missing configured env vars (see Deploy).
-	decrypt func(string) (string, error)
+	// decrypt turns an EnvVar.ValueEncrypted into its plaintext value,
+	// given the owning app's ID and the var's key (bound in as AEAD
+	// additional-authenticated-data — audit finding L9 — so a ciphertext
+	// relocated onto a different app's row, or a different key within the
+	// same row, fails to decrypt; see internal/crypto's AAD/OpenAAD and
+	// the closures internal/server.Run builds). nil disables env
+	// injection entirely: Deploy fails rather than ship a container
+	// silently missing configured env vars (see Deploy).
+	decrypt func(appID int64, key, sealed string) (string, error)
+
+	// encrypt is decrypt's inverse (crypto.SealAAD under the hood),
+	// given the owning app's ID and the var's key. It is used only to
+	// persist a basepod.yaml manifest's `env` defaults for keys an app
+	// doesn't already have (see applyManifestEnvDefaults, resolving
+	// issue #1) — every other env write goes through the API layer's own
+	// seal closure (internal/api/env.go), not this one. nil skips
+	// applying manifest env defaults entirely rather than failing the
+	// deploy over a missing nice-to-have.
+	encrypt func(appID int64, key, plaintext string) (string, error)
 
 	// probeInterval and probeAttempts control the health-probe retry
 	// loop; they default to 1s/30 (New) and are unexported so tests can
@@ -117,12 +133,15 @@ type Engine struct {
 
 // New builds an Engine. rootDomain is appended to an app's slug to form
 // its hostname (e.g. rootDomain "apps.example.com" -> "blog.apps.example.com").
-// decrypt turns a stored EnvVar's encrypted value into plaintext; pass nil
-// to disable env injection (Deploy then fails rather than silently
-// omitting configured env vars). dashboard is the dashboard route (or nil
-// to disable it) every router.Apply call made through this Engine carries
-// alongside the app route set — see the dashboard field's doc comment.
-func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(string) (string, error), dashboard *caddy.DashboardRoute) *Engine {
+// decrypt turns a stored EnvVar's encrypted value into plaintext, given
+// the owning app's ID and the var's key; pass nil to disable env
+// injection (Deploy then fails rather than silently omitting configured
+// env vars). encrypt is decrypt's inverse, used only to persist manifest
+// `env` defaults (see the encrypt field's doc comment); pass nil to skip
+// applying them. dashboard is the dashboard route (or nil to disable it)
+// every router.Apply call made through this Engine carries alongside the
+// app route set — see the dashboard field's doc comment.
+func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(appID int64, key, sealed string) (string, error), encrypt func(appID int64, key, plaintext string) (string, error), dashboard *caddy.DashboardRoute) *Engine {
 	return &Engine{
 		st:            st,
 		rt:            rt,
@@ -130,6 +149,7 @@ func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain st
 		probe:         probe,
 		rootDomain:    rootDomain,
 		decrypt:       decrypt,
+		encrypt:       encrypt,
 		dashboard:     dashboard,
 		probeInterval: time.Second,
 		probeAttempts: 30,
@@ -167,8 +187,9 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 // comment for why: it's what makes GET .../deployments/{n}/log able to
 // live-tail the log for the build's entire duration, not just after it
 // finishes), marks the app "deploying", then hands gzTar off to
-// builder.Build to decompress, validate, and build it into a local image
-// tag.
+// builder.BuildManifest to decompress, validate, and build it into a
+// local image tag — additionally parsing a root-level basepod.yaml, if
+// present, into a *manifest.Manifest (see build.Result).
 //
 // On a build failure, this goes through the same fail() path Deploy uses
 // for every other failure: the deployment is marked failed and the app's
@@ -176,12 +197,16 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 // it, "error" otherwise) — no container was ever created for a build
 // failure, so fail() is called with an empty newContainerID.
 //
-// On a successful build, the image tag is recorded on the deployment and
-// rollout proceeds via the same runRollout Deploy uses — but, critically,
-// skipping Deploy's PullImage step: builder.Build produces a local
-// "localhost/basepod/..." tag, and pulling a localhost/ tag from a
-// registry would either fail outright or (worse) silently pull the wrong
-// thing.
+// On a successful build, any parsed manifest is applied onto app via
+// applyManifestDefaults (port/resources — see its doc comment for the
+// precedence rule) and applyManifestEnvDefaults (env), both persisted to
+// the store before rollout proceeds — so the very first rollout of a
+// zero-config deploy already honors basepod.yaml, not just the next one.
+// The image tag is recorded on the deployment and rollout proceeds via
+// the same runRollout Deploy uses — but, critically, skipping Deploy's
+// PullImage step: the build produces a local "localhost/basepod/..."
+// tag, and pulling a localhost/ tag from a registry would either fail
+// outright or (worse) silently pull the wrong thing.
 //
 // If the build succeeds but the rollout that follows it fails (a failed
 // probe, a container that won't start, ...), the freshly-built tag never
@@ -206,9 +231,29 @@ func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reade
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
 	}
 
-	tag, _, buildErr := builder.Build(ctx, app.Slug, dep.Number, gzTar)
+	res, buildErr := builder.BuildManifest(ctx, app.Slug, dep.Number, gzTar)
 	if buildErr != nil {
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: build: %w", buildErr))
+	}
+	tag := res.ImageTag
+
+	// Apply the build context's basepod.yaml (if any) onto app BEFORE
+	// runRollout builds the container spec below, so the very first
+	// rollout of a zero-config deploy already reflects it (issue #1) —
+	// see applyManifestDefaults/applyManifestEnvDefaults for the
+	// precedence rules.
+	if res.Manifest != nil {
+		if applyManifestDefaults(app, res.Manifest) {
+			if err := e.st.UpdateAppPort(app.ID, app.Port); err != nil {
+				return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: apply manifest port: %w", err))
+			}
+			if err := e.st.UpdateAppLimits(app.ID, app.MemoryLimitMB, app.CPULimit, app.PidsLimit); err != nil {
+				return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: apply manifest resources: %w", err))
+			}
+		}
+		if err := e.applyManifestEnvDefaults(app, res.Manifest.Env); err != nil {
+			return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: apply manifest env defaults: %w", err))
+		}
 	}
 
 	if err := e.st.SetDeploymentImage(dep.ID, tag); err != nil {
@@ -221,6 +266,97 @@ func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reade
 		e.removeOrphanBuildImage(ctx, tag)
 	}
 	return result, rollErr
+}
+
+// applyManifestDefaults fills in app's Port, MemoryLimitMB, and CPULimit
+// from mf (a basepod.yaml parsed by internal/build.Builder.BuildManifest)
+// — resolving issue #1's TODO — and reports whether app was mutated (the
+// caller, DeployBuild, owns persisting any change via store.UpdateAppPort
+// / store.UpdateAppLimits before the container spec that uses these
+// fields is built).
+//
+// Precedence rule: the app's own stored config always wins over the
+// manifest. A field is only filled in when the app is still at its
+// unset/default value:
+//
+//   - Port: only when app.Port == 0. In practice every app created
+//     through the dashboard/API already has an explicit, validated
+//     (1-65535) port (see handleCreateApp), so this fires only for an
+//     app whose port was never set — it deliberately does NOT overwrite
+//     an operator's dashboard-configured port just because a manifest
+//     in a later upload names a different one.
+//   - Resources (Memory/CPUs): only when the app's MemoryLimitMB/CPULimit
+//     still equal store.DefaultMemoryLimitMB/store.DefaultCPULimit — the
+//     values every app gets at creation (see store.CreateApp) — rather
+//     than a value an operator (or an earlier manifest) already set
+//     explicitly via PATCH /api/v1/apps/{slug}. There is no manifest
+//     field for pids_limit, so it is never touched here.
+//
+// Healthcheck.Path is intentionally NOT applied: store.App has no column
+// for it yet, and adding one is out of scope for this change (a schema
+// migration is a separate, deliberate decision) — see the change's
+// report for this call-out.
+func applyManifestDefaults(app *store.App, mf *manifest.Manifest) bool {
+	changed := false
+
+	if mf.Port != 0 && app.Port == 0 {
+		app.Port = mf.Port
+		changed = true
+	}
+
+	if mf.Resources.Memory != "" && app.MemoryLimitMB == store.DefaultMemoryLimitMB {
+		if bytesVal, err := manifest.ParseMemory(mf.Resources.Memory); err == nil {
+			if mb := bytesVal / (1024 * 1024); mb > 0 {
+				app.MemoryLimitMB = mb
+				changed = true
+			}
+		}
+	}
+
+	if mf.Resources.CPUs != 0 && app.CPULimit == store.DefaultCPULimit {
+		app.CPULimit = mf.Resources.CPUs
+		changed = true
+	}
+
+	return changed
+}
+
+// applyManifestEnvDefaults persists defaults's non-secret env vars onto
+// app for every key it doesn't already have — never overwriting an
+// existing value (of either a plain var or a secret) and never touching
+// anything already stored as a secret, matching basepod.yaml's own
+// contract that `env:` is non-secret defaults only (see
+// manifest.Manifest.Env's doc comment). It is a no-op when defaults is
+// empty or e.encrypt is nil (env injection/sealing disabled — see the
+// encrypt field's doc comment): a missing manifest env default is never
+// worth failing an otherwise-successful build+deploy over.
+func (e *Engine) applyManifestEnvDefaults(app *store.App, defaults map[string]string) error {
+	if len(defaults) == 0 || e.encrypt == nil {
+		return nil
+	}
+
+	existing, err := e.st.ListEnvVars(app.ID)
+	if err != nil {
+		return fmt.Errorf("deploy: list env vars: %w", err)
+	}
+	have := make(map[string]bool, len(existing))
+	for _, ev := range existing {
+		have[ev.Key] = true
+	}
+
+	for key, value := range defaults {
+		if have[key] {
+			continue
+		}
+		sealed, err := e.encrypt(app.ID, key, value)
+		if err != nil {
+			return fmt.Errorf("deploy: seal manifest env default %s: %w", key, err)
+		}
+		if err := e.st.UpsertEnvVar(app.ID, key, sealed, false); err != nil {
+			return fmt.Errorf("deploy: store manifest env default %s: %w", key, err)
+		}
+	}
+	return nil
 }
 
 // removeOrphanBuildImage best-effort removes a freshly-built local image
@@ -344,7 +480,7 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 		}
 		env := make(map[string]string, len(envVars))
 		for _, ev := range envVars {
-			plain, err := e.decrypt(ev.ValueEncrypted)
+			plain, err := e.decrypt(app.ID, ev.Key, ev.ValueEncrypted)
 			if err != nil {
 				return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: decrypt env var %s: %w", ev.Key, err))
 			}
