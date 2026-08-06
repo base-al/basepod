@@ -232,6 +232,80 @@ func TestSealWithWrongKeyLength(t *testing.T) {
 	}
 }
 
+// TestSealAADOpenAADRoundtrip proves SealAAD/OpenAAD roundtrip correctly
+// when the same AAD is supplied on both ends — the base case for audit
+// finding L9's appID|key row-binding.
+func TestSealAADOpenAADRoundtrip(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	aad := AAD(42, "API_KEY")
+	sealed, err := SealAAD(key, "supersecret", aad)
+	if err != nil {
+		t.Fatalf("SealAAD failed: %v", err)
+	}
+
+	opened, err := OpenAAD(key, sealed, aad)
+	if err != nil {
+		t.Fatalf("OpenAAD failed: %v", err)
+	}
+	if opened != "supersecret" {
+		t.Fatalf("opened = %q, want %q", opened, "supersecret")
+	}
+}
+
+// TestOpenAADWrongAADFails proves a ciphertext sealed under one AAD (e.g.
+// app 1's "API_KEY") cannot be opened under a different AAD (e.g. app 2's
+// "API_KEY", or the same app's "OTHER_KEY") — the actual protection L9
+// closes: a ciphertext relocated to a different row/key must not still
+// decrypt.
+func TestOpenAADWrongAADFails(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	sealed, err := SealAAD(key, "supersecret", AAD(1, "API_KEY"))
+	if err != nil {
+		t.Fatalf("SealAAD failed: %v", err)
+	}
+
+	for _, wrongAAD := range [][]byte{
+		AAD(2, "API_KEY"), // relocated to a different app
+		AAD(1, "OTHER"),   // relocated to a different key on the same app
+	} {
+		if _, err := OpenAAD(key, sealed, wrongAAD); err == nil {
+			t.Fatalf("OpenAAD with wrong AAD %q succeeded, want it to fail", wrongAAD)
+		}
+	}
+}
+
+// TestOpenAADFallsBackToLegacyNilAAD proves OpenAAD's migration path: a
+// ciphertext sealed the old way (plain Seal, no AAD — i.e. every row that
+// existed before AAD binding) still opens via OpenAAD's legacy fallback,
+// so existing data keeps working without a hard migration.
+func TestOpenAADFallsBackToLegacyNilAAD(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	legacySealed, err := Seal(key, "old-value")
+	if err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	opened, err := OpenAAD(key, legacySealed, AAD(7, "LEGACY_KEY"))
+	if err != nil {
+		t.Fatalf("OpenAAD legacy fallback failed: %v", err)
+	}
+	if opened != "old-value" {
+		t.Fatalf("opened = %q, want %q", opened, "old-value")
+	}
+}
+
 // TestOpenWithWrongKeyLength verifies that Open rejects keys that are not 32 bytes.
 func TestOpenWithWrongKeyLength(t *testing.T) {
 	rightKey := make([]byte, 32)
