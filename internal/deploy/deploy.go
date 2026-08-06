@@ -277,6 +277,71 @@ func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reade
 	return e.buildAndRollout(ctx, app, dep, prepared, builder)
 }
 
+// ---------------------------------------------------------------------
+// v0.5 Task 8: compose apply. DeployExisting and DeployBuildExisting let
+// a caller that has already created a deployment row itself
+// (store.CreateDeploymentFull) drive the same pull/build+rollout pipeline
+// Deploy/DeployBuild use internally, against THAT row, instead of each
+// creating (and orphaning) a second one of their own. internal/api's
+// compose orchestrator (compose.go) is the only caller: it pre-creates
+// every service's deployment row synchronously, in dependency order,
+// before the compose-apply HTTP response is ever written — which is what
+// lets that response report every service's real, stable deployment
+// number immediately, even though the (potentially slow) actual work for
+// later services hasn't started yet. A service the chain never reaches
+// (an earlier one failed) gets its pre-created row finished "failed"
+// directly by the caller via store.FinishDeployment — neither method
+// here is involved for that case, so there's no risk of it creating a
+// second row for an app that was never attempted.
+//
+// Kept in their own block, right beside Deploy/DeployBuild, rather than
+// folded into them: both are a near-verbatim copy of Deploy's/
+// DeployBuild's own body minus the CreateDeployment(Full) call — the
+// smallest change that reuses runRollout/buildAndRollout (which already
+// took a pre-created *store.Deployment as a parameter) instead of
+// duplicating rollout logic a third time.
+// ---------------------------------------------------------------------
+
+// DeployExisting runs a registry-image deploy (pull, then the shared
+// rollout) against an already-created deployment row dep. See this
+// block's doc comment above for why dep is pre-created rather than
+// created here, the way Deploy creates its own.
+func (e *Engine) DeployExisting(ctx context.Context, app *store.App, dep *store.Deployment, imageRef string) (*store.Deployment, error) {
+	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
+	}
+	if err := e.rt.PullImage(ctx, imageRef); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: pull %s: %w", imageRef, err))
+	}
+	return e.runRollout(ctx, app, dep, imageRef)
+}
+
+// DeployBuildExisting runs a synchronous tarball build+rollout against an
+// already-created deployment row dep. Unlike DeployBuildAsync (which
+// itself creates the row and backgrounds the build), the compose
+// orchestrator already runs the whole per-service sequence on its own
+// detached goroutine (see internal/api/compose.go), so this method does
+// the build synchronously and simply reuses dep — there is no need for a
+// second layer of backgrounding. See DeployBuild's doc comment for the
+// shared build+rollout behavior this delegates to.
+func (e *Engine) DeployBuildExisting(ctx context.Context, app *store.App, dep *store.Deployment, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
+	logPath := builder.LogPath(app.Slug, dep.Number)
+	if err := e.st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		fmt.Fprintf(e.log, "deploy: set build log path for deployment %d: %v\n", dep.ID, err)
+	}
+	dep.BuildLogPath = logPath
+
+	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
+	}
+
+	prepared, err := builder.PrepareBuild(gzTar)
+	if err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: build: %w", err))
+	}
+	return e.buildAndRollout(ctx, app, dep, prepared, builder)
+}
+
 // asyncBuildTimeout bounds a background tarball build+rollout started by
 // DeployBuildAsync — generous enough to cover the slowest legitimate build
 // plus a full rollout, on a context detached from the triggering HTTP
@@ -661,6 +726,22 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 		e.removeOldContainers(ctx, app.Slug, dep.Number)
 	}
 
+	// v0.5 Task 8: a compose-managed service's container additionally
+	// carries its bare compose service name as a network alias (e.g.
+	// "db"), alongside the standard "app-<slug>" one, so sibling services
+	// in the same compose project can reach it the way compose.yaml's own
+	// depends_on/service-name convention expects ("db:5432" from "web") —
+	// see compose.ServicePlan.Alias's doc comment. A hand-created app
+	// (ComposeService == "") never gets this extra alias. The v0.4
+	// alias-namespace guard (audit finding M1) still applies: a compose
+	// service name is validated at plan time (internal/compose.BuildPlan)
+	// against the same reserved prefixes/names container aliases use, and
+	// checked for cross-project collisions before ever reaching here.
+	aliases := []string{aliasV2Prefix + app.Slug}
+	if app.ComposeService != "" {
+		aliases = append(aliases, app.ComposeService)
+	}
+
 	spec := podman.CreateSpec{
 		Name:  name,
 		Image: imageRef,
@@ -678,7 +759,7 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 		// Caddy deliver traffic into the wrong container. See
 		// aliasScheme's own doc comment for how this interacts with
 		// apps deployed before this fix existed.
-		NetworkAliases: []string{aliasV2Prefix + app.Slug},
+		NetworkAliases: aliases,
 		RestartPolicy:  "always",
 		// Resource limits (audit H2): every app container is created with
 		// the app's stored limits, which default to a sane bounded value
@@ -730,9 +811,18 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: start container: %w", err))
 	}
 
-	upstream := fmt.Sprintf("%s:%d", name, app.Port)
-	if err := e.probeUntilUp(ctx, upstream); err != nil {
-		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: probe %s: %w", upstream, err))
+	// v0.5 Task 8: an internal (no `expose:`) compose service has no
+	// Caddy route and no guarantee it even speaks HTTP (e.g. a
+	// Postgres-style service) — CaddyProber's wget-based probe would be
+	// meaningless (and Port is 0, an unprobeable target) for it. Skip
+	// straight to "the container started" as this rollout's health
+	// signal, matching how a non-HTTP TCP app is already out of scope for
+	// the probe mechanism (see CaddyProber's doc comment).
+	if !app.Internal {
+		upstream := fmt.Sprintf("%s:%d", name, app.Port)
+		if err := e.probeUntilUp(ctx, upstream); err != nil {
+			return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: probe %s: %w", upstream, err))
+		}
 	}
 
 	if err := e.st.UpdateAppImage(app.ID, imageRef); err != nil {
@@ -1175,6 +1265,14 @@ func (e *Engine) Routes() ([]caddy.AppRoute, error) {
 	var routes []caddy.AppRoute
 	for _, a := range apps {
 		if a.Status != "running" {
+			continue
+		}
+		// v0.5 Task 8: an internal compose service (no `expose:` entry —
+		// see App.Internal's doc comment) never gets a Caddy route,
+		// public or generated-hostname: it's reachable only by its bare
+		// compose-service network alias from sibling containers, never
+		// from outside the shared network.
+		if a.Internal {
 			continue
 		}
 		custom := customByApp[a.ID]
