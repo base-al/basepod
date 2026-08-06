@@ -238,7 +238,29 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: apply routes: %w", err)
 	}
 
-	srv := newHTTPServer(cfg.Listen, rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder)))
+	// handler is shared by both listeners. The public loopback listener
+	// (cfg.Listen) serves it as-is — untrusted. The dashboard's
+	// unix-socket listener, reachable only by bp-caddy's container (see
+	// prepareDashboardListener's doc comment), serves it wrapped in
+	// api.TrustedProxyMiddleware — marking every request that arrives
+	// through it as having passed through Caddy, so clientIP (see
+	// internal/api/clientip.go) may honor its X-Forwarded-For header.
+	// This wrapping is the ONLY thing that ever grants trusted status:
+	// there is no header or other client-controlled input that can spoof
+	// it, since a request reaching the loopback listener never touches
+	// TrustedProxyMiddleware at all.
+	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder))
+	srv := newHTTPServer(cfg.Listen, handler)
+
+	// dashboardSrv is a second *http.Server sharing every setting
+	// newHTTPServer applies, but wired to the trust-marking handler above
+	// and served over dashboardListener directly (Serve, not
+	// ListenAndServe) rather than its own Addr, which is therefore left
+	// unset (unused; Serve ignores http.Server.Addr entirely).
+	var dashboardSrv *http.Server
+	if dashboardListener != nil {
+		dashboardSrv = newHTTPServer("", api.TrustedProxyMiddleware(handler))
+	}
 
 	log.Printf("basepod: listening on %s", cfg.Listen)
 	log.Printf("basepod: root domain %s", rootDomain)
@@ -265,7 +287,7 @@ func Run(ctx context.Context, cfgPath string) error {
 
 	if dashboardListener != nil {
 		go func() {
-			if err := srv.Serve(dashboardListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := dashboardSrv.Serve(dashboardListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				serveErr <- err
 				return
 			}
@@ -279,7 +301,16 @@ func Run(ctx context.Context, cfgPath string) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+		var shutdownErrs []error
 		if err := srv.Shutdown(shutdownCtx); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		if dashboardSrv != nil {
+			if err := dashboardSrv.Shutdown(shutdownCtx); err != nil {
+				shutdownErrs = append(shutdownErrs, err)
+			}
+		}
+		if err := errors.Join(shutdownErrs...); err != nil {
 			return fmt.Errorf("server: shutdown: %w", err)
 		}
 		return nil
@@ -465,11 +496,76 @@ func checkPodmanVersion(version string) error {
 // http://localhost:5173), requests to / are reverse-proxied there instead
 // so the dashboard can be edited with hot-reload against a real running
 // control plane.
+//
+// Every response — dashboard pages and API responses alike — goes
+// through securityHeaders first (audit finding M2): the dashboard's
+// session token lives in localStorage, not an HttpOnly cookie, so the
+// browser-security headers below matter for the HTML/JS that touches it,
+// not just the API's JSON.
 func rootHandler(apiHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/", dashboardHandler())
-	return mux
+	return securityHeaders(mux)
+}
+
+// cspScriptHash is the CSP script-src hash-source for the one inline
+// <script> block web/index.html ships: the pre-paint dark/light class
+// flip that reads localStorage before Vue mounts, so there's no flash of
+// the wrong theme. It's a `sha256-<base64>` of the exact bytes between
+// that block's <script> and </script> tags. Vite leaves this block
+// untouched (byte-for-byte) when it builds web/dist, so the hash stays
+// valid across rebuilds as long as the script itself doesn't change; if
+// it does, TestSecurityHeadersCSPScriptHashMatchesDashboard in
+// server_test.go fails and names the fix (recompute this constant, or —
+// preferably, if the script grows — move it to an external same-origin
+// file instead and drop the hash-source entirely). This keeps CSP's
+// script-src at 'self' plus this one exact, named exception — never
+// 'unsafe-inline'.
+const cspScriptHash = "sha256-5guJyYK5v2PtGhrjDvi2ZURW/XRuzCbI4oTsaQIS49E="
+
+// cspHeader is the dashboard/API's Content-Security-Policy value (audit
+// finding M2). default-src 'self' plus the explicit denials
+// (frame-ancestors/base-uri/object-src) block the SPA from ever loading
+// or being loaded as anything but itself: no framing (clickjacking),
+// no <base>-tag hijacking, no plugin/object embeds. script-src repeats
+// 'self' and adds only cspScriptHash — never 'unsafe-inline' — so the
+// one legitimate inline script (see cspScriptHash's doc comment) is
+// allowed by exact content match and nothing else inline can run. No
+// style-src override is needed: the built dashboard has no inline
+// <style> tag or style="" attribute (verified against `npm run build`'s
+// actual dist/ output while implementing this).
+const cspHeader = "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; " +
+	"script-src 'self' '" + cspScriptHash + "'"
+
+// securityHeaders sets a fixed set of browser-security response headers
+// on every response (audit finding M2): CSP (see cspHeader),
+// X-Content-Type-Options to stop MIME-sniffing, a strict Referrer-Policy
+// so URLs (which may include ?access_token= on the log-streaming routes)
+// never leak to a Referer header, X-Frame-Options as a legacy backstop
+// for browsers that don't honor CSP's frame-ancestors, and
+// Strict-Transport-Security.
+//
+// HSTS is set unconditionally even though every listener this process
+// itself binds — the loopback :3080 listener and the dashboard's unix
+// socket — only ever speaks plain HTTP, never TLS: browsers only act on
+// Strict-Transport-Security when the response that carried it already
+// arrived over HTTPS in the first place (RFC 6797 §7.2), so a client
+// hitting http://127.0.0.1:3080 directly just ignores the header — it's
+// inert there, not a lie. The header earns its keep on the one path a
+// browser actually sees this response over TLS: proxied through Caddy at
+// the dashboard's public hostname, where it now tells the browser to
+// never downgrade that hostname back to plain HTTP.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", cspHeader)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Strict-Transport-Security", "max-age=31536000")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // dashboardHandler returns the embedded dashboard, or a reverse proxy to

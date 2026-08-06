@@ -1,23 +1,11 @@
 package api
 
 import (
-	"net"
 	"net/http"
 	"time"
 
 	"github.com/base-al/basepod/internal/auth"
 )
-
-// clientIP extracts the host portion of r.RemoteAddr for rate-limit
-// bucketing. Falls back to the raw value if it isn't a host:port pair
-// (e.g. in atypical test transports).
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
 
 type loginRequest struct {
 	Email    string `json:"email"`
@@ -34,10 +22,21 @@ type loginResponse struct {
 	User  userResponse `json:"user"`
 }
 
-// handleLogin verifies email/password, rate-limited per client IP, and on
-// success issues a new session token good for sessionDuration.
+// handleLogin verifies email/password, rate-limited per client IP (plus a
+// global ceiling across every IP — see the api struct's limiter/
+// globalLimiter doc comments), and on success issues a new session token
+// good for sessionDuration.
+//
+// Only a FAILED attempt consumes a rate-limit slot. The limiters are
+// peeked (Blocked) before any credential check, so an already-exhausted
+// caller is rejected without even reading the body or touching the
+// store; a failed credential check then records the attempt against both
+// limiters. A successful login records nothing — an admin who mistypes
+// their password a few times and then gets it right must not find their
+// own next login rate-limited by the success itself.
 func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if !a.limiter.Allow(clientIP(r)) {
+	key := clientIP(r)
+	if a.limiter.Blocked(key) || a.globalLimiter.Blocked(globalLimiterKey) {
 		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many login attempts; try again later")
 		return
 	}
@@ -49,6 +48,8 @@ func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	user, err := a.st.UserByEmail(req.Email)
 	if err != nil || !auth.VerifyPassword(req.Password, user.PasswordHash) {
+		a.limiter.Allow(key)
+		a.globalLimiter.Allow(globalLimiterKey)
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
 		return
 	}

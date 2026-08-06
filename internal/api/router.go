@@ -79,9 +79,20 @@ const deployTimeout = 5 * time.Minute
 const sessionDuration = 30 * 24 * time.Hour
 
 // loginRateLimit and loginRateWindow bound login attempts per client IP.
+// globalLoginRateLimit bounds FAILED login attempts across every client
+// IP combined, over the same window — a backstop against a distributed
+// flood (many source IPs, each well under loginRateLimit individually)
+// that the per-IP limiter alone can't see, without letting a single IP
+// exhaust it and lock everyone else out the way audit finding H1's
+// degenerate-key bug did. globalLimiterKey is the single fixed key that
+// backstop is tracked under, reusing rateLimiter's per-key map machinery
+// as a plain counter.
 const (
 	loginRateLimit  = 10
 	loginRateWindow = time.Minute
+
+	globalLoginRateLimit = 100
+	globalLimiterKey     = "global"
 )
 
 // maxJSONBody caps the size of a JSON request body handlers behind
@@ -111,7 +122,13 @@ type api struct {
 	dep     Deployer
 	ping    Pinger
 	version string
-	limiter *rateLimiter
+
+	// limiter bounds login attempts per client IP (see clientIP);
+	// globalLimiter additionally bounds failed login attempts summed
+	// across every IP, under the single fixed key globalLimiterKey — see
+	// the loginRateLimit/globalLoginRateLimit doc comment.
+	limiter       *rateLimiter
+	globalLimiter *rateLimiter
 
 	// seal/open encrypt and decrypt EnvVar.ValueEncrypted values. They
 	// close over the process's encryption key (see internal/crypto) so
@@ -137,16 +154,17 @@ type api struct {
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
 func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(string) (string, error), open func(string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder) http.Handler {
 	a := &api{
-		st:      st,
-		dep:     dep,
-		ping:    ping,
-		version: version,
-		limiter: newRateLimiter(loginRateLimit, loginRateWindow),
-		seal:    seal,
-		open:    open,
-		routes:  routes,
-		logs:    logs,
-		builder: builder,
+		st:            st,
+		dep:           dep,
+		ping:          ping,
+		version:       version,
+		limiter:       newRateLimiter(loginRateLimit, loginRateWindow),
+		globalLimiter: newRateLimiter(globalLoginRateLimit, loginRateWindow),
+		seal:          seal,
+		open:          open,
+		routes:        routes,
+		logs:          logs,
+		builder:       builder,
 	}
 
 	r := chi.NewRouter()
@@ -437,6 +455,30 @@ func (rl *rateLimiter) Allow(key string) bool {
 	}
 	rl.attempts[key] = append(kept, now)
 	return true
+}
+
+// Blocked reports whether key is already at its limit for the trailing
+// window, WITHOUT recording a new attempt. Used to gate a request before
+// deciding whether it should even count as an attempt (see
+// api.handleLogin): checking status must never itself consume a slot, or
+// a caller sitting exactly at the limit could never find out they're
+// blocked without also being the one to (re-)trip it.
+func (rl *rateLimiter) Blocked(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := rl.nowFunc()
+	cutoff := now.Add(-rl.window)
+
+	rl.maybeSweep(now, cutoff)
+
+	count := 0
+	for _, t := range rl.attempts[key] {
+		if t.After(cutoff) {
+			count++
+		}
+	}
+	return count >= rl.limit
 }
 
 // maybeSweep drops every key in the map whose newest recorded attempt is
