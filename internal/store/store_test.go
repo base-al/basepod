@@ -803,8 +803,8 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 6 {
-		t.Fatalf("db version after migrating = %d, want 6 (00001..00006)", version)
+	if version != 7 {
+		t.Fatalf("db version after migrating = %d, want 7 (00001..00007)", version)
 	}
 
 	var appliedCount int
@@ -813,8 +813,8 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	}
 	// goose_db_version always carries a synthetic version-0 bootstrap row in
 	// addition to one row per applied migration file.
-	if appliedCount != 7 {
-		t.Fatalf("applied migration rows = %d, want 7 (bootstrap + 6 migrations)", appliedCount)
+	if appliedCount != 8 {
+		t.Fatalf("applied migration rows = %d, want 8 (bootstrap + 7 migrations)", appliedCount)
 	}
 
 	// apps.alias_scheme (migration 00005_alias_scheme.sql, from
@@ -850,6 +850,41 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	var tableName string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stream_tokens'`).Scan(&tableName); err != nil {
 		t.Fatalf("stream_tokens table missing after migrating to latest: %v", err)
+	}
+
+	// git_sources and git_deliveries tables (migration
+	// 00007_git_sources.sql, v0.5's Task 2) must exist.
+	for _, want := range []string{"git_sources", "git_deliveries"} {
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, want).Scan(&tableName); err != nil {
+			t.Fatalf("%s table missing after migrating to latest: %v", want, err)
+		}
+	}
+
+	// deployments.git_sha (migration 00007_git_sources.sql) must exist.
+	rows, err = db.Query(`PRAGMA table_info(deployments)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawGitSha bool
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if name == "git_sha" {
+			sawGitSha = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if !sawGitSha {
+		t.Fatal("deployments.git_sha column missing after migrating to latest")
 	}
 }
 
@@ -1276,5 +1311,299 @@ func TestStreamTokenByHashPrunesExpiredLazily(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("expected the lazy prune in StreamTokenByHash to have already removed the expired row, %d still pruneable", n)
+	}
+}
+
+// TestGitSourceRoundtrip proves UpsertGitSource/GitSourceByAppID/
+// GitSourceByHookID round-trip every field, and that GitSourceByAppID
+// reports ErrNotFound before any source is connected.
+func TestGitSourceRoundtrip(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("myapp", "img:1.0", 8080)
+
+	if _, err := s.GitSourceByAppID(app.ID); err != ErrNotFound {
+		t.Fatalf("GitSourceByAppID before connect = %v, want ErrNotFound", err)
+	}
+
+	got, err := s.UpsertGitSource(GitSource{
+		AppID:           app.ID,
+		URL:             "https://github.com/example/repo.git",
+		Branch:          "main",
+		Provider:        "github",
+		HookID:          "hook-abc123",
+		SecretEncrypted: "sealed-secret",
+		TokenEncrypted:  "sealed-token",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitSource: %v", err)
+	}
+	if got.AppID != app.ID || got.URL != "https://github.com/example/repo.git" || got.Branch != "main" ||
+		got.Provider != "github" || got.HookID != "hook-abc123" ||
+		got.SecretEncrypted != "sealed-secret" || got.TokenEncrypted != "sealed-token" {
+		t.Fatalf("unexpected git source after insert: %+v", got)
+	}
+	if got.CreatedAt == "" || got.UpdatedAt == "" {
+		t.Fatalf("CreatedAt/UpdatedAt not set: %+v", got)
+	}
+
+	byApp, err := s.GitSourceByAppID(app.ID)
+	if err != nil || byApp.HookID != "hook-abc123" {
+		t.Fatalf("GitSourceByAppID: %+v, %v", byApp, err)
+	}
+	byHook, err := s.GitSourceByHookID("hook-abc123")
+	if err != nil || byHook.AppID != app.ID {
+		t.Fatalf("GitSourceByHookID: %+v, %v", byHook, err)
+	}
+
+	if _, err := s.GitSourceByHookID("no-such-hook"); err != ErrNotFound {
+		t.Fatalf("GitSourceByHookID unknown = %v, want ErrNotFound", err)
+	}
+}
+
+// TestGitSourceUpsertReplacesInPlace proves a second UpsertGitSource for
+// the same app updates the existing row (keyed by the UNIQUE app_id
+// column) rather than erroring or creating a duplicate, preserves
+// created_at across the update, and advances updated_at.
+func TestGitSourceUpsertReplacesInPlace(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("myapp", "img:1.0", 8080)
+
+	first, err := s.UpsertGitSource(GitSource{
+		AppID: app.ID, URL: "https://github.com/example/repo.git", Branch: "main",
+		HookID: "hook-1", SecretEncrypted: "s1",
+	})
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	second, err := s.UpsertGitSource(GitSource{
+		AppID: app.ID, URL: "https://github.com/example/repo.git", Branch: "develop",
+		HookID: "hook-1", SecretEncrypted: "s1", TokenEncrypted: "t2",
+	})
+	if err != nil {
+		t.Fatalf("second upsert (reconnect): %v", err)
+	}
+
+	if second.ID != first.ID {
+		t.Fatalf("reconnect created a new row: first ID %d, second ID %d", first.ID, second.ID)
+	}
+	if second.Branch != "develop" || second.TokenEncrypted != "t2" {
+		t.Fatalf("reconnect did not apply new fields: %+v", second)
+	}
+	if second.CreatedAt != first.CreatedAt {
+		t.Fatalf("created_at changed across reconnect: %q -> %q", first.CreatedAt, second.CreatedAt)
+	}
+
+	all, err := s.ListGitDeliveries(app.ID, 10)
+	if err != nil || len(all) != 0 {
+		t.Fatalf("expected no deliveries yet: %v, %v", all, err)
+	}
+}
+
+// TestGitSourceUpsertUnknownApp proves UpsertGitSource maps a foreign-key
+// violation (an app_id that doesn't exist) to ErrNotFound, mirroring
+// AddDomain's behavior.
+func TestGitSourceUpsertUnknownApp(t *testing.T) {
+	s := open(t)
+	if _, err := s.UpsertGitSource(GitSource{AppID: 999999, URL: "https://example.com/r.git", Branch: "main", HookID: "h"}); err != ErrNotFound {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+// TestGitSourceHookIDUniqueAcrossApps proves hook_id is globally unique —
+// two apps cannot end up with colliding webhook URLs.
+func TestGitSourceHookIDUniqueAcrossApps(t *testing.T) {
+	s := open(t)
+	app1, _ := s.CreateApp("app1", "img:1.0", 8080)
+	app2, _ := s.CreateApp("app2", "img:1.0", 8081)
+
+	if _, err := s.UpsertGitSource(GitSource{AppID: app1.ID, URL: "https://example.com/a.git", Branch: "main", HookID: "shared-hook"}); err != nil {
+		t.Fatalf("app1 upsert: %v", err)
+	}
+	if _, err := s.UpsertGitSource(GitSource{AppID: app2.ID, URL: "https://example.com/b.git", Branch: "main", HookID: "shared-hook"}); err == nil {
+		t.Fatal("expected a UNIQUE constraint error for a colliding hook_id across two different apps, got nil")
+	}
+}
+
+// TestGitSourceCascadeDelete proves deleting an app removes its git
+// source row too (ON DELETE CASCADE).
+func TestGitSourceCascadeDelete(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("myapp", "img:1.0", 8080)
+	if _, err := s.UpsertGitSource(GitSource{AppID: app.ID, URL: "https://example.com/r.git", Branch: "main", HookID: "hook-x"}); err != nil {
+		t.Fatal(err)
+	}
+
+	s.DeleteApp(app.ID)
+
+	if _, err := s.GitSourceByAppID(app.ID); err != ErrNotFound {
+		t.Fatalf("git source survived app delete: err=%v", err)
+	}
+}
+
+// TestDeleteGitSource proves DeleteGitSource disconnects a repo, and is a
+// harmless no-op when none was connected.
+func TestDeleteGitSource(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("myapp", "img:1.0", 8080)
+
+	if err := s.DeleteGitSource(app.ID); err != nil {
+		t.Fatalf("DeleteGitSource with nothing connected: %v", err)
+	}
+
+	if _, err := s.UpsertGitSource(GitSource{AppID: app.ID, URL: "https://example.com/r.git", Branch: "main", HookID: "hook-x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteGitSource(app.ID); err != nil {
+		t.Fatalf("DeleteGitSource: %v", err)
+	}
+	if _, err := s.GitSourceByAppID(app.ID); err != ErrNotFound {
+		t.Fatalf("git source still present after DeleteGitSource: err=%v", err)
+	}
+}
+
+// TestGitDeliveryRoundtripAndOrdering proves InsertGitDelivery/
+// ListGitDeliveries round-trip every field (including a nil vs. set
+// DeploymentID) and list newest first.
+func TestGitDeliveryRoundtripAndOrdering(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("myapp", "img:1.0", 8080)
+
+	if _, err := s.InsertGitDelivery(GitDelivery{
+		AppID: app.ID, Provider: "github", Event: "push", Ref: "refs/heads/main",
+		CommitSHA: "aaa111", Status: "ignored_branch", Detail: "branch mismatch",
+	}); err != nil {
+		t.Fatalf("insert #1: %v", err)
+	}
+
+	// deployment_id references a real deployments row (FOREIGN KEY), so
+	// exercise the round-trip against one actually created.
+	dep, err := s.CreateDeployment(app.ID, "img:2.0")
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	got2, err := s.InsertGitDelivery(GitDelivery{
+		AppID: app.ID, Provider: "github", Event: "push", Ref: "refs/heads/main",
+		CommitSHA: "bbb222", Status: "deployed", Detail: "deployed as #3", DeploymentID: &dep.ID,
+	})
+	if err != nil {
+		t.Fatalf("insert #2: %v", err)
+	}
+	if got2.DeploymentID == nil || *got2.DeploymentID != dep.ID {
+		t.Fatalf("deployment_id not round-tripped: %+v", got2)
+	}
+	if got2.ReceivedAt == "" || got2.ID == 0 {
+		t.Fatalf("id/received_at not populated: %+v", got2)
+	}
+
+	list, err := s.ListGitDeliveries(app.ID, 10)
+	if err != nil {
+		t.Fatalf("ListGitDeliveries: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 deliveries, got %d: %+v", len(list), list)
+	}
+	// Newest first: the second insert (commit bbb222) must come before the
+	// first (commit aaa111).
+	if list[0].CommitSHA != "bbb222" || list[1].CommitSHA != "aaa111" {
+		t.Fatalf("deliveries not newest-first: %+v", list)
+	}
+	if list[0].DeploymentID == nil || *list[0].DeploymentID != dep.ID {
+		t.Fatalf("expected first entry's deployment_id round-tripped: %+v", list[0])
+	}
+	if list[1].DeploymentID != nil {
+		t.Fatalf("expected second entry's deployment_id to be nil: %+v", list[1])
+	}
+}
+
+// TestGitDeliveryCascadeDelete proves deleting an app removes its
+// delivery log too.
+func TestGitDeliveryCascadeDelete(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("myapp", "img:1.0", 8080)
+	if _, err := s.InsertGitDelivery(GitDelivery{AppID: app.ID, Status: "ignored_event"}); err != nil {
+		t.Fatal(err)
+	}
+
+	s.DeleteApp(app.ID)
+
+	list, err := s.ListGitDeliveries(app.ID, 10)
+	if err != nil || len(list) != 0 {
+		t.Fatalf("deliveries survived app delete: %+v, %v", list, err)
+	}
+}
+
+// TestGitDeliveryPerAppIsolation proves ListGitDeliveries only returns
+// the requested app's rows.
+func TestGitDeliveryPerAppIsolation(t *testing.T) {
+	s := open(t)
+	app1, _ := s.CreateApp("app1", "img:1.0", 8080)
+	app2, _ := s.CreateApp("app2", "img:1.0", 8081)
+
+	if _, err := s.InsertGitDelivery(GitDelivery{AppID: app1.ID, CommitSHA: "a1", Status: "deployed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertGitDelivery(GitDelivery{AppID: app2.ID, CommitSHA: "a2", Status: "deployed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	list1, _ := s.ListGitDeliveries(app1.ID, 10)
+	list2, _ := s.ListGitDeliveries(app2.ID, 10)
+	if len(list1) != 1 || list1[0].CommitSHA != "a1" {
+		t.Fatalf("app1 deliveries wrong: %+v", list1)
+	}
+	if len(list2) != 1 || list2[0].CommitSHA != "a2" {
+		t.Fatalf("app2 deliveries wrong: %+v", list2)
+	}
+}
+
+// TestPruneGitDeliveriesKeepsExactlyNNewest proves PruneGitDeliveries (and
+// InsertGitDelivery's automatic call to it, using DefaultGitDeliveryKeep)
+// leaves exactly the keep newest rows.
+func TestPruneGitDeliveriesKeepsExactlyNNewest(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("myapp", "img:1.0", 8080)
+
+	// Insert 5 deliveries, one at a time, in increasing "freshness" order
+	// (commit_sha doubles as an ordinal so we can identify survivors
+	// without depending on sub-second received_at resolution).
+	for i := 0; i < 5; i++ {
+		if _, err := s.InsertGitDelivery(GitDelivery{
+			AppID: app.ID, CommitSHA: string(rune('a' + i)), Status: "ignored_event",
+		}); err != nil {
+			t.Fatalf("insert #%d: %v", i, err)
+		}
+	}
+
+	n, err := s.PruneGitDeliveries(app.ID, 3)
+	if err != nil {
+		t.Fatalf("PruneGitDeliveries: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("PruneGitDeliveries removed %d rows, want 2 (5 - keep 3)", n)
+	}
+
+	list, err := s.ListGitDeliveries(app.ID, 10)
+	if err != nil {
+		t.Fatalf("ListGitDeliveries: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("expected exactly 3 deliveries left, got %d: %+v", len(list), list)
+	}
+	// The 3 newest (by insertion order/id, since received_at may tie at
+	// second resolution) must be the last 3 inserted: c, d, e.
+	got := map[string]bool{}
+	for _, d := range list {
+		got[d.CommitSHA] = true
+	}
+	for _, want := range []string{"c", "d", "e"} {
+		if !got[want] {
+			t.Fatalf("expected surviving delivery %q, got set %v (full list %+v)", want, got, list)
+		}
+	}
+	for _, gone := range []string{"a", "b"} {
+		if got[gone] {
+			t.Fatalf("expected delivery %q pruned, but it survived: %+v", gone, list)
+		}
 	}
 }
