@@ -740,7 +740,7 @@ func TestEnsureNetworkCreatesWhenMissing(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"name": "basepod"})
 	})
 	c := fakeDaemon(t, mux)
-	if err := c.EnsureNetwork(context.Background(), "basepod"); err != nil {
+	if err := c.EnsureNetwork(context.Background(), "basepod", ""); err != nil {
 		t.Fatal(err)
 	}
 	if existsCalls != 1 || createCalls != 1 {
@@ -758,6 +758,33 @@ func TestEnsureNetworkCreatesWhenMissing(t *testing.T) {
 	// containers unable to resolve each other by name/alias.
 	if createBody["dns_enabled"] != true {
 		t.Fatalf("create body dns_enabled: %v, want true", createBody["dns_enabled"])
+	}
+}
+
+// TestEnsureNetworkCreatesWithInstanceLabel proves a non-empty instanceID
+// argument gets stamped onto the network as basepod.instance (issue #10),
+// alongside the always-present basepod.managed label.
+func TestEnsureNetworkCreatesWithInstanceLabel(t *testing.T) {
+	var createBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/networks/basepod/exists", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(404)
+	})
+	mux.HandleFunc("POST /v5.0.0/libpod/networks/create", func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&createBody)
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{"name": "basepod"})
+	})
+	c := fakeDaemon(t, mux)
+	if err := c.EnsureNetwork(context.Background(), "basepod", "inst-abc123"); err != nil {
+		t.Fatal(err)
+	}
+	labels, _ := createBody["labels"].(map[string]any)
+	if labels["basepod.managed"] != "true" {
+		t.Fatalf("create body labels: %v", createBody)
+	}
+	if labels["basepod.instance"] != "inst-abc123" {
+		t.Fatalf("create body labels[basepod.instance] = %v, want %q", labels["basepod.instance"], "inst-abc123")
 	}
 }
 
@@ -783,7 +810,7 @@ func TestEnsureNetworkNoopWhenPresent(t *testing.T) {
 		w.WriteHeader(200)
 	})
 	c := fakeDaemon(t, mux)
-	if err := c.EnsureNetwork(context.Background(), "basepod"); err != nil {
+	if err := c.EnsureNetwork(context.Background(), "basepod", ""); err != nil {
 		t.Fatal(err)
 	}
 	if createCalls != 0 {
@@ -822,7 +849,7 @@ func TestEnsureNetworkSelfHealsDNSWhenNoContainers(t *testing.T) {
 		w.WriteHeader(200)
 	})
 	c := fakeDaemon(t, mux)
-	if err := c.EnsureNetwork(context.Background(), "basepod"); err != nil {
+	if err := c.EnsureNetwork(context.Background(), "basepod", ""); err != nil {
 		t.Fatal(err)
 	}
 	if removeCalls != 1 {
@@ -865,7 +892,7 @@ func TestEnsureNetworkWarnsWhenDNSDisabledButContainersAttached(t *testing.T) {
 		w.WriteHeader(200)
 	})
 	c := fakeDaemon(t, mux)
-	if err := c.EnsureNetwork(context.Background(), "basepod"); err != nil {
+	if err := c.EnsureNetwork(context.Background(), "basepod", ""); err != nil {
 		t.Fatal(err)
 	}
 	if removeCalls != 0 {

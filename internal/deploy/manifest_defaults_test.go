@@ -313,7 +313,7 @@ func TestDeployBuildAppliesManifestEnvDefaultsOnlyForMissingKeys(t *testing.T) {
 	// is enough here since this test only asserts on what's stored, not
 	// on the rolled-out container's plaintext env.
 	decrypt := func(appID int64, key, sealedVal string) (string, error) { return sealedVal, nil }
-	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, encrypt, nil)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, encrypt, nil, testInstanceID)
 	eng.probeInterval = 0
 	eng.probeAttempts = 1
 

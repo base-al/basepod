@@ -99,7 +99,7 @@ func DashboardSockDial() string {
 // Runtime is the podman capability the manager needs (satisfied by
 // *podman.Client).
 type Runtime interface {
-	EnsureNetwork(ctx context.Context, name string) error
+	EnsureNetwork(ctx context.Context, name, instanceID string) error
 	PullImage(ctx context.Context, ref string) error
 	// ImageArchitecture reports the architecture recorded in ref's image
 	// manifest/config — used by Manager to catch a wrong-arch image that
@@ -126,6 +126,15 @@ type Manager struct {
 	httpPort  int
 	httpsPort int
 
+	// instanceID is this BasePod instance's stable id (see
+	// internal/instanceid.LoadOrCreate), stamped as basepod.instance=<id>
+	// on the basepod network and on bp-caddy itself (see create) — issue
+	// #10. Ensure uses it to tell "my bp-caddy" (recreate on drift, same
+	// as before instance ids existed) apart from "a different BasePod
+	// instance's bp-caddy, sharing this Podman socket" (never touched —
+	// see Ensure's doc comment).
+	instanceID string
+
 	// expectedArch is the architecture pullImage requires the PinnedImage
 	// ref to resolve to after pulling — defaults to runtime.GOARCH (see
 	// NewManager) and is only ever overridden by tests. runtime.GOARCH is
@@ -142,14 +151,17 @@ type Manager struct {
 // NewManager builds a Manager. configDir is the host directory bind-mounted
 // into the Caddy container at /etc/caddy; it must be an absolute path.
 // httpPort and httpsPort are the host ports mapped to the container's 80
-// and 443.
-func NewManager(rt Runtime, exec Execer, configDir string, httpPort, httpsPort int) *Manager {
+// and 443. instanceID is this BasePod instance's stable id (see
+// internal/instanceid.LoadOrCreate) — see the instanceID field's doc
+// comment for what it's used for.
+func NewManager(rt Runtime, exec Execer, configDir string, httpPort, httpsPort int, instanceID string) *Manager {
 	return &Manager{
 		rt:           rt,
 		exec:         exec,
 		configDir:    configDir,
 		httpPort:     httpPort,
 		httpsPort:    httpsPort,
+		instanceID:   instanceID,
 		expectedArch: runtime.GOARCH,
 	}
 }
@@ -188,8 +200,26 @@ const driftStopTimeout = 5
 // exist and are running, creating and starting the container (with an
 // initial empty-routes config) on first run.
 //
-// If bp-caddy already exists, Ensure first checks for drift against the
-// spec create would build today — a different image, different host port
+// If bp-caddy already exists, Ensure first checks whether it's owned by a
+// DIFFERENT BasePod instance (issue #10): a bp-caddy container carrying a
+// basepod.instance label that doesn't match m.instanceID belongs to
+// another BasePod daemon sharing this same Podman socket, and Ensure
+// refuses to touch it at all — no drift check, no start-if-stopped, and
+// certainly no stop/remove/recreate — returning a clear, actionable error
+// instead (see the instance-mismatch branch below). Two BasePod instances
+// racing to own the one shared "bp-caddy" name/proxy is not a supported
+// configuration; each instance needs its own Podman socket. A bp-caddy
+// with NO basepod.instance label at all (every v0.4.2-and-earlier install,
+// before this label existed) is treated as adopted — exactly the same as
+// before instance ids existed — since there's no way to tell "unlabeled
+// because it predates instance labeling" apart from "unlabeled because it
+// belongs to some other, still-unlabeled instance", and refusing to ever
+// touch bp-caddy again after every upgrade would defeat the whole point of
+// this method. It picks up its own instance's label the next time drift
+// (e.g. an image bump) forces a real recreate — see create().
+//
+// Once ownership is established, Ensure checks for drift against the spec
+// create would build today — a different image, different host port
 // mappings, or a container stuck in the "created" state (meaning it was
 // made but never successfully started, e.g. because its port mapping lost
 // a bind race on a previous boot) — and if any of those differ, pulls the
@@ -214,7 +244,7 @@ const driftStopTimeout = 5
 // no-op against a wrong-arch cache entry (e.g. daemon offline, or a future
 // libpod/registry combination that doesn't re-resolve on every call).
 func (m *Manager) Ensure(ctx context.Context) error {
-	if err := m.rt.EnsureNetwork(ctx, NetworkName); err != nil {
+	if err := m.rt.EnsureNetwork(ctx, NetworkName, m.instanceID); err != nil {
 		return fmt.Errorf("caddy: ensure network %q: %w", NetworkName, err)
 	}
 
@@ -224,6 +254,16 @@ func (m *Manager) Ensure(ctx context.Context) error {
 			return fmt.Errorf("caddy: inspect %s: %w", ContainerName, err)
 		}
 		return m.create(ctx)
+	}
+
+	if owner, labeled := info.Labels["basepod.instance"]; labeled && owner != m.instanceID {
+		return fmt.Errorf(
+			"caddy: %s is owned by a different BasePod instance (id %s; this instance is %s) — "+
+				"two BasePod instances appear to share this Podman socket, which is not supported; "+
+				"refusing to recreate or otherwise touch %s. Point one of the instances at a separate "+
+				"Podman socket, or stop the other instance, before starting this one",
+			ContainerName, owner, m.instanceID, ContainerName,
+		)
 	}
 
 	desiredMounts, err := m.desiredMounts()
@@ -471,9 +511,14 @@ func (m *Manager) create(ctx context.Context) error {
 	}
 
 	spec := podman.CreateSpec{
-		Name:   ContainerName,
-		Image:  PinnedImage,
-		Labels: map[string]string{"basepod.managed": "true"},
+		Name:  ContainerName,
+		Image: PinnedImage,
+		// basepod.instance (issue #10): stamped so a second BasePod
+		// instance sharing this Podman socket can tell this bp-caddy
+		// apart from its own and refuse to fight over it (see Ensure's
+		// instance-mismatch check above) instead of recreating it under
+		// its own config, as happened in the original incident.
+		Labels: map[string]string{"basepod.managed": "true", "basepod.instance": m.instanceID},
 		// The image doesn't ship /var/run/caddy, the parent directory
 		// AdminSocket's unix socket binds into, and Caddy can't create
 		// it itself ("bind: no such file or directory"). It must live

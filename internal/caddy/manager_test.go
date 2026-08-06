@@ -19,6 +19,12 @@ import (
 // consumes.
 var _ Runtime = (*podman.Client)(nil)
 
+// testInstanceID is the instance id every test in this file builds its
+// Manager against, unless a test specifically needs a different one (see
+// TestEnsureRefusesForeignInstanceCaddy) — arbitrary, just needs to be
+// stable and non-empty.
+const testInstanceID = "test-instance-aaa"
+
 // fakeRuntime is a test double for Runtime: it records the ordered
 // sequence of calls made against it and returns canned results.
 type fakeRuntime struct {
@@ -48,7 +54,7 @@ type fakeRuntime struct {
 	archErr    error
 }
 
-func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
+func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name, instanceID string) error {
 	f.calls = append(f.calls, "EnsureNetwork")
 	return f.networkErr
 }
@@ -143,7 +149,7 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 
 	fr := &fakeRuntime{inspectErr: podman.ErrNotFound}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -166,6 +172,11 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	}
 	if spec.NetworkName != NetworkName {
 		t.Errorf("spec.NetworkName = %q, want %q", spec.NetworkName, NetworkName)
+	}
+	// issue #10: bp-caddy must carry this instance's id so a second BasePod
+	// instance sharing this Podman socket can recognize it as not-mine.
+	if spec.Labels["basepod.instance"] != testInstanceID {
+		t.Errorf("spec.Labels[basepod.instance] = %q, want %q", spec.Labels["basepod.instance"], testInstanceID)
 	}
 	// Command must create /var/run/caddy (AdminSocket's parent dir, which
 	// the image doesn't ship) on the container's own filesystem before
@@ -286,7 +297,7 @@ func TestEnsureStartsWhenStopped(t *testing.T) {
 		Image: PinnedImage, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
 	}}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -307,7 +318,7 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 		Image: PinnedImage, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
 	}}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -316,6 +327,71 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureAdoptsUnlabeledCaddy proves a pre-v0.5 bp-caddy container —
+// carrying no basepod.instance label at all, the exact shape a real
+// upgrade from v0.4.2 (no instance labeling) to this fix finds on its
+// first boot (issue #10) — is adopted rather than refused or recreated:
+// with no other drift, Ensure treats it exactly like TestEnsureNoopWhenRunning
+// treats one of its own (matching image/ports/mounts, already running),
+// leaving it running untouched. It only ever picks up this instance's own
+// label the next time a real drift condition (e.g. an image bump) forces
+// an actual recreate — see create()'s Labels.
+func TestEnsureAdoptsUnlabeledCaddy(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: PinnedImage, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
+		// Deliberately no Labels at all — the pre-instance-id shape.
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (adoption must not stop/remove/recreate)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureRefusesForeignInstanceCaddy proves a bp-caddy container
+// labeled with a DIFFERENT instance's id — the shape a second BasePod
+// daemon sharing this Podman socket produces once both are on this fix —
+// makes Ensure fail loudly rather than recreating it: no pull, no
+// stop/remove/create, nothing but the read-only EnsureNetwork+
+// InspectContainer calls already made before the ownership check runs.
+// This is the fix for the exact incident issue #10 reports (a second
+// BasePod instance recreating the first's bp-caddy under its own config).
+func TestEnsureRefusesForeignInstanceCaddy(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: PinnedImage, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
+		Labels: map[string]string{"basepod.managed": "true", "basepod.instance": "some-other-instance"},
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
+
+	err := mgr.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure should refuse to touch a foreign-instance bp-caddy, got nil error")
+	}
+	if !strings.Contains(err.Error(), "different BasePod instance") {
+		t.Errorf("error = %q, want it to explain the instance conflict", err.Error())
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (must never pull/stop/remove/create a foreign instance's bp-caddy)", fr.calls, wantCalls)
 	}
 }
 
@@ -344,7 +420,7 @@ func TestEnsureRecreatesWhenStateCreated(t *testing.T) {
 		Image: PinnedImage, Ports: matchingPorts,
 	}}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -370,7 +446,7 @@ func TestEnsureRecreatesOnImageMismatch(t *testing.T) {
 		Image: "docker.io/library/caddy:2.9-alpine", Ports: matchingPorts,
 	}}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -398,7 +474,7 @@ func TestEnsureRecreatesOnPortMismatch(t *testing.T) {
 		},
 	}}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -440,7 +516,7 @@ func TestEnsureNoopWhenAllMatch(t *testing.T) {
 		Mounts: reversedMounts,
 	}}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -472,7 +548,7 @@ func TestEnsureRecreatesOnMountMismatch(t *testing.T) {
 		},
 	}}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -506,7 +582,7 @@ func TestEnsureDriftRecreatePullFailureLeavesOldContainer(t *testing.T) {
 		pullErr: pullErr,
 	}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	err := mgr.Ensure(context.Background())
 	if err == nil {
@@ -544,7 +620,7 @@ func TestEnsureDriftRecreateAlwaysPulls(t *testing.T) {
 		},
 	}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -563,7 +639,7 @@ func TestEnsureCreateAlwaysPulls(t *testing.T) {
 
 	fr := &fakeRuntime{inspectErr: podman.ErrNotFound}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -595,7 +671,7 @@ func TestEnsureDriftRecreateArchMismatchLeavesOldContainer(t *testing.T) {
 		archResult: "amd64",
 	}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 	mgr.expectedArch = "arm64"
 
 	err := mgr.Ensure(context.Background())
@@ -623,7 +699,7 @@ func TestEnsureCreateArchMismatch(t *testing.T) {
 
 	fr := &fakeRuntime{inspectErr: podman.ErrNotFound, archResult: "amd64"}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 	mgr.expectedArch = "arm64"
 
 	err := mgr.Ensure(context.Background())
@@ -646,7 +722,7 @@ func TestApplyWritesAndReloads(t *testing.T) {
 
 	fr := &fakeRuntime{}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
 	if err := mgr.Apply(context.Background(), routes, nil); err != nil {
@@ -680,7 +756,7 @@ func TestApplyWritesDashboardRoute(t *testing.T) {
 
 	fr := &fakeRuntime{}
 	fe := &fakeExecer{}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
 	dashboard := &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: DashboardSockDial()}
@@ -721,7 +797,7 @@ func TestApplyRetriesReloadOnTransientFailure(t *testing.T) {
 	fr := &fakeRuntime{}
 	transient := errors.New(`podman exec: exit status 1: Error: reading config from file: open /etc/caddy/current.json: no such file or directory`)
 	fe := &fakeExecer{errSequence: []error{transient, transient, nil}}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	if err := mgr.Apply(context.Background(), nil, nil); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -748,7 +824,7 @@ func TestApplyFailsAfterExhaustingReloadRetries(t *testing.T) {
 	fr := &fakeRuntime{}
 	persistent := errors.New("permanent failure")
 	fe := &fakeExecer{err: persistent}
-	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443, testInstanceID)
 
 	err := mgr.Apply(context.Background(), nil, nil)
 	if err == nil {
