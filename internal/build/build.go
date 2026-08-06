@@ -11,6 +11,7 @@ package build
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/base-al/basepod/internal/manifest"
 	"github.com/base-al/basepod/internal/podman"
 )
 
@@ -144,6 +146,31 @@ func (b *Builder) appLock(slug string) *sync.Mutex {
 	return m
 }
 
+// Result is BuildManifest's return value: everything a caller needs from
+// a finished (or failed-after-the-log-existed) build, including the
+// app's basepod.yaml manifest when the build context had one at its
+// root.
+type Result struct {
+	// ImageTag is the local image tag Build produced, e.g.
+	// "localhost/basepod/blog:3". Empty if the build never got far
+	// enough to pick one (spooling or tar validation failed).
+	ImageTag string
+	// LogPath is where the build's log lives on disk. Populated whenever
+	// the log file was created, even if the build itself then failed —
+	// same contract as Build's logPath return.
+	LogPath string
+	// Manifest is the app's basepod.yaml/basepod.yml, parsed from the
+	// build context's root, or nil if none was present (or it failed to
+	// parse — see Warnings in that case).
+	Manifest *manifest.Manifest
+	// Warnings are non-fatal manifest issues (unknown keys, a manifest
+	// that was present but too large or failed to parse, etc.) — see
+	// validateTar's doc comment. BuildManifest also writes these to the
+	// build log itself, so a caller isn't required to do anything with
+	// this field for them to reach the user.
+	Warnings []string
+}
+
 // Build decompresses gzTar (a gzipped tar stream — the raw upload body),
 // spools it to a temp file under <dataDir>/builds/ so its index can be
 // validated and then rewound for the actual build, validates that
@@ -160,7 +187,45 @@ func (b *Builder) appLock(slug string) *sync.Mutex {
 // if the build itself then fails — so a caller can still show the
 // caller-facing error via the log file. It is "" only when Build fails
 // before the log file exists (spooling or tar validation).
+//
+// Build is a thin, signature-preserving wrapper around BuildManifest —
+// see that method for the same information plus the build context's
+// parsed basepod.yaml manifest. Build exists because
+// internal/deploy.Engine.runRollout (outside this package's ownership as
+// of the manifest work — see BuildManifest's doc comment) already calls
+// it with this exact 3-return signature; changing Build itself would
+// break that call site.
 func (b *Builder) Build(ctx context.Context, slug string, deploymentNumber int, gzTar io.Reader) (imageTag, logPath string, err error) {
+	res, err := b.BuildManifest(ctx, slug, deploymentNumber, gzTar)
+	return res.ImageTag, res.LogPath, err
+}
+
+// BuildManifest does everything Build does, and additionally parses a
+// root-level basepod.yaml/basepod.yml from the build context (if
+// present) and returns it as part of Result — see Result's doc comment.
+// Any manifest warnings (unknown keys, a manifest that was ignored for
+// being too large or unparseable) are written to the build log itself
+// before the podman build starts, so they reach the user (the build
+// log's SSE stream) even if nothing downstream of BuildManifest ever
+// looks at Result.Warnings.
+//
+// TODO(#1): internal/deploy.Engine.runRollout (internal/deploy/deploy.go,
+// around the `tag, _, buildErr := builder.Build(...)` call in
+// DeployBuild) currently calls Build and so never sees the parsed
+// manifest. Once that package can be touched by this change, switch that
+// call site to:
+//
+//	res, buildErr := builder.BuildManifest(ctx, app.Slug, dep.Number, gzTar)
+//	tag := res.ImageTag
+//	if res.Manifest != nil {
+//	    applyManifestDefaults(app, res.Manifest) // port/healthcheck.path/resources iff app doesn't already override
+//	}
+//
+// (a small helper, not shown, that only fills in zero-valued fields on
+// app — an app's own stored config always wins over the manifest) and
+// keep the rest of runRollout unchanged; buildErr's error handling
+// doesn't change.
+func (b *Builder) BuildManifest(ctx context.Context, slug string, deploymentNumber int, gzTar io.Reader) (Result, error) {
 	lock := b.appLock(slug)
 	lock.Lock()
 	defer lock.Unlock()
@@ -168,13 +233,13 @@ func (b *Builder) Build(ctx context.Context, slug string, deploymentNumber int, 
 	select {
 	case b.sem <- struct{}{}:
 	case <-ctx.Done():
-		return "", "", ctx.Err()
+		return Result{}, ctx.Err()
 	}
 	defer func() { <-b.sem }()
 
 	spoolPath, err := b.spool(gzTar)
 	if err != nil {
-		return "", "", err
+		return Result{}, err
 	}
 	// The spool file is a temp artifact this call created for its own use
 	// (tar index validation needs to seek, which an io.Reader upload body
@@ -182,33 +247,46 @@ func (b *Builder) Build(ctx context.Context, slug string, deploymentNumber int, 
 	// touching anything a user owns.
 	defer os.Remove(spoolPath)
 
-	dockerfile, err := validateTar(spoolPath)
+	dockerfile, mf, warnings, err := validateTar(spoolPath)
 	if err != nil {
-		return "", "", err
+		return Result{}, err
 	}
 
 	spool, err := os.Open(spoolPath)
 	if err != nil {
-		return "", "", fmt.Errorf("build: reopen spool for build: %w", err)
+		return Result{}, fmt.Errorf("build: reopen spool for build: %w", err)
 	}
 	defer spool.Close()
 
 	logPath, logFile, err := b.createLog(slug, deploymentNumber)
 	if err != nil {
-		return "", "", err
+		return Result{}, err
 	}
 	defer logFile.Close()
+
+	// Surface basepod.yaml warnings in the build log immediately — for a
+	// zero-config deploy the build log's SSE stream is the user's first
+	// (often only) feedback channel, well before any dashboard manifest
+	// viewer exists.
+	for _, w := range warnings {
+		fmt.Fprintf(logFile, "warning: %s\n", w)
+	}
 
 	// Cap how much build output ever reaches disk (see limitedLogWriter):
 	// the BUILD itself is unaffected by the cap — BuildImage's own stream
 	// copy is oblivious to it — only the log stops growing once it's hit.
 	sink := newLimitedLogWriter(logFile, b.maxLogBytes)
 
-	imageTag = fmt.Sprintf("localhost/basepod/%s:%d", slug, deploymentNumber)
+	imageTag := fmt.Sprintf("localhost/basepod/%s:%d", slug, deploymentNumber)
 	if err := b.rt.BuildImage(ctx, imageTag, dockerfile, spool, sink); err != nil {
-		return "", logPath, err
+		// Matches Build's pre-existing contract: on a BuildImage failure
+		// the tag is deliberately withheld (there is no usable image),
+		// while LogPath/Manifest/Warnings are still returned since the
+		// log file (and whatever it was told about the manifest) exists
+		// regardless of whether the build itself succeeded.
+		return Result{LogPath: logPath, Manifest: mf, Warnings: warnings}, err
 	}
-	return imageTag, logPath, nil
+	return Result{ImageTag: imageTag, LogPath: logPath, Manifest: mf, Warnings: warnings}, nil
 }
 
 // spool decompresses gzTar into a fresh temp file under <dataDir>/builds/
@@ -280,46 +358,96 @@ func (b *Builder) createLog(slug string, deploymentNumber int) (string, *os.File
 	return logPath, f, nil
 }
 
-// validateTar scans the tar at path's index (headers only — file bodies
-// are never read) for a root-level Containerfile or Dockerfile,
-// preferring Containerfile if both are present, and rejects any entry
-// whose path is absolute or contains a ".." traversal segment.
-func validateTar(path string) (dockerfile string, err error) {
+// maxManifestSize bounds how many bytes of a root-level
+// basepod.yaml/basepod.yml validateTar will read and attempt to parse. A
+// manifest is meant to be a few dozen lines; one larger than this is
+// almost certainly not a real config, so it's ignored (with a warning)
+// rather than either failing the whole build over it or buffering an
+// attacker-controlled blob into memory.
+const maxManifestSize = 1 << 20 // 1 MiB
+
+// validateTar scans the tar at path's index for a root-level
+// Containerfile or Dockerfile (preferring Containerfile if both are
+// present) and rejects any entry whose path is absolute or contains a
+// ".." traversal segment (see ErrBadPath) — exactly as before the
+// manifest work. It additionally looks for a root-level basepod.yaml or
+// basepod.yml (basepod.yaml preferred if both exist; a manifest nested
+// in a subdirectory is intentionally ignored, matching how a root-only
+// Containerfile is required), reads its bytes in the same pass — the tar
+// is already spooled to disk for this scan, so re-reading it later just
+// to fetch one small entry would be wasted I/O — and parses it via
+// manifest.Parse. A missing manifest is not an error (it's optional); an
+// oversized or unparseable one is downgraded to a warning rather than
+// failing the build, matching manifest.Parse's own "never let a manifest
+// problem be the reason a zero-config deploy fails" philosophy.
+func validateTar(path string) (dockerfile string, mf *manifest.Manifest, warnings []string, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("build: open spool for validation: %w", err)
+		return "", nil, nil, fmt.Errorf("build: open spool for validation: %w", err)
 	}
 	defer f.Close()
 
 	tr := tar.NewReader(f)
 	found := map[string]bool{}
+	var manifestName string
+	var manifestBody []byte
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return "", fmt.Errorf("build: reading tar index: %w", err)
+			return "", nil, nil, fmt.Errorf("build: reading tar index: %w", err)
 		}
 
 		if !safeTarPath(hdr.Name) {
-			return "", ErrBadPath
+			return "", nil, nil, ErrBadPath
 		}
-		switch filepath.ToSlash(filepath.Clean(hdr.Name)) {
+		clean := filepath.ToSlash(filepath.Clean(hdr.Name))
+		switch clean {
 		case "Containerfile":
 			found["Containerfile"] = true
 		case "Dockerfile":
 			found["Dockerfile"] = true
+		case "basepod.yaml", "basepod.yml":
+			// basepod.yaml wins if both are present, same "preferred name
+			// wins" rule as Containerfile-vs-Dockerfile above.
+			if manifestName == "basepod.yaml" {
+				continue
+			}
+			if hdr.Size > maxManifestSize {
+				warnings = append(warnings, fmt.Sprintf("%s is larger than %d bytes; ignoring", clean, maxManifestSize))
+				continue
+			}
+			body, readErr := io.ReadAll(tr)
+			if readErr != nil {
+				warnings = append(warnings, fmt.Sprintf("%s: read failed (%v); ignoring", clean, readErr))
+				continue
+			}
+			manifestName = clean
+			manifestBody = body
+		}
+	}
+
+	if manifestBody != nil {
+		parsed, parseWarnings, parseErr := manifest.Parse(bytes.NewReader(manifestBody))
+		if parseErr != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: %v; deploying without manifest defaults", manifestName, parseErr))
+		} else {
+			mf = parsed
+			for _, w := range parseWarnings {
+				warnings = append(warnings, fmt.Sprintf("%s: %s", manifestName, w))
+			}
 		}
 	}
 
 	switch {
 	case found["Containerfile"]:
-		return "Containerfile", nil
+		return "Containerfile", mf, warnings, nil
 	case found["Dockerfile"]:
-		return "Dockerfile", nil
+		return "Dockerfile", mf, warnings, nil
 	default:
-		return "", ErrNoContainerfile
+		return "", nil, nil, ErrNoContainerfile
 	}
 }
 
