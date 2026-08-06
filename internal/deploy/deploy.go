@@ -144,6 +144,12 @@ type Engine struct {
 	// log receives best-effort teardown/bookkeeping errors that must not
 	// fail an otherwise-successful (or already-failed) deploy.
 	log io.Writer
+
+	// wg tracks every background deploy goroutine started by
+	// DeployBuildAsync, so a graceful shutdown (see WaitForBackgroundDeploys)
+	// can give in-flight builds a grace period to finish rather than
+	// abandoning them the instant the process is asked to stop.
+	wg sync.WaitGroup
 }
 
 // New builds an Engine. rootDomain is appended to an app's slug to form
@@ -231,6 +237,111 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 // repeated failed builds would leave one dead tag behind per attempt,
 // forever.
 func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
+	dep, err := e.createBuildDeployment(ctx, app, builder)
+	if err != nil {
+		return dep, err
+	}
+
+	prepared, err := builder.PrepareBuild(gzTar)
+	if err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: build: %w", err))
+	}
+
+	return e.buildAndRollout(ctx, app, dep, prepared, builder)
+}
+
+// asyncBuildTimeout bounds a background tarball build+rollout started by
+// DeployBuildAsync — generous enough to cover the slowest legitimate build
+// plus a full rollout, on a context detached from the triggering HTTP
+// request (which ends the moment its 202 response is written — see
+// DeployBuildAsync's own doc comment). Deliberately the same bound
+// buildTimeout enforces synchronously on the (unused, for this path) tarball
+// request context in internal/api, so a background build gets no more grace
+// than the old synchronous request-bound deploy ever did.
+const asyncBuildTimeout = 60 * time.Minute
+
+// DeployBuildAsync is DeployBuild's asynchronous twin: prepared is a build
+// context builder.PrepareBuild has already spooled and validated
+// SYNCHRONOUSLY by the caller (the API's handleDeployTarball, before ever
+// responding — so a malformed upload still fails fast with the caller's
+// own 413/422, and no deployment row exists at all for a request that
+// never gets past validation).
+//
+// This method itself only does fast, synchronous bookkeeping — create the
+// deployment row, record its build-log path, and mark the app "deploying"
+// (see createBuildDeployment) — before the caller ever sees a response, so
+// the deployment number in its return value is always immediately valid
+// for a caller to act on (e.g. minting a build-log stream token for it).
+// The actual build+rollout is handed off to a background goroutine running
+// on ctx detached from the caller's own cancellation
+// (context.WithoutCancel) with a fresh, generous timeout of its own
+// (asyncBuildTimeout): an HTTP request's context dies the moment its
+// response is written, well before a build can realistically finish.
+//
+// The returned deployment is the freshly created row, always still
+// "deploying" — its terminal status only ever becomes visible later, via
+// GET .../deployments/{n} or the build-log SSE stream (see
+// internal/api.handleGetDeployment / handleDeploymentLog), never as this
+// call's own return value. If bookkeeping itself fails before the
+// goroutine ever starts (e.g. a store write error), the returned error is
+// non-nil and no goroutine is started — prepared is closed either way,
+// never leaked.
+//
+// The background goroutine is tracked in e.wg so a graceful shutdown (see
+// WaitForBackgroundDeploys) can give it a grace period to finish rather
+// than abandoning it mid-build the instant the process is asked to stop.
+func (e *Engine) DeployBuildAsync(ctx context.Context, app *store.App, prepared *build.PreparedBuild, builder *build.Builder) (*store.Deployment, error) {
+	dep, err := e.createBuildDeployment(ctx, app, builder)
+	if err != nil {
+		prepared.Close()
+		return dep, err
+	}
+
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncBuildTimeout)
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		defer cancel()
+		e.buildAndRollout(bgCtx, app, dep, prepared, builder)
+	}()
+
+	return dep, nil
+}
+
+// WaitForBackgroundDeploys blocks until every background deploy goroutine
+// started by DeployBuildAsync has finished, or ctx is done — whichever
+// comes first. Called from internal/server's graceful-shutdown path with a
+// bounded grace period: if that grace period expires with deploys still
+// running, this returns ctx's error and the caller proceeds with shutdown
+// anyway (never blocking it indefinitely) — any deployment row still
+// "deploying" at that point is left for SweepStuckDeployments to reconcile
+// at the next boot.
+func (e *Engine) WaitForBackgroundDeploys(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// createBuildDeployment is the fast, synchronous bookkeeping shared by
+// DeployBuild and DeployBuildAsync: create the deployment row (source
+// "tarball", no image_ref yet), record its build-log path (a pure path
+// computation — see builder.LogPath's doc comment — so it's addressable
+// for live tailing from before the build even starts), and mark the app
+// "deploying". A failure marking the app "deploying" goes through the
+// normal fail() path (the deployment row already exists by that point) and
+// is returned as an error; every other error here (creating the row in the
+// first place) has no deployment row to attach a failure to and is
+// returned as a plain error instead, matching DeployBuild's pre-existing
+// contract.
+func (e *Engine) createBuildDeployment(ctx context.Context, app *store.App, builder *build.Builder) (*store.Deployment, error) {
 	dep, err := e.st.CreateDeploymentFull(app.ID, "", "tarball", "api")
 	if err != nil {
 		return nil, fmt.Errorf("deploy: create deployment: %w", err)
@@ -246,7 +357,23 @@ func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reade
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
 	}
 
-	res, buildErr := builder.BuildManifest(ctx, app.Slug, dep.Number, gzTar)
+	return dep, nil
+}
+
+// buildAndRollout runs prepared (an already spooled+validated build
+// context — see build.Builder.PrepareBuild) through the per-app-locked,
+// semaphore-bounded build (builder.BuildPrepared) and the shared rollout
+// pipeline, for a deployment row (dep) that createBuildDeployment has
+// already created. Shared by DeployBuild (called synchronously, ctx is the
+// caller's own) and DeployBuildAsync's background goroutine (ctx is a
+// detached context with its own timeout — see that method's doc comment).
+//
+// See the former DeployBuild's doc comment (now split across this method
+// and its callers) for the full behavior: applying a basepod.yaml
+// manifest's defaults, recording the built image tag, running the shared
+// rollout, and cleaning up an orphaned build image if the rollout fails.
+func (e *Engine) buildAndRollout(ctx context.Context, app *store.App, dep *store.Deployment, prepared *build.PreparedBuild, builder *build.Builder) (*store.Deployment, error) {
+	res, buildErr := builder.BuildPrepared(ctx, app.Slug, dep.Number, prepared)
 	if buildErr != nil {
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: build: %w", buildErr))
 	}
@@ -1143,6 +1270,99 @@ func (e *Engine) removeOrphanContainer(ctx context.Context, c podman.ContainerIn
 	if err := e.rt.RemoveContainer(ctx, c.ID, true); err != nil {
 		fmt.Fprintf(e.log, "deploy: orphan gc: remove %s: %v\n", c.Name, err)
 	}
+}
+
+// stuckDeploymentError is the message FinishDeployment records for a
+// deployment SweepStuckDeployments marks failed — see that function's doc
+// comment.
+const stuckDeploymentError = "basepod restarted while this deployment was still in progress"
+
+// SweepStuckDeployments marks failed every deployment still "deploying" at
+// boot whose (app, deployment-number) generation has no running container —
+// i.e. a deploy whose background goroutine (DeployBuildAsync, or a
+// synchronous Deploy/DeployBuild call) never reached a terminal status
+// because the process died mid-deploy (a crash, or a hard kill past
+// WaitForBackgroundDeploys's graceful-shutdown grace period) rather than
+// finishing or being interrupted cleanly. Without this, such a row — and
+// the app it belongs to, left "deploying" too — would stay stuck forever:
+// nothing else in BasePod ever revisits a "deploying" row once the
+// goroutine that owned it is gone.
+//
+// Called once at boot (see server.Run), right after CleanupOrphans: that
+// ordering matters, since CleanupOrphans may itself remove a stuck
+// deployment's container as an orphan (a container whose generation isn't
+// the app's latest *healthy* deployment — which a still-"deploying" row
+// never is) before this method ever checks whether one is running, so the
+// container-existence check below reflects ground truth *after* orphan GC,
+// not a possibly-stale view from before it.
+//
+// A deployment whose generation DOES have a running container (the rare
+// case: the process died in the narrow window after the container passed
+// its health probe but before FinishDeployment/UpdateAppStatus persisted,
+// and CleanupOrphans didn't remove it) is left alone — the container is
+// fine, and there is nothing to reconcile.
+func (e *Engine) SweepStuckDeployments(ctx context.Context) (int, error) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orphanCleanupTimeout)
+	defer cancel()
+
+	deps, err := e.st.ListDeployingDeployments()
+	if err != nil {
+		return 0, fmt.Errorf("deploy: sweep stuck deployments: list: %w", err)
+	}
+
+	swept := 0
+	for _, dep := range deps {
+		app, err := e.st.AppByID(dep.AppID)
+		if err != nil {
+			fmt.Fprintf(e.log, "deploy: sweep stuck deployments: look up app %d for deployment %d: %v\n", dep.AppID, dep.ID, err)
+			continue
+		}
+
+		containers, err := e.rt.ListContainers(cleanupCtx, map[string]string{
+			"basepod.managed": "true", "basepod.app": app.Slug, "basepod.deployment": strconv.Itoa(dep.Number),
+		})
+		if err != nil {
+			fmt.Fprintf(e.log, "deploy: sweep stuck deployments: list containers for %s: %v\n", app.Slug, err)
+			continue
+		}
+		running := false
+		for _, c := range containers {
+			if c.State == "running" {
+				running = true
+				break
+			}
+		}
+		if running {
+			continue
+		}
+
+		if err := e.st.FinishDeployment(dep.ID, "failed", stuckDeploymentError); err != nil {
+			fmt.Fprintf(e.log, "deploy: sweep stuck deployments: finish deployment %d: %v\n", dep.ID, err)
+			continue
+		}
+		swept++
+
+		// The app's own status must not be left "deploying" forever either
+		// — restore it the same way fail() does for any other mid-deploy
+		// failure: "running" if some other (older, still-healthy)
+		// generation is up, "error" if nothing is.
+		status := "error"
+		appContainers, err := e.rt.ListContainers(cleanupCtx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
+		if err != nil {
+			fmt.Fprintf(e.log, "deploy: sweep stuck deployments: list containers for %s: %v\n", app.Slug, err)
+		} else {
+			for _, c := range appContainers {
+				if c.State == "running" {
+					status = "running"
+					break
+				}
+			}
+		}
+		if err := e.st.UpdateAppStatus(app.ID, status); err != nil {
+			fmt.Fprintf(e.log, "deploy: sweep stuck deployments: update app status for %s: %v\n", app.Slug, err)
+		}
+	}
+	return swept, nil
 }
 
 // latestHealthyDeploymentNumber returns the Number of appID's most
