@@ -1,6 +1,9 @@
 package api
 
-import "net/http"
+import (
+	"log"
+	"net/http"
+)
 
 type systemResponse struct {
 	Version string `json:"version"`
@@ -10,10 +13,18 @@ type systemResponse struct {
 
 // handleSystem reports the running version, container runtime
 // reachability, and total app count.
+//
+// A podman ping failure is reported to the caller as the fixed string
+// "error" (audit finding L5): the underlying error can carry internal
+// infrastructure detail — e.g. the unix socket path podman.Client dials
+// (see internal/podman.socketPath) — that has no business reaching an
+// API client. The actual detail is logged server-side instead, where an
+// operator diagnosing "podman: error" in the dashboard can find it.
 func (a *api) handleSystem(w http.ResponseWriter, r *http.Request) {
 	podmanStatus := "ok"
 	if err := a.ping(r.Context()); err != nil {
-		podmanStatus = "error: " + err.Error()
+		log.Printf("api: podman ping failed: %v", err)
+		podmanStatus = "error"
 	}
 
 	apps, err := a.st.ListApps()

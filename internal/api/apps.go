@@ -544,7 +544,13 @@ func (a *api) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.dep.RemoveApp(r.Context(), app); err != nil {
-		writeError(w, http.StatusBadGateway, "remove_failed", err.Error())
+		// Unlike a deploy/build failure (handleDeploy, handleDeployTarball),
+		// this is a teardown/infrastructure error — container removal
+		// failures from the podman API rather than anything about the
+		// user's own app — so the detail is logged, not relayed (audit
+		// finding L5).
+		log.Printf("api: remove app %s: %v", app.Slug, err)
+		writeError(w, http.StatusBadGateway, "remove_failed", "failed to remove app")
 		return
 	}
 

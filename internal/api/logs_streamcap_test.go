@@ -191,4 +191,3 @@ func TestHandleAppLogsFailedLookupNeverConsumesASlot(t *testing.T) {
 		t.Fatalf("defaultStreamLimiter.perUser[%d] = %d after a failed lookup, want 0 (a 404 must never consume a slot)", user.ID, got)
 	}
 }
-
