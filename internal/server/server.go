@@ -205,14 +205,25 @@ func Run(ctx context.Context, cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("server: load encryption key: %w", err)
 	}
-	decrypt := func(sealed string) (string, error) {
-		return crypto.Open(encKey, sealed)
+	// decrypt/encrypt bind every env value to its owning app's ID and its
+	// own key as AEAD additional-authenticated-data (audit finding L9 —
+	// see crypto.AAD/SealAAD/OpenAAD's doc comments): a ciphertext
+	// relocated onto a different app's row, or a different key within the
+	// same row, then fails to decrypt. decrypt's OpenAAD call falls back
+	// to a legacy no-AAD open for rows sealed before this binding existed
+	// (crypto.Seal, pre-dating this change); every encrypt call re-seals
+	// with the binding, so a legacy row is upgraded the next time
+	// something writes it (internal/api/env.go's PUT handler, or
+	// internal/deploy's manifest env defaults) — a lazy upgrade, not a
+	// migration.
+	decrypt := func(appID int64, key, sealed string) (string, error) {
+		return crypto.OpenAAD(encKey, sealed, crypto.AAD(appID, key))
 	}
-	encrypt := func(plaintext string) (string, error) {
-		return crypto.Seal(encKey, plaintext)
+	encrypt := func(appID int64, key, plaintext string) (string, error) {
+		return crypto.SealAAD(encKey, plaintext, crypto.AAD(appID, key))
 	}
 
-	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt, dashboardRoute)
+	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt, encrypt, dashboardRoute)
 	builder := build.New(pc, cfg.DataDir, maxConcurrentBuilds)
 
 	// Orphan GC: remove containers left behind by a previous crash or

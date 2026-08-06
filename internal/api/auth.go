@@ -27,6 +27,19 @@ type loginResponse struct {
 	User  userResponse `json:"user"`
 }
 
+// verifyDummyLogin is auth.VerifyPassword against the fixed,
+// non-secret auth.DummyHash (see its doc comment) — a package var
+// (rather than a bare call in handleLogin) so tests can substitute a spy
+// to prove the unknown-email login path actually invokes it (see
+// login_timing_test.go). This closes audit finding L1 (login timing
+// enumeration): DummyHash costs argon2 the same m/t/p parameters as a
+// real user's hash, so calling it on the unknown-email path pays the
+// same latency the wrong-password path already pays via
+// auth.VerifyPassword against a real hash — an attacker measuring
+// response time can no longer distinguish "no such user" from "wrong
+// password".
+var verifyDummyLogin = func(pw string) bool { return auth.VerifyPassword(pw, auth.DummyHash) }
+
 // handleLogin verifies email/password, rate-limited per client IP (plus a
 // global ceiling across every IP — see the api struct's limiter/
 // globalLimiter doc comments), and on success issues a new session token
@@ -39,6 +52,12 @@ type loginResponse struct {
 // limiters. A successful login records nothing — an admin who mistypes
 // their password a few times and then gets it right must not find their
 // own next login rate-limited by the success itself.
+//
+// The unknown-email and wrong-password branches are deliberately kept
+// separate (rather than one `err != nil || !VerifyPassword(...)` check)
+// so the unknown-email branch can pay verifyDummyLogin's argon2 cost —
+// see its doc comment for why (audit finding L1) — instead of returning
+// immediately with none of the wrong-password branch's latency.
 func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
 	key := clientIP(r)
 	if a.limiter.Blocked(key) || a.globalLimiter.Blocked(globalLimiterKey) {
@@ -52,7 +71,18 @@ func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := a.st.UserByEmail(req.Email)
-	if err != nil || !auth.VerifyPassword(req.Password, user.PasswordHash) {
+	if err != nil {
+		// Unknown email: pay the same argon2 cost VerifyPassword against a
+		// real hash would (see verifyDummyLogin's doc comment), so this
+		// request's timing can't be distinguished from the wrong-password
+		// branch below.
+		verifyDummyLogin(req.Password)
+		a.limiter.Allow(key)
+		a.globalLimiter.Allow(globalLimiterKey)
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
+		return
+	}
+	if !auth.VerifyPassword(req.Password, user.PasswordHash) {
 		a.limiter.Allow(key)
 		a.globalLimiter.Allow(globalLimiterKey)
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
