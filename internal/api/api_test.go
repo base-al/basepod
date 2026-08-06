@@ -90,17 +90,20 @@ type fakeDeployer struct {
 	deployedImage string
 	removeCalled  bool
 
-	// deployBuildErr, if set, is returned by DeployBuild as-is (after
-	// marking the deployment row it creates "failed") — tests script this
-	// to a *http.MaxBytesError, build.ErrNoContainerfile, or
-	// build.ErrBadPath to exercise handleDeployTarball's error-code
-	// mapping without needing a real build.Builder or an actual
-	// oversized/invalid upload.
-	deployBuildErr error
+	// deployBuildAsyncErr, if set, is returned by DeployBuildAsync as-is
+	// (after marking the deployment row it creates "failed") — simulates a
+	// synchronous bookkeeping failure (e.g. a store write erroring while
+	// marking the app "deploying") that happens before any background
+	// build goroutine would ever start. Unlike the old (pre-issue-#2)
+	// deployBuildErr, this can no longer stand in for a build/validation
+	// failure — those are now caught synchronously by
+	// builder.PrepareBuild, before DeployBuildAsync is ever called (see
+	// deploy_tarball_test.go's real-builder tests for that coverage).
+	deployBuildAsyncErr error
 
-	deployBuildCalled  bool
-	deployBuildBody    []byte // the full gzTar body read, for tests to assert on
-	deployBuildBuilder *build.Builder
+	deployBuildCalled   bool
+	deployBuildPrepared *build.PreparedBuild
+	deployBuildBuilder  *build.Builder
 
 	// rollbackErr, if set, is returned by Rollback as-is (mirroring how
 	// deployErr/deployBuildErr script Deploy/DeployBuild) — tests script
@@ -129,36 +132,41 @@ func (f *fakeDeployer) Deploy(ctx context.Context, app *store.App, imageRef stri
 	return dep, nil
 }
 
-// DeployBuild is a lightweight stand-in for deploy.Engine.DeployBuild: it
-// persists a real deployment row (source "tarball") through the store —
-// like Deploy above, and like the real engine — but never actually
-// builds anything; internal/deploy and internal/build already cover the
-// real build pipeline's own behavior with their own fakes, so this only
-// needs to prove the API layer's plumbing (request -> DeployBuild call ->
-// response/error mapping) is wired correctly.
-func (f *fakeDeployer) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
+// DeployBuildAsync is a lightweight stand-in for
+// deploy.Engine.DeployBuildAsync: it persists a real deployment row
+// (source "tarball") through the store — like Deploy above, and like the
+// real engine's own synchronous bookkeeping half — but never actually
+// builds anything and never finishes the row; internal/deploy and
+// internal/build already cover the real build pipeline's (and the real
+// background goroutine's) own behavior with their own fakes, so this only
+// needs to prove the API layer's plumbing (request -> DeployBuildAsync
+// call -> 202/error mapping) is wired correctly. It always closes
+// prepared, matching the real method's "always takes ownership" contract.
+func (f *fakeDeployer) DeployBuildAsync(ctx context.Context, app *store.App, prepared *build.PreparedBuild, builder *build.Builder) (*store.Deployment, error) {
 	f.deployBuildCalled = true
 	f.deployBuildBuilder = builder
-	body, _ := io.ReadAll(gzTar)
-	f.deployBuildBody = body
+	f.deployBuildPrepared = prepared
+	if prepared != nil {
+		prepared.Close()
+	}
 
 	dep, err := f.st.CreateDeploymentFull(app.ID, "", "tarball", "api")
 	if err != nil {
 		return nil, err
 	}
-	if f.deployBuildErr != nil {
-		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployBuildErr.Error())
-		return nil, f.deployBuildErr
+	if f.deployBuildAsyncErr != nil {
+		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployBuildAsyncErr.Error())
+		return nil, f.deployBuildAsyncErr
 	}
 
-	tag := fmt.Sprintf("localhost/basepod/%s:%d", app.Slug, dep.Number)
 	logPath := fmt.Sprintf("/fake/data/apps/%s/builds/%d.log", app.Slug, dep.Number)
-	_ = f.st.SetDeploymentImage(dep.ID, tag)
 	_ = f.st.SetDeploymentBuildLog(dep.ID, logPath)
-	_ = f.st.FinishDeployment(dep.ID, "healthy", "")
-	dep.Status = "healthy"
-	dep.ImageRef = tag
 	dep.BuildLogPath = logPath
+	// Deliberately left "deploying": the real DeployBuildAsync's own
+	// synchronous half never finishes the row itself — a background
+	// goroutine does, later (see internal/deploy's own tests for that
+	// behavior). A test that needs a terminal state calls
+	// f.st.FinishDeployment directly after asserting the 202 response.
 	return dep, nil
 }
 

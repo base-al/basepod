@@ -265,6 +265,17 @@ async function logsPreflight(slug: string): Promise<void> {
  * with the fraction (0..1) of the file sent so far as the browser
  * streams the request body.
  *
+ * The server spools and validates the upload synchronously (a bad upload
+ * still fails fast with 413/422, handled below exactly like any other
+ * error), but responds 202 Accepted — not 200 — the moment that succeeds,
+ * before the build+rollout even starts (issue #2): the returned Deployment
+ * is therefore always still "deploying". The `xhr.status >= 200 && < 300`
+ * check below already treats 202 as success like any other 2xx, so no
+ * status-code branching is needed here; callers (NewApp.vue) just navigate
+ * to the app detail page with the (already-valid) deployment number, whose
+ * own polling/build-log-stream UI (AppDetail.vue, BuildLogPanel.vue)
+ * handles an in-flight "deploying" row the same way it always has.
+ *
  * Mirrors requestRaw's auth-header injection, 401 interception, and
  * {"error":{code,message}} envelope parsing, but can't reuse it directly
  * since requestRaw is fetch-based. Also note the request body here is

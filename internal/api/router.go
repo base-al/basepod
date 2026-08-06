@@ -29,13 +29,22 @@ import (
 // satisfies this interface; see the compile-time assertion in api_test.go.
 type Deployer interface {
 	Deploy(ctx context.Context, app *store.App, imageRef string) (*store.Deployment, error)
-	// DeployBuild runs a tarball-sourced deploy: gzTar is the raw gzipped
-	// tar upload body, and builder is the shared build pipeline
-	// (internal/build.Builder) handleDeployTarball hands every call —
-	// passed per-call rather than baked into the Deployer at construction
-	// so the API layer owns configuring build concurrency without
-	// changing deploy.New's signature.
-	DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error)
+	// DeployBuildAsync runs a tarball-sourced deploy asynchronously:
+	// prepared is a build context handleDeployTarball has already spooled
+	// and validated synchronously (via builder.PrepareBuild) before ever
+	// calling this — so a malformed upload still fails fast with its own
+	// 413/422 before a deployment row exists — and builder is the shared
+	// build pipeline (internal/build.Builder), passed per-call rather than
+	// baked into the Deployer at construction so the API layer owns
+	// configuring build concurrency without changing deploy.New's
+	// signature. This method itself only does fast, synchronous
+	// bookkeeping (create the deployment row, mark the app "deploying")
+	// before returning — the actual build+rollout runs in a background
+	// goroutine on a context detached from ctx, so a caller must never
+	// treat the returned deployment's Status as final; poll GET
+	// .../deployments/{n} or follow the build-log SSE stream instead. See
+	// deploy.Engine.DeployBuildAsync's doc comment for the full contract.
+	DeployBuildAsync(ctx context.Context, app *store.App, prepared *build.PreparedBuild, builder *build.Builder) (*store.Deployment, error)
 	// Rollback redeploys app to an earlier deployment's exact image. See
 	// deploy.Engine.Rollback's doc comment for its typed failure modes
 	// (deploy.ErrRollbackTargetNotFound / ErrRollbackTargetUnhealthy /
@@ -206,6 +215,7 @@ func newRouter(a *api) http.Handler {
 			r.Get("/apps", a.handleListApps)
 			r.Get("/apps/{slug}", a.handleGetApp)
 			r.Patch("/apps/{slug}", a.handlePatchApp)
+			r.Get("/apps/{slug}/deployments/{number}", a.handleGetDeployment)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
 			r.Post("/apps/{slug}/rollback", a.handleRollback)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)

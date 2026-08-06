@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -234,9 +235,17 @@ func (c *Client) Deploy(ctx context.Context, slug, image string) (*Deployment, e
 // DeployTarball uploads a gzipped tar build context (body) for a
 // build-from-source deploy. size sets Content-Length up front (the caller
 // packs to a temp file first specifically so this can avoid chunked
-// transfer encoding). This call blocks for as long as the server takes to
-// build and roll out the new image — c.HTTP has no client-side timeout of
-// its own, matching the server's own long buildTimeout.
+// transfer encoding).
+//
+// The server spools and validates the upload synchronously — so a bad
+// upload (413/422) still fails fast, surfacing here as an *ApiError from
+// c.do exactly like before — but responds 202 Accepted immediately once
+// that succeeds, before the build+rollout even starts (see
+// internal/api.handleDeployTarball). The returned Deployment is therefore
+// always still "deploying": callers follow up with CreateStreamToken +
+// OpenDeploymentLog (to watch it build) and GetDeployment (to poll for a
+// terminal status), rather than trusting this call's own return value —
+// see followDeployment in commands.go, the only caller.
 func (c *Client) DeployTarball(ctx context.Context, slug string, body io.Reader, size int64) (*Deployment, error) {
 	req, err := c.newRequest(ctx, http.MethodPost, "/apps/"+slug+"/deploy/tarball", "application/gzip", body)
 	if err != nil {
@@ -248,6 +257,84 @@ func (c *Client) DeployTarball(ctx context.Context, slug string, body io.Reader,
 		return nil, err
 	}
 	return &out, nil
+}
+
+// GetDeployment fetches a single deployment by number (GET
+// .../deployments/{number}) — the polling half of the async tarball deploy
+// flow: followDeployment (commands.go) calls this in a loop until Status
+// is terminal.
+func (c *Client) GetDeployment(ctx context.Context, slug string, number int) (*Deployment, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/apps/"+slug+"/deployments/"+strconv.Itoa(number), "", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out Deployment
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// StreamToken is the wire shape of a successful POST /stream-token
+// response — see internal/api/stream_token.go's streamTokenResponse.
+type StreamToken struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// CreateBuildLogStreamToken mints a short-lived, single-purpose stream
+// token scoped to exactly one deployment's build log (scope "build_log") —
+// the credential OpenDeploymentLog's ?access_token= needs, matching the
+// same stream-token model the dashboard's SSE connections use (see
+// internal/api/stream_token.go) rather than putting the CLI's own
+// full-authority session token in a URL query string.
+func (c *Client) CreateBuildLogStreamToken(ctx context.Context, slug string, number int) (*StreamToken, error) {
+	n := number
+	body, err := json.Marshal(map[string]any{"scope": "build_log", "slug": slug, "deployment_number": &n})
+	if err != nil {
+		return nil, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/stream-token", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var out StreamToken
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// OpenDeploymentLog opens GET .../deployments/{number}/log, authenticated
+// via a stream token minted by CreateBuildLogStreamToken (as ?access_token=
+// — this route also accepts a bearer session token, but the CLI
+// deliberately uses the same scoped-token model the dashboard does rather
+// than putting its full-authority session token in a URL). The caller owns
+// closing the returned response body and reading it as either an SSE
+// stream (while the deployment is still "deploying" — Content-Type
+// text/event-stream) or a single plain-text body (once it's terminal —
+// Content-Type text/plain): see followDeployment in commands.go, the only
+// caller, for how it tells the two apart.
+func (c *Client) OpenDeploymentLog(ctx context.Context, slug string, number int, streamToken string) (*http.Response, error) {
+	path := "/apps/" + slug + "/deployments/" + strconv.Itoa(number) + "/log?access_token=" + url.QueryEscape(streamToken)
+	req, err := c.newRequest(ctx, http.MethodGet, path, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var er errorResponse
+		if err := json.Unmarshal(body, &er); err == nil && er.Error.Message != "" {
+			return nil, &ApiError{Status: resp.StatusCode, Code: er.Error.Code, Message: er.Error.Message}
+		}
+		return nil, &ApiError{Status: resp.StatusCode, Message: fmt.Sprintf("unexpected response: %s", resp.Status)}
+	}
+	return resp, nil
 }
 
 // Rollback triggers a rollback to an earlier deployment's exact image.

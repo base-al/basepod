@@ -486,6 +486,15 @@ func (s *Store) AppBySlug(slug string) (*App, error) {
 	return scanApp(row)
 }
 
+// AppByID looks up an app by primary key. Returns ErrNotFound if none
+// exists. Used by internal/deploy's SweepStuckDeployments to resolve a
+// stuck deployment row's owning app (a Deployment only carries AppID, not
+// the app's slug — see Deployment's doc comment) at boot.
+func (s *Store) AppByID(id int64) (*App, error) {
+	row := s.db.QueryRow(`SELECT `+appColumns+` FROM apps WHERE id = ?`, id)
+	return scanApp(row)
+}
+
 // ListApps returns all apps ordered by ID.
 func (s *Store) ListApps() ([]App, error) {
 	rows, err := s.db.Query(`SELECT ` + appColumns + ` FROM apps ORDER BY id`)
@@ -673,6 +682,30 @@ func (s *Store) DeploymentByNumber(appID int64, number int) (*Deployment, error)
 		return nil, err
 	}
 	return &d, nil
+}
+
+// ListDeployingDeployments returns every deployment across every app whose
+// Status is "deploying", ordered by app_id then number. Used at boot (see
+// internal/deploy.Engine.SweepStuckDeployments) to find deployments whose
+// background goroutine never reached a terminal status because the
+// process died mid-deploy.
+func (s *Store) ListDeployingDeployments() ([]Deployment, error) {
+	rows, err := s.db.Query(`SELECT ` + deploymentColumns + `
+		FROM deployments WHERE status = 'deploying' ORDER BY app_id, number`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deployments []Deployment
+	for rows.Next() {
+		d, err := scanDeploymentRow(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		deployments = append(deployments, d)
+	}
+	return deployments, rows.Err()
 }
 
 // UpsertEnvVar inserts or updates an environment variable for appID.

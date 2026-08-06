@@ -216,6 +216,116 @@ func (b *Builder) Build(ctx context.Context, slug string, deploymentNumber int, 
 // basepod.yaml in the upload takes effect starting with that very
 // deploy.
 func (b *Builder) BuildManifest(ctx context.Context, slug string, deploymentNumber int, gzTar io.Reader) (Result, error) {
+	prepared, err := b.PrepareBuild(gzTar)
+	if err != nil {
+		return Result{}, err
+	}
+	return b.BuildPrepared(ctx, slug, deploymentNumber, prepared)
+}
+
+// PreparedBuild is a build context that has already been spooled to disk
+// and validated (see PrepareBuild) but not yet built — the split that
+// makes an async tarball deploy possible: the caller (the API's
+// handleDeployTarball) can spool+validate synchronously, so a malformed
+// upload still fails fast with a 413/422 before any deployment row exists,
+// while the actual (slow, lock/semaphore-bounded) build runs later in a
+// background goroutine via BuildPrepared.
+//
+// The zero value is not usable; always construct one via PrepareBuild. The
+// caller owns calling Close (or passing it to BuildPrepared, which does so
+// on its behalf) exactly once — whichever of the two happens first wins;
+// forgetting both leaks the spooled temp file under <dataDir>/builds/.
+type PreparedBuild struct {
+	// spoolPath is the temp file PrepareBuild decompressed gzTar into,
+	// still holding the validated tar's full contents — BuildPrepared
+	// reopens it for the actual build. Close removes it.
+	spoolPath string
+
+	// dockerfile is "Containerfile" or "Dockerfile", whichever validateTar
+	// found (and preferred) at the build context's root.
+	dockerfile string
+
+	// Manifest is the app's basepod.yaml/basepod.yml, parsed from the
+	// build context's root, or nil if none was present (or it failed to
+	// parse — see Warnings in that case). Populated here (rather than only
+	// in Result) so a caller building an async flow — DeployBuildAsync's
+	// synchronous half — can inspect it before the build itself even
+	// starts, if it ever needs to.
+	Manifest *manifest.Manifest
+
+	// Warnings are non-fatal manifest issues, exactly as Result.Warnings
+	// describes — carried here too so BuildPrepared can still write them to
+	// the build log once it exists, even though PrepareBuild ran before
+	// that log file was created.
+	Warnings []string
+}
+
+// Close removes prepared's spooled temp file. Safe to call on a
+// already-closed (or zero) PreparedBuild — os.Remove on a missing path is
+// treated as success, matching every other best-effort cleanup in this
+// package.
+func (p *PreparedBuild) Close() error {
+	if p == nil || p.spoolPath == "" {
+		return nil
+	}
+	err := os.Remove(p.spoolPath)
+	p.spoolPath = ""
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// PrepareBuild decompresses gzTar (a gzipped tar stream — the raw upload
+// body) to a temp file under <dataDir>/builds/ and validates it as a safe
+// build context (see ErrNoContainerfile / ErrBadPath / ErrContextTooLarge)
+// — exactly the synchronous, fast part of what BuildManifest used to do
+// before ever touching the per-app lock or the global build-concurrency
+// semaphore (see BuildPrepared). It does no podman I/O and takes no
+// context.Context: nothing here ever blocks on anything but local disk and
+// gzip/tar decoding, so there is nothing worth being cancelable against.
+//
+// This split is what makes an async tarball deploy possible: a caller (the
+// API's handleDeployTarball) can call this synchronously — so a malformed
+// upload still fails fast with the caller's own 413/422 before a
+// deployment row even exists — and only hand the (potentially slow,
+// lock/semaphore-queued) actual build off to a background goroutine via
+// BuildPrepared.
+//
+// The returned *PreparedBuild owns a spooled temp file; the caller must
+// eventually call its Close (or pass it to BuildPrepared, which does so on
+// its behalf) or the temp file leaks.
+func (b *Builder) PrepareBuild(gzTar io.Reader) (*PreparedBuild, error) {
+	spoolPath, err := b.spool(gzTar)
+	if err != nil {
+		return nil, err
+	}
+
+	dockerfile, mf, warnings, err := validateTar(spoolPath)
+	if err != nil {
+		os.Remove(spoolPath)
+		return nil, err
+	}
+
+	return &PreparedBuild{spoolPath: spoolPath, dockerfile: dockerfile, Manifest: mf, Warnings: warnings}, nil
+}
+
+// BuildPrepared runs a build context already spooled+validated by
+// PrepareBuild through the per-app lock and global build-concurrency
+// semaphore (see the sem/perApp field comments — same serialization
+// BuildManifest always enforced, just starting from a PreparedBuild rather
+// than doing the spool+validate step itself), then drives BuildRuntime to
+// build it into a local image tag while streaming build output to
+// <dataDir>/apps/<slug>/builds/<n>.log. It always consumes prepared: its
+// spooled temp file is removed before this method returns, regardless of
+// outcome — the caller must not use (or re-Close) prepared afterward.
+//
+// See BuildManifest's doc comment for logPath's populated-even-on-failure
+// contract and Result's fields; this method's return value follows the
+// exact same rules.
+func (b *Builder) BuildPrepared(ctx context.Context, slug string, deploymentNumber int, prepared *PreparedBuild) (Result, error) {
+	defer prepared.Close()
+
 	lock := b.appLock(slug)
 	lock.Lock()
 	defer lock.Unlock()
@@ -227,22 +337,7 @@ func (b *Builder) BuildManifest(ctx context.Context, slug string, deploymentNumb
 	}
 	defer func() { <-b.sem }()
 
-	spoolPath, err := b.spool(gzTar)
-	if err != nil {
-		return Result{}, err
-	}
-	// The spool file is a temp artifact this call created for its own use
-	// (tar index validation needs to seek, which an io.Reader upload body
-	// can't do) — removing it here is cleaning up after ourselves, not
-	// touching anything a user owns.
-	defer os.Remove(spoolPath)
-
-	dockerfile, mf, warnings, err := validateTar(spoolPath)
-	if err != nil {
-		return Result{}, err
-	}
-
-	spool, err := os.Open(spoolPath)
+	spool, err := os.Open(prepared.spoolPath)
 	if err != nil {
 		return Result{}, fmt.Errorf("build: reopen spool for build: %w", err)
 	}
@@ -258,7 +353,7 @@ func (b *Builder) BuildManifest(ctx context.Context, slug string, deploymentNumb
 	// zero-config deploy the build log's SSE stream is the user's first
 	// (often only) feedback channel, well before any dashboard manifest
 	// viewer exists.
-	for _, w := range warnings {
+	for _, w := range prepared.Warnings {
 		fmt.Fprintf(logFile, "warning: %s\n", w)
 	}
 
@@ -268,15 +363,15 @@ func (b *Builder) BuildManifest(ctx context.Context, slug string, deploymentNumb
 	sink := newLimitedLogWriter(logFile, b.maxLogBytes)
 
 	imageTag := fmt.Sprintf("localhost/basepod/%s:%d", slug, deploymentNumber)
-	if err := b.rt.BuildImage(ctx, imageTag, dockerfile, spool, sink); err != nil {
+	if err := b.rt.BuildImage(ctx, imageTag, prepared.dockerfile, spool, sink); err != nil {
 		// Matches Build's pre-existing contract: on a BuildImage failure
 		// the tag is deliberately withheld (there is no usable image),
 		// while LogPath/Manifest/Warnings are still returned since the
 		// log file (and whatever it was told about the manifest) exists
 		// regardless of whether the build itself succeeded.
-		return Result{LogPath: logPath, Manifest: mf, Warnings: warnings}, err
+		return Result{LogPath: logPath, Manifest: prepared.Manifest, Warnings: prepared.Warnings}, err
 	}
-	return Result{ImageTag: imageTag, LogPath: logPath, Manifest: mf, Warnings: warnings}, nil
+	return Result{ImageTag: imageTag, LogPath: logPath, Manifest: prepared.Manifest, Warnings: prepared.Warnings}, nil
 }
 
 // spool decompresses gzTar into a fresh temp file under <dataDir>/builds/

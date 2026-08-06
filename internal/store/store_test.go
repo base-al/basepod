@@ -344,6 +344,84 @@ func TestDeploymentByNumberNotFound(t *testing.T) {
 	}
 }
 
+// TestAppByID proves AppByID resolves an app by its primary key (used by
+// internal/deploy's SweepStuckDeployments, which only has a Deployment's
+// AppID to work from) with the exact same fields AppBySlug returns, and
+// ErrNotFound for an unknown id.
+func TestAppByID(t *testing.T) {
+	s := open(t)
+	created, err := s.CreateApp("blog", "nginx:alpine", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.AppByID(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Slug != "blog" || got.ImageRef != "nginx:alpine" || got.Port != 80 {
+		t.Fatalf("AppByID = %+v, want the created app", got)
+	}
+
+	if _, err := s.AppByID(created.ID + 1000); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestListDeployingDeployments proves it returns exactly the deployments
+// (across every app) whose Status is "deploying", ordered by app then
+// number — the boot-sweep query internal/deploy.Engine.SweepStuckDeployments
+// drives.
+func TestListDeployingDeployments(t *testing.T) {
+	s := open(t)
+	app1, err := s.CreateApp("blog", "nginx:alpine", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app2, err := s.CreateApp("shop", "nginx:alpine", 81)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// app1: one healthy (finished), one still deploying.
+	h, err := s.CreateDeployment(app1.ID, "nginx:alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishDeployment(h.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+	stuck1, err := s.CreateDeployment(app1.ID, "nginx:alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// app2: one still deploying.
+	stuck2, err := s.CreateDeployment(app2.ID, "nginx:alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deps, err := s.ListDeployingDeployments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 2 {
+		t.Fatalf("ListDeployingDeployments = %+v, want exactly 2 (the finished one excluded)", deps)
+	}
+	if deps[0].AppID != app1.ID || deps[0].Number != stuck1.Number {
+		t.Fatalf("deps[0] = %+v, want app1's stuck deployment", deps[0])
+	}
+	if deps[1].AppID != app2.ID || deps[1].Number != stuck2.Number {
+		t.Fatalf("deps[1] = %+v, want app2's stuck deployment", deps[1])
+	}
+	for _, d := range deps {
+		if d.Status != "deploying" {
+			t.Fatalf("deps = %+v, every entry must have Status=deploying", deps)
+		}
+	}
+}
+
 func TestUserByEmailNotFound(t *testing.T) {
 	s := open(t)
 	if _, err := s.UserByEmail("nobody@example.com"); err != ErrNotFound {
