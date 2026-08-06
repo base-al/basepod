@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -344,5 +345,173 @@ func TestHandleDeploymentLogSSEStripsCarriageReturn(t *testing.T) {
 	}
 	if strings.Contains(dataLine, "\r") {
 		t.Fatalf("data line still contains a bare \\r: %q", dataLine)
+	}
+}
+
+// TestHandleDeploymentLogQueryTokenAuth proves the build-log route
+// accepts a stream token (minted with scope "build_log" for this exact
+// slug and deployment number) via ?access_token=, the same fallback
+// handleAppLogs offers native EventSource clients.
+func TestHandleDeploymentLogQueryTokenAuth(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	app, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "1.log")
+	if err := os.WriteFile(logPath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeploymentImage(dep.ID, "localhost/basepod/blog:1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	streamTok := mintStreamToken(t, srv, session.Token, streamTokenRequest{Scope: streamScopeBuildLog, Slug: "blog", DeploymentNumber: &dep.Number})
+
+	// No Authorization header — only the query param.
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/apps/blog/deployments/%d/log?access_token=%s", srv.URL, dep.Number, streamTok.Token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "hello\n" {
+		t.Fatalf("body = %q, want %q", body, "hello\n")
+	}
+}
+
+// TestHandleDeploymentLogAppLogsScopedTokenRejected proves a stream token
+// minted with scope "app_logs" cannot open the build-log route, even for
+// the very same app and user — mirrors
+// TestHandleAppLogsBuildLogScopedTokenRejected's opposite direction.
+func TestHandleDeploymentLogAppLogsScopedTokenRejected(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	app, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "1.log")
+	if err := os.WriteFile(logPath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	appLogsTok := mintStreamToken(t, srv, session.Token, streamTokenRequest{Scope: streamScopeAppLogs, Slug: "blog"})
+
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/apps/blog/deployments/%d/log?access_token=%s", srv.URL, dep.Number, appLogsTok.Token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (an app_logs-scoped token must not open the build-log route)", resp.StatusCode)
+	}
+}
+
+// TestHandleDeploymentLogWrongDeploymentNumberRejected proves a stream
+// token minted for one deployment number cannot be used to read a
+// different deployment's build log, even for the same app/user/scope.
+func TestHandleDeploymentLogWrongDeploymentNumberRejected(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	app, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep1, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep2, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "2.log")
+	if err := os.WriteFile(logPath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeploymentBuildLog(dep2.ID, logPath); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	// Token minted for deployment 1, used against deployment 2's log.
+	tok := mintStreamToken(t, srv, session.Token, streamTokenRequest{Scope: streamScopeBuildLog, Slug: "blog", DeploymentNumber: &dep1.Number})
+
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/apps/blog/deployments/%d/log?access_token=%s", srv.URL, dep2.Number, tok.Token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (a token minted for a different deployment number must not work here)", resp.StatusCode)
+	}
+}
+
+// TestHandleDeploymentLogSessionTokenInQueryRejected proves a session
+// token placed in ?access_token= is rejected on the build-log route too
+// (see TestHandleAppLogsSessionTokenInQueryRejected for the container-log
+// route's version of this).
+func TestHandleDeploymentLogSessionTokenInQueryRejected(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	app, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "1.log")
+	if err := os.WriteFile(logPath, []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/apps/blog/deployments/%d/log?access_token=%s", srv.URL, dep.Number, session.Token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (a session token must never authenticate ?access_token=)", resp.StatusCode)
 	}
 }

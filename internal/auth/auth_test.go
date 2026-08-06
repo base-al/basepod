@@ -120,3 +120,20 @@ func TestSessionToken(t *testing.T) {
 		t.Fatal("hash mismatch")
 	}
 }
+
+// TestStreamToken mirrors TestSessionToken for NewStreamToken, and also
+// proves the two token spaces never collide on prefix — a stream token
+// must never be mistakable for (or accepted where BasePod expects) a
+// session token.
+func TestStreamToken(t *testing.T) {
+	tok, hash := NewStreamToken()
+	if !strings.HasPrefix(tok, "bp_stream_") || len(tok) != len("bp_stream_")+48 {
+		t.Fatalf("token shape: %q", tok)
+	}
+	if HashToken(tok) != hash || len(hash) != 64 {
+		t.Fatal("hash mismatch")
+	}
+	if strings.HasPrefix(tok, "bp_sess_") {
+		t.Fatal("stream token must not also look like a session token")
+	}
+}

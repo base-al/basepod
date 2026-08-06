@@ -1009,3 +1009,115 @@ func TestDomainCascadeDelete(t *testing.T) {
 		t.Fatalf("expected 0 domains after app delete, got %d: %+v", len(domains), domains)
 	}
 }
+
+func TestUserByID(t *testing.T) {
+	s := open(t)
+	uid, err := s.CreateUser("a@b.c", "A", "hash", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := s.UserByID(uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Email != "a@b.c" || u.Name != "A" || !u.IsSuperadmin {
+		t.Fatalf("unexpected user: %+v", u)
+	}
+
+	if _, err := s.UserByID(999); err != ErrNotFound {
+		t.Fatalf("unknown id: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestStreamTokenRoundtrip proves a stream token minted for one (scope,
+// slug, deploymentNumber) triple is found by hash with exactly that
+// triple intact, for both the app_logs shape (no deployment number) and
+// the build_log shape (a deployment number set).
+func TestStreamTokenRoundtrip(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+
+	if err := s.CreateStreamToken(uid, "th-logs", "app_logs", "blog", nil, time.Now().Add(5*time.Minute)); err != nil {
+		t.Fatalf("create app_logs token: %v", err)
+	}
+	got, err := s.StreamTokenByHash("th-logs")
+	if err != nil {
+		t.Fatalf("lookup app_logs token: %v", err)
+	}
+	if got.UserID != uid || got.Scope != "app_logs" || got.Slug != "blog" || got.DeploymentNumber != nil {
+		t.Fatalf("unexpected app_logs token: %+v", got)
+	}
+
+	n := int64(3)
+	if err := s.CreateStreamToken(uid, "th-build", "build_log", "blog", &n, time.Now().Add(5*time.Minute)); err != nil {
+		t.Fatalf("create build_log token: %v", err)
+	}
+	got, err = s.StreamTokenByHash("th-build")
+	if err != nil {
+		t.Fatalf("lookup build_log token: %v", err)
+	}
+	if got.Scope != "build_log" || got.DeploymentNumber == nil || *got.DeploymentNumber != 3 {
+		t.Fatalf("unexpected build_log token: %+v (deployment_number=%v)", got, got.DeploymentNumber)
+	}
+}
+
+// TestStreamTokenByHashUnknown proves an unrecognized hash reports
+// ErrNotFound rather than a zero-value token.
+func TestStreamTokenByHashUnknown(t *testing.T) {
+	s := open(t)
+	if _, err := s.StreamTokenByHash("no-such-hash"); err != ErrNotFound {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+// TestStreamTokenExpiry proves an expired stream token is not returned by
+// StreamTokenByHash, mirroring TestSessionExpiry.
+func TestStreamTokenExpiry(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+
+	if err := s.CreateStreamToken(uid, "live", "app_logs", "blog", nil, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateStreamToken(uid, "dead", "app_logs", "blog", nil, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.StreamTokenByHash("live"); err != nil {
+		t.Fatalf("valid stream token rejected: %v", err)
+	}
+	if _, err := s.StreamTokenByHash("dead"); err != ErrNotFound {
+		t.Fatalf("expired stream token accepted: %v", err)
+	}
+}
+
+// TestStreamTokenByHashPrunesExpiredLazily proves StreamTokenByHash's
+// side-effecting prune (see its doc comment) actually deletes expired
+// rows — not just skips them in its own SELECT — by looking up an
+// unrelated live token afterward and confirming
+// PruneExpiredStreamTokens finds nothing left to do.
+func TestStreamTokenByHashPrunesExpiredLazily(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+
+	if err := s.CreateStreamToken(uid, "dead", "app_logs", "blog", nil, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateStreamToken(uid, "live", "app_logs", "blog", nil, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any lookup (even for the live token) sweeps every expired row.
+	if _, err := s.StreamTokenByHash("live"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PruneExpiredStreamTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected the lazy prune in StreamTokenByHash to have already removed the expired row, %d still pruneable", n)
+	}
+}

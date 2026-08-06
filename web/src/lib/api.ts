@@ -126,6 +126,27 @@ export interface PasswordChangeRequest {
   new_password: string
 }
 
+/** Body for POST /stream-token (internal/api/stream_token.go's
+ * streamTokenRequest). scope "app_logs" streams a running app's container
+ * logs (GET .../logs) and must NOT carry deployment_number; scope
+ * "build_log" streams one deployment's build log (GET
+ * .../deployments/{number}/log) and MUST carry deployment_number — see
+ * sse.ts's connect(), the only caller. */
+export interface StreamTokenRequest {
+  scope: 'app_logs' | 'build_log'
+  slug: string
+  deployment_number?: number
+}
+
+/** Response shape of POST /stream-token: a short-lived (5-minute),
+ * single-purpose token good for exactly the (scope, slug,
+ * deployment_number) triple requested, and expires_at (RFC3339) it dies
+ * at. See internal/api/stream_token.go's streamTokenResponse. */
+export interface StreamTokenResponse {
+  token: string
+  expires_at: string
+}
+
 /** Typed error thrown for any non-2xx response, parsed from BasePod's
  * {"error":{"code","message"}} envelope. */
 export class ApiError extends Error {
@@ -416,6 +437,21 @@ export const api = {
     }),
 
   logsPreflight,
+
+  /** Mints a stream token for one SSE connection attempt (internal/api/
+   * stream_token.go's handleCreateStreamToken) — see sse.ts's connect(),
+   * which calls this before every EventSource open, including reconnects
+   * (the token expires in 5 minutes, well short of a long-lived log
+   * view). Throws ApiError with code "validation" (422) for an
+   * incoherent scope/deployment_number combination, or "app_not_found" /
+   * "deployment_not_found" (404) — none of which sse.ts's callers are
+   * expected to hit in practice, since they always pass a scope/slug/
+   * deployment matching a page that already loaded successfully. */
+  mintStreamToken: (payload: StreamTokenRequest) =>
+    request<StreamTokenResponse>('/stream-token', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   /** Fetches a finished deployment's full build log as plain text (see
    * GET .../deployments/{number}/log in internal/api/logs.go — the
