@@ -2,14 +2,19 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/base-al/basepod/internal/store"
+	"github.com/base-al/basepod/web"
 )
 
 // TestRunFailsFastWithoutSetup verifies that Run refuses to start against a
@@ -271,5 +276,97 @@ func TestCheckPodmanVersionUnparseable(t *testing.T) {
 		if err := checkPodmanVersion(v); err == nil {
 			t.Errorf("version %q: expected a parse error, got nil", v)
 		}
+	}
+}
+
+// TestSecurityHeadersOnDashboardAndAPI proves rootHandler's security
+// headers (audit finding M2) land on both halves of the process's single
+// HTTP server: the embedded dashboard (/) and the API (/api/*) alike —
+// the session token in localStorage isn't scoped to either one.
+func TestSecurityHeadersOnDashboardAndAPI(t *testing.T) {
+	apiCalled := false
+	fakeAPI := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := rootHandler(fakeAPI)
+
+	for _, path := range []string{"/", "/api/v1/system"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			h := rec.Header()
+			if got := h.Get("Content-Security-Policy"); got != cspHeader {
+				t.Errorf("Content-Security-Policy = %q, want %q", got, cspHeader)
+			}
+			if got := h.Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+			}
+			if got := h.Get("Referrer-Policy"); got != "no-referrer" {
+				t.Errorf("Referrer-Policy = %q, want no-referrer", got)
+			}
+			if got := h.Get("X-Frame-Options"); got != "DENY" {
+				t.Errorf("X-Frame-Options = %q, want DENY", got)
+			}
+			if got := h.Get("Strict-Transport-Security"); got != "max-age=31536000" {
+				t.Errorf("Strict-Transport-Security = %q, want max-age=31536000", got)
+			}
+		})
+	}
+	if !apiCalled {
+		t.Error("/api/v1/system did not reach the wrapped API handler")
+	}
+}
+
+// TestSecurityHeadersCSPRejectsInlineUnsafe proves the CSP's script-src
+// never grew 'unsafe-inline' — it must stay exactly 'self' plus the one
+// named hash (see cspScriptHash's doc comment), since that's the whole
+// point of hashing the one legitimate inline script instead of just
+// allowing all inline scripts.
+func TestSecurityHeadersCSPRejectsInlineUnsafe(t *testing.T) {
+	if strings.Contains(cspHeader, "unsafe-inline") {
+		t.Fatalf("cspHeader must never contain 'unsafe-inline': %q", cspHeader)
+	}
+	if !strings.Contains(cspHeader, "script-src 'self' '"+cspScriptHash+"'") {
+		t.Fatalf("cspHeader's script-src does not pin exactly 'self' plus cspScriptHash: %q", cspHeader)
+	}
+}
+
+// TestSecurityHeadersCSPScriptHashMatchesDashboard proves cspScriptHash
+// (server.go) still matches the actual inline <script> block the built
+// dashboard ships (the pre-paint dark/light class flip in
+// web/index.html) — byte for byte, since that's exactly what a browser
+// hashes to check it against CSP's script-src. If index.html's inline
+// script ever changes, this test fails and names the fix: recompute the
+// constant, or move the script to an external same-origin file instead
+// (see cspScriptHash's doc comment for why that's the preferred fix if
+// the script grows past a one-liner).
+//
+// The committed placeholder dist/index.html (see web/embed.go's doc
+// comment — used whenever `make ui` hasn't run) has no inline script at
+// all, so this only has something to check against a real build; CI
+// always builds the frontend before running Go tests (see
+// .github/workflows/ci.yml), so the real assertion still runs there.
+func TestSecurityHeadersCSPScriptHashMatchesDashboard(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	web.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+
+	re := regexp.MustCompile(`(?s)<script>(.*?)</script>`)
+	matches := re.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		t.Skip("no inline <script> in the embedded dashboard (placeholder build — run `make ui`/`npm run build` for a real build)")
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one inline <script> block in index.html, found %d — cspScriptHash and this test need updating for the new script(s)", len(matches))
+	}
+
+	sum := sha256.Sum256([]byte(matches[0][1]))
+	got := "sha256-" + base64.StdEncoding.EncodeToString(sum[:])
+	if got != cspScriptHash {
+		t.Fatalf("dashboard's inline script hash = %s, want %s (cspScriptHash in server.go) — update cspScriptHash to match", got, cspScriptHash)
 	}
 }
