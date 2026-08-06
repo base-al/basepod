@@ -333,6 +333,7 @@ func newRouter(a *api) http.Handler {
 			r.Put("/apps/{slug}/git", a.handlePutGitSource)
 			r.Get("/apps/{slug}/git", a.handleGetGitSource)
 			r.Delete("/apps/{slug}/git", a.handleDeleteGitSource)
+			r.Post("/apps/{slug}/git/rotate-secret", a.handleRotateGitSecret)
 			r.Get("/apps/{slug}/git/deliveries", a.handleListGitDeliveries)
 			r.Post("/apps/{slug}/deploy/git", a.handleDeployGit)
 		})

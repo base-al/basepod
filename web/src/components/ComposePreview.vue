@@ -4,16 +4,13 @@
 // apply" footer is shown) or the result of a real apply (plan.dry_run
 // false, per-service deployment numbers are real and pollable).
 //
-// KNOWN GAP (reported, not silently worked around): the v0.5 milestone
-// brief for this screen asks for each service's image/build ref, named
-// volumes, and env var keys in these cards. internal/api/compose.go's
-// composeServiceResponse — the actual wire shape GET/POST .../compose/up
-// returns — carries only name/slug/action/internal/port/alias/
-// deploy_strategy/deployment_number/warnings; there is no field for
-// image, build context, volumes, or env keys anywhere in the response.
-// Per this task's scope (web/** only, no Go changes), this component
-// renders every field the API actually provides and does not fabricate
-// the rest — see the v0.5 UI report for the full note.
+// Each card renders what the service will actually run — image (or build
+// context for a `build:` service) and named volumes — plus its env var
+// keys, so a reviewer can answer "is this the image I expect, is my
+// database volume attached?" before anything is applied (issue #12).
+// env_keys is exactly that: keys only. The API never sends a value (see
+// internal/api/compose.go's composeServiceResponse doc comment) — this
+// component has no value to render even if it wanted to.
 import type { ComposePlan, ComposeService } from '../lib/api'
 import { hasOrphans, planWarningCount, serviceActionLabel, servicePortLabel } from '../lib/composePreview'
 
@@ -103,6 +100,42 @@ function statusFor(service: ComposeService): string {
           <UBadge v-if="statusFor(service)" color="success" variant="subtle" size="sm" class="font-mono">
             {{ statusFor(service) }}
           </UBadge>
+        </div>
+
+        <!-- What this service will actually run: image (or build context
+             for a `build:` service) and its named volumes — the fields a
+             reviewer needs to check "is this the image I expect, is my
+             database volume attached?" before applying (issue #12). -->
+        <div class="flex flex-col gap-1 rounded-md border border-slate-800/60 bg-slate-900/40 px-2.5 py-2 text-xs">
+          <div v-if="service.image" class="flex min-w-0 items-center gap-1.5">
+            <UIcon name="i-lucide-box" class="size-3.5 shrink-0 text-slate-500" />
+            <span class="truncate font-mono text-emerald-300" :title="service.image">{{ service.image }}</span>
+          </div>
+          <div v-else-if="service.build" class="flex min-w-0 items-center gap-1.5">
+            <UIcon name="i-lucide-hammer" class="size-3.5 shrink-0 text-slate-500" />
+            <span class="truncate font-mono text-emerald-300" :title="service.build.context">
+              build: {{ service.build.context }}
+            </span>
+            <span v-if="service.build.dockerfile" class="shrink-0 truncate font-mono text-slate-500">
+              ({{ service.build.dockerfile }})
+            </span>
+          </div>
+
+          <div v-if="service.volumes?.length" class="flex flex-col gap-0.5">
+            <div v-for="v in service.volumes" :key="v.name" class="flex min-w-0 items-center gap-1.5">
+              <UIcon name="i-lucide-database" class="size-3.5 shrink-0 text-slate-500" />
+              <span class="truncate font-mono text-slate-300">{{ v.name }}</span>
+              <span class="shrink-0 text-slate-600">&rarr;</span>
+              <span class="truncate font-mono text-slate-400" :title="v.path">{{ v.path }}</span>
+            </div>
+          </div>
+
+          <div v-if="service.env_keys?.length" class="flex flex-wrap items-center gap-1 pt-0.5">
+            <UIcon name="i-lucide-key-round" class="size-3.5 shrink-0 text-slate-500" />
+            <UBadge v-for="key in service.env_keys" :key="key" color="neutral" variant="subtle" size="sm" class="font-mono">
+              {{ key }}
+            </UBadge>
+          </div>
         </div>
 
         <ul v-if="service.warnings?.length" class="flex flex-col gap-1">

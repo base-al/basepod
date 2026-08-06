@@ -1,16 +1,18 @@
 <script setup lang="ts">
 // AppDetail's Git tab: connect/manage push-to-deploy (v0.5 Tasks 4/5/9),
-// backed by GET/PUT/DELETE /apps/{slug}/git and GET
-// /apps/{slug}/git/deliveries (internal/api/git.go).
+// backed by GET/PUT/DELETE /apps/{slug}/git, POST
+// /apps/{slug}/git/rotate-secret, and GET /apps/{slug}/git/deliveries
+// (internal/api/git.go).
 //
-// One deliberate deviation from the milestone brief, made to match the
-// REAL shipped API rather than the plan's original sketch: the webhook
-// secret is NOT "shown once on creation" — internal/api/git.go's
-// gitSourceResponse returns it in plaintext from every GET, by design
-// (see that file's doc comment: the operator may need to re-paste it
-// into a forge's webhook settings more than once). This panel reflects
-// that honestly — the secret is visible here whenever this tab is open —
-// rather than pretending a retrieval story the server doesn't implement.
+// The webhook secret is write-only (issue #13): it matches every other
+// secret in this product (env values, the deploy token below it in this
+// same panel) rather than being the one exception. `revealedSecret`
+// holds the plaintext for exactly as long as it's visible in the UI —
+// set the moment a connect/rotate mutation succeeds, cleared when the
+// operator dismisses the "copy this now" banner or navigates away
+// (component unmount resets it; nothing persists it). GET never returns
+// a secret to re-populate it from, by design — see GitSource's doc
+// comment in lib/api.ts.
 import { computed, reactive, ref, watch } from 'vue'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useToast } from '@nuxt/ui/composables'
@@ -89,6 +91,18 @@ const urlValid = computed(() => URL_PATTERN.test(form.url.trim()))
 const branchValid = computed(() => form.branch.trim().length > 0)
 const formValid = computed(() => urlValid.value && branchValid.value)
 
+// revealedSecret holds a just-minted webhook secret's plaintext for
+// exactly as long as it's on screen — set by a successful connect or
+// rotate below, cleared when the operator dismisses the "copy this now"
+// banner (dismissRevealedSecret). Nothing re-fetches it: GET never
+// returns a secret (issue #13), so once cleared, this is the operator's
+// only chance until the next rotate.
+const revealedSecret = ref('')
+
+function dismissRevealedSecret() {
+  revealedSecret.value = ''
+}
+
 const connectMutation = useMutation({
   mutationFn: () =>
     api.putGitSource(props.slug, {
@@ -96,10 +110,11 @@ const connectMutation = useMutation({
       branch: form.branch.trim(),
       token: form.token,
     }),
-  onSuccess: async () => {
+  onSuccess: async (gs) => {
     formError.value = ''
     editing.value = false
     form.token = ''
+    if (gs.secret) revealedSecret.value = gs.secret
     await invalidateGit()
     toast.add({ title: 'Repo connected', description: form.url, color: 'success', icon: 'i-lucide-git-branch' })
   },
@@ -119,21 +134,14 @@ function submitForm() {
 const rotateConfirmOpen = ref(false)
 
 const rotateMutation = useMutation({
-  mutationFn: () => {
-    if (!gitSource.value) throw new Error('no git source')
-    return api.putGitSource(props.slug, {
-      url: gitSource.value.url,
-      branch: gitSource.value.branch,
-      token: '',
-      rotate_secret: true,
-    })
-  },
-  onSuccess: async () => {
+  mutationFn: () => api.rotateGitSecret(props.slug),
+  onSuccess: async (gs) => {
     rotateConfirmOpen.value = false
+    if (gs.secret) revealedSecret.value = gs.secret
     await invalidateGit()
     toast.add({
       title: 'Webhook secret rotated',
-      description: 'Update the secret in your forge’s webhook settings with the new value below.',
+      description: 'Copy the new secret below and update it in your forge’s webhook settings.',
       color: 'success',
       icon: 'i-lucide-key',
     })
@@ -157,6 +165,7 @@ const disconnectMutation = useMutation({
   mutationFn: () => api.deleteGitSource(props.slug),
   onSuccess: async () => {
     disconnectOpen.value = false
+    revealedSecret.value = ''
     await invalidateGit()
     toast.add({ title: 'Repo disconnected', color: 'success', icon: 'i-lucide-unlink' })
   },
@@ -386,21 +395,40 @@ const detectedAccordionValue = computed(() => {
 
             <div>
               <p class="mb-1.5 text-xs text-slate-500">
-                Secret — visible on this page whenever you view it (BasePod doesn't hide it after first connect, since you
-                may need to paste it again). Treat this tab as sensitive.
+                Secret — write-only, same as the access token below. Shown once, right here, the moment it's minted (on
+                connect or rotate); BasePod never returns it again after that.
               </p>
-              <div class="flex items-center gap-2">
-                <span class="min-w-0 flex-1 truncate rounded-md border border-slate-800 bg-slate-900/50 px-3 py-1.5 font-mono text-sm text-slate-200">
-                  {{ gitSource.secret }}
-                </span>
-                <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy secret" @click="copyText(gitSource.secret, 'Webhook secret')" />
+
+              <!-- Just-minted/rotated: the one chance to copy it. -->
+              <div v-if="revealedSecret" class="flex flex-col gap-2 rounded-md border border-emerald-800/60 bg-emerald-950/30 p-3">
+                <p class="flex items-center gap-1.5 text-xs font-medium text-emerald-300">
+                  <UIcon name="i-lucide-eye" class="size-3.5" />
+                  Copy this now — it won't be shown again
+                </p>
+                <div class="flex items-center gap-2">
+                  <span class="min-w-0 flex-1 truncate rounded-md border border-slate-800 bg-slate-900/60 px-3 py-1.5 font-mono text-sm text-emerald-200">
+                    {{ revealedSecret }}
+                  </span>
+                  <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy secret" @click="copyText(revealedSecret, 'Webhook secret')" />
+                </div>
+                <div class="flex justify-end">
+                  <UButton size="xs" color="neutral" variant="ghost" @click="dismissRevealedSecret">Done, hide it</UButton>
+                </div>
+              </div>
+
+              <!-- Steady state: never readable again — rotate to see a new one. -->
+              <div v-else class="flex items-center gap-2">
+                <UBadge color="neutral" variant="subtle" class="gap-1">
+                  <UIcon name="i-lucide-eye-off" class="size-3.5" />
+                  Write-only — not shown
+                </UBadge>
                 <UPopover :open="rotateConfirmOpen" @update:open="(v: boolean) => (rotateConfirmOpen = v)">
                   <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-rotate-cw">Rotate</UButton>
                   <template #content>
                     <div class="flex max-w-64 flex-col gap-2 p-3">
                       <p class="text-xs text-slate-300">
                         Rotate the webhook secret? Any webhook already configured on your forge will need updating with the
-                        new value.
+                        new value shown once here after rotating.
                       </p>
                       <div class="flex justify-end gap-2">
                         <UButton size="xs" color="neutral" variant="ghost" @click="rotateConfirmOpen = false">Cancel</UButton>
