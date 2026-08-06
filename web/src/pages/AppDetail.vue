@@ -16,6 +16,7 @@ import LogViewer from '../components/LogViewer.vue'
 import EnvEditor from '../components/EnvEditor.vue'
 import DomainsPanel from '../components/DomainsPanel.vue'
 import ResourceLimitsPanel from '../components/ResourceLimitsPanel.vue'
+import GitPanel from '../components/GitPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -75,6 +76,7 @@ const tabItems = computed<TabsItem[]>(() => [
     badge: envRedeployRequired.value ? { color: 'warning', variant: 'solid', class: 'h-2 w-2 rounded-full p-0 ring-0' } : undefined,
   },
   { label: 'Domains', value: 'domains' },
+  { label: 'Git', value: 'git' },
   { label: 'Settings', value: 'settings' },
 ])
 
@@ -158,6 +160,16 @@ onMounted(() => {
     void router.replace({ name: 'app-detail', params: { slug: slug.value }, query: {} })
   }
 })
+
+// GitPanel's manual "Deploy now" (POST .../deploy/git) already queued a
+// deployment by the time this fires — switch to the Deployments tab and
+// auto-expand its build-log drawer so the build streams live immediately,
+// the same handoff NewApp.vue's upload flow does via ?buildLog=.
+function onGitDeployed(deploymentNumber: number) {
+  autoExpandDeploymentNumber.value = deploymentNumber
+  activeTab.value = 'deployments'
+  void queryClient.invalidateQueries({ queryKey: ['app', slug.value] })
+}
 
 function deployLatest() {
   // Same guard as the Deploy button's :disabled — also reached from
@@ -389,6 +401,10 @@ const deleteMutation = useMutation({
 
         <div v-else-if="activeTab === 'domains'">
           <DomainsPanel :slug="slug" />
+        </div>
+
+        <div v-else-if="activeTab === 'git'">
+          <GitPanel :slug="slug" @deployed="onGitDeployed" />
         </div>
 
         <div v-else-if="activeTab === 'settings'" class="flex flex-col gap-6">

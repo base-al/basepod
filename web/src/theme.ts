@@ -58,6 +58,31 @@ export const statusStyles: Record<
   failed: { label: 'Failed', color: 'error', dotClass: 'bg-red-400', pulse: false },
 }
 
+/** v0.5's GitDeliveryStatus (see lib/api.ts) — every reason a webhook push
+ * did or didn't trigger a deploy. Styled separately from `statusStyles`
+ * above rather than folded into the same union: a delivery's status is
+ * about "what a push resulted in", not "is this thing currently running",
+ * and several of its members (ignored_branch, coalesced) have no
+ * equivalent app/deployment state at all. */
+export const gitDeliveryStatusStyles: Record<
+  | 'deployed'
+  | 'ignored_branch'
+  | 'ignored_event'
+  | 'invalid_signature'
+  | 'rate_limited'
+  | 'coalesced'
+  | 'error',
+  { label: string; color: 'neutral' | 'warning' | 'success' | 'error'; dotClass: string; pulse: boolean }
+> = {
+  deployed: { label: 'Deployed', color: 'success', dotClass: 'bg-emerald-400', pulse: false },
+  ignored_branch: { label: 'Ignored — wrong branch', color: 'neutral', dotClass: 'bg-slate-400', pulse: false },
+  ignored_event: { label: 'Ignored — not a push', color: 'neutral', dotClass: 'bg-slate-400', pulse: false },
+  invalid_signature: { label: 'Rejected — bad signature', color: 'error', dotClass: 'bg-red-400', pulse: false },
+  rate_limited: { label: 'Rate limited', color: 'warning', dotClass: 'bg-amber-400', pulse: false },
+  coalesced: { label: 'Queued', color: 'warning', dotClass: 'bg-amber-400', pulse: true },
+  error: { label: 'Error', color: 'error', dotClass: 'bg-red-400', pulse: false },
+}
+
 /** localStorage keys used across the app — centralized to avoid typos/drift. */
 export const storageKeys = {
   token: 'basepod.token',
