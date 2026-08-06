@@ -399,6 +399,40 @@ func TestBuildContextCanceledWaitingForSemaphore(t *testing.T) {
 	}
 }
 
+// TestBuildCapsLogOutput proves Build wires the limiting writer (see
+// logcap.go) into the log file it hands BuildImage: a build that streams
+// far more output than Builder.maxLogBytes still succeeds (the BUILD
+// itself is never affected by the cap), but the log file on disk stops
+// growing at the cap and carries the truncation notice exactly once.
+func TestBuildCapsLogOutput(t *testing.T) {
+	dataDir := t.TempDir()
+	// Five lines of 20 bytes each = 100 bytes of build output, well past
+	// a cap shrunk to 10 bytes.
+	line := strings.Repeat("x", 20) + "\n"
+	rt := &fakeRuntime{logLines: []string{line, line, line, line, line}}
+	b := New(rt, dataDir, 2)
+	b.maxLogBytes = 10
+
+	gz := gzipTar(t, []tarEntry{{name: "Containerfile", body: "FROM alpine\n"}})
+
+	_, logPath, err := b.Build(context.Background(), "blog", 1, gz)
+	if err != nil {
+		t.Fatalf("Build: %v (a capped log must never fail the build)", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := line[:10] + logTruncationNotice
+	if string(data) != want {
+		t.Fatalf("log contents = %q, want %q", data, want)
+	}
+	if strings.Count(string(data), "truncated") != 1 {
+		t.Fatalf("log contents = %q, want the truncation notice exactly once", data)
+	}
+}
+
 func fatalIfErrNotContains(t *testing.T, err error, substr string) {
 	t.Helper()
 	if err == nil || !strings.Contains(err.Error(), substr) {

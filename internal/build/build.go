@@ -80,6 +80,14 @@ type Builder struct {
 	// multi-hundred-MiB fixture.
 	maxDecompressedContext int64
 
+	// maxLogBytes bounds how many bytes of build output Build writes to a
+	// build's log file before truncating it (see limitedLogWriter and
+	// defaultMaxLogBytes's doc comment). It's a field — defaulting to
+	// defaultMaxLogBytes in New — rather than a bare constant so tests can
+	// shrink it and exercise the cap without needing a multi-hundred-MiB
+	// fixture.
+	maxLogBytes int64
+
 	// sem bounds the number of builds running concurrently across every
 	// app (maxConcurrent, set by New).
 	sem chan struct{}
@@ -108,9 +116,20 @@ func New(rt BuildRuntime, dataDir string, maxConcurrent int) *Builder {
 		rt:                     rt,
 		dataDir:                dataDir,
 		maxDecompressedContext: defaultMaxDecompressedContext,
+		maxLogBytes:            defaultMaxLogBytes,
 		sem:                    make(chan struct{}, maxConcurrent),
 		perApp:                 make(map[string]*sync.Mutex),
 	}
+}
+
+// DataDir returns the data directory Builder was constructed with (see
+// New) — the same one build logs and spool files live under. Exported
+// solely so the API layer (internal/api/apps.go's delete handler) can
+// derive an app's on-disk data directory without internal/deploy or
+// internal/api needing their own separate copy of BasePod's data-dir
+// configuration.
+func (b *Builder) DataDir() string {
+	return b.dataDir
 }
 
 // appLock returns the (lazily created) mutex serializing builds for slug.
@@ -180,8 +199,13 @@ func (b *Builder) Build(ctx context.Context, slug string, deploymentNumber int, 
 	}
 	defer logFile.Close()
 
+	// Cap how much build output ever reaches disk (see limitedLogWriter):
+	// the BUILD itself is unaffected by the cap — BuildImage's own stream
+	// copy is oblivious to it — only the log stops growing once it's hit.
+	sink := newLimitedLogWriter(logFile, b.maxLogBytes)
+
 	imageTag = fmt.Sprintf("localhost/basepod/%s:%d", slug, deploymentNumber)
-	if err := b.rt.BuildImage(ctx, imageTag, dockerfile, spool, logFile); err != nil {
+	if err := b.rt.BuildImage(ctx, imageTag, dockerfile, spool, sink); err != nil {
 		return "", logPath, err
 	}
 	return imageTag, logPath, nil
