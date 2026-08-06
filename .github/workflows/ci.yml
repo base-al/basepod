@@ -14,11 +14,21 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: cd web && npm ci && npm run build && npm run type-check && npm test
+      # High/critical advisories fail the build; --audit-level=high already
+      # makes npm audit exit 0 when only low/moderate findings exist (e.g.
+      # the esbuild dev-server advisory), so no `|| true` is needed here —
+      # adding one would silence the high/critical findings this step
+      # exists to catch.
+      - run: cd web && npm audit --audit-level=high
       - uses: actions/setup-go@v5
         with: {go-version: 'stable'}
       - run: go vet ./...
       - run: CGO_ENABLED=0 go build ./...
       - run: go test ./... -count=1
+      # Fails the build on any reachable known vulnerability in the Go
+      # standard library or a dependency (see SECURITY.md's "known
+      # limitations" for the last time this was manually swept).
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
   e2e:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
