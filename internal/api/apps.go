@@ -10,8 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -466,12 +466,6 @@ func writeRollbackError(w http.ResponseWriter, err error) {
 // upload isn't bound by a cap sized for JSON payloads.
 const maxTarballBody = 256 << 20 // 256 MiB
 
-// buildTimeout bounds a single tarball deploy request — much longer than
-// deployTimeout, since it also has to decompress the upload and run a
-// full container build before the existing pull-less rollout even
-// starts.
-const buildTimeout = 60 * time.Minute
-
 // gzipContentTypes are the Content-Type header values handleDeployTarball
 // accepts for the raw gzipped-tar upload body.
 var gzipContentTypes = map[string]bool{
@@ -482,15 +476,31 @@ var gzipContentTypes = map[string]bool{
 // handleDeployTarball triggers a build-from-upload deploy: the request
 // body must be a raw gzipped tar (Content-Type application/gzip or
 // application/x-gzip) containing a Containerfile or Dockerfile at its
-// root. It streams the body straight into Deployer.DeployBuild (via
-// a.builder) rather than buffering it itself, bounded by maxTarballBody
-// and buildTimeout regardless of the caller's own timeout.
+// root.
+//
+// Unlike handleDeploy (and unlike this same route before issue #2), this
+// handler does NOT block until the build+rollout finishes. It spools and
+// validates the upload SYNCHRONOUSLY — via a.builder.PrepareBuild, bounded
+// by maxTarballBody — so a bad upload still fails fast with the exact same
+// 413/422 codes it always has; only once that succeeds does it call
+// Deployer.DeployBuildAsync, which creates the deployment row and hands the
+// actual build+rollout off to a background goroutine on a context detached
+// from this request (see deploy.Engine.DeployBuildAsync's doc comment —
+// this request's own context dies the moment the response below is
+// written, long before a real build can finish). The response is 202
+// Accepted with the freshly created (still "deploying") deployment JSON —
+// callers follow up via GET .../deployments/{n} (handleGetDeployment) or
+// the build-log SSE stream (handleDeploymentLog) to learn how it actually
+// turns out.
 //
 // Errors: 400 "invalid_content_type" for a non-gzip Content-Type, 413
-// "request_too_large" if the body exceeds maxTarballBody, 422
-// "no_containerfile"/"bad_path" for a build context that fails
-// validation (see internal/build.ErrNoContainerfile / ErrBadPath), 502
-// "deploy_failed" for any other build/rollout failure.
+// "request_too_large" if the body exceeds maxTarballBody, 413
+// "context_too_large" for a decompressed context over the build pipeline's
+// own cap, 422 "no_containerfile"/"bad_path" for a build context that
+// fails validation (see internal/build.ErrNoContainerfile / ErrBadPath) —
+// all of these are synchronous, pre-deployment-row failures now, detected
+// before DeployBuildAsync is ever called — 502 "deploy_failed" for the
+// (rare) case where even the deployment row's own bookkeeping fails.
 func (a *api) handleDeployTarball(w http.ResponseWriter, r *http.Request) {
 	app, ok := a.appBySlugOrNotFound(w, r)
 	if !ok {
@@ -504,28 +514,35 @@ func (a *api) handleDeployTarball(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxTarballBody)
 
-	ctx, cancel := context.WithTimeout(r.Context(), buildTimeout)
-	defer cancel()
-
-	dep, err := a.dep.DeployBuild(ctx, app, r.Body, a.builder)
+	prepared, err := a.builder.PrepareBuild(r.Body)
 	if err != nil {
-		writeDeployBuildError(w, err)
+		writePrepareBuildError(w, err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
+	// DeployBuildAsync takes ownership of prepared from here on (success or
+	// failure) — it always eventually closes it, so this handler must not.
+	dep, err := a.dep.DeployBuildAsync(r.Context(), app, prepared, a.builder)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "deploy_failed", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, toDeploymentResponse(*dep))
 }
 
-// writeDeployBuildError maps a DeployBuild failure to the documented
-// status/error code: an oversize upload (bodyLimit's *http.MaxBytesError,
-// surfacing here through the io.Copy chain inside the build pipeline
-// rather than a JSON decode) is 413, as is a build context that decompresses
-// past the pipeline's own size cap (build.ErrContextTooLarge — a defense
-// against a small compressed upload expanding into a much larger one, a
-// "gzip bomb"); a build-context validation failure is 422 with a code
-// naming which check failed; anything else is a generic 502
-// "deploy_failed", matching handleDeploy's own catch-all.
-func writeDeployBuildError(w http.ResponseWriter, err error) {
+// writePrepareBuildError maps a builder.PrepareBuild failure — the
+// synchronous spool+validate step handleDeployTarball now runs before a
+// deployment row even exists — to the documented status/error code: an
+// oversize upload (bodyLimit's *http.MaxBytesError, tripped by
+// http.MaxBytesReader during decompression) is 413, as is a build context
+// that decompresses past the pipeline's own size cap
+// (build.ErrContextTooLarge — a defense against a small compressed upload
+// expanding into a much larger one, a "gzip bomb"); a build-context
+// validation failure is 422 with a code naming which check failed;
+// anything else (e.g. the upload not being valid gzip at all) is a generic
+// 502 "deploy_failed", matching handleDeploy's own catch-all.
+func writePrepareBuildError(w http.ResponseWriter, err error) {
 	var maxErr *http.MaxBytesError
 	switch {
 	case errors.As(err, &maxErr):
@@ -539,6 +556,42 @@ func writeDeployBuildError(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusBadGateway, "deploy_failed", err.Error())
 	}
+}
+
+// handleGetDeployment returns a single deployment for polling — the
+// counterpart to the async tarball deploy's 202 response (see
+// handleDeployTarball): a caller mints the deployment number from that
+// response and then polls this route until Status is terminal
+// ("healthy"/"failed"), rather than the old synchronous "block on the HTTP
+// request" contract.
+//
+// Errors: 404 "app_not_found" for an unknown slug (via
+// appBySlugOrNotFound), 400 "invalid_request" if {number} isn't an
+// integer, 404 "deployment_not_found" for a number with no matching
+// deployment on this app.
+func (a *api) handleGetDeployment(w http.ResponseWriter, r *http.Request) {
+	app, ok := a.appBySlugOrNotFound(w, r)
+	if !ok {
+		return
+	}
+
+	number, err := strconv.Atoi(chi.URLParam(r, "number"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "deployment number must be an integer")
+		return
+	}
+
+	dep, err := a.st.DeploymentByNumber(app.ID, number)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "deployment_not_found", "deployment not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal", "failed to look up deployment")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
 }
 
 // handleDeleteApp tears down an app's containers/routes via the Deployer

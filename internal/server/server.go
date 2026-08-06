@@ -43,6 +43,18 @@ var Version = "dev"
 // finish once a shutdown signal arrives.
 const shutdownTimeout = 10 * time.Second
 
+// backgroundDeployGrace bounds how long Run waits, after the HTTP servers
+// themselves have stopped accepting new requests, for any background
+// tarball deploy goroutines (see deploy.Engine.DeployBuildAsync) that were
+// already in flight to finish on their own. It is deliberately much larger
+// than shutdownTimeout — a build can legitimately take minutes, and an
+// abrupt cutoff mid-build is exactly the "silently orphaned" state issue #2
+// set out to avoid — but still bounded: shutdown must never hang
+// indefinitely on a slow or stuck build. A deploy still running when this
+// expires is simply abandoned; its deployment row is left "deploying" for
+// SweepStuckDeployments to reconcile (mark failed) at the next boot.
+const backgroundDeployGrace = 30 * time.Second
+
 // pruneInterval is how often expired sessions are swept from the store.
 // pruneInitialDelay defers the first sweep past boot, so it doesn't
 // compete with the rest of Run's startup work.
@@ -238,6 +250,23 @@ func Run(ctx context.Context, cfgPath string) error {
 		log.Printf("basepod: orphan container cleanup: removed %d orphaned container(s)", removed)
 	}
 
+	// Stuck-deployment sweep: any deployment still "deploying" from a
+	// previous run whose generation has no running container means the
+	// process died mid-deploy (a crash, or a hard kill past
+	// backgroundDeployGrace below) — mark it failed rather than leaving it
+	// (and the app it belongs to) stuck forever. Runs right after orphan
+	// GC, deliberately: CleanupOrphans may itself have just removed that
+	// deployment's container as an orphan, so this sweep's own
+	// no-running-container check reflects ground truth after GC, not a
+	// possibly-stale view from before it (see SweepStuckDeployments's doc
+	// comment). Best-effort, like orphan GC above: a failure here is
+	// logged and boot continues.
+	if swept, err := engine.SweepStuckDeployments(ctx); err != nil {
+		log.Printf("basepod: stuck-deployment sweep: %v", err)
+	} else if swept > 0 {
+		log.Printf("basepod: stuck-deployment sweep: marked %d deployment(s) failed", swept)
+	}
+
 	// Reconcile: the Caddy config file is rebuilt from DB truth on every
 	// boot, rather than trusting whatever current.json happened to
 	// contain from a previous run.
@@ -321,6 +350,20 @@ func Run(ctx context.Context, cfgPath string) error {
 				shutdownErrs = append(shutdownErrs, err)
 			}
 		}
+
+		// Both HTTP servers have now stopped accepting new requests and
+		// finished in-flight ones (or been force-cut at shutdownTimeout) —
+		// give any background tarball builds still running (started by a
+		// request that already got its 202 response and returned) a
+		// further, separate grace period to finish, rather than abandoning
+		// them the instant the HTTP layer itself is done. Never blocks past
+		// backgroundDeployGrace; see its doc comment.
+		graceCtx, graceCancel := context.WithTimeout(context.Background(), backgroundDeployGrace)
+		if err := engine.WaitForBackgroundDeploys(graceCtx); err != nil {
+			log.Printf("basepod: shutdown: background deploy(s) still running after %s grace period — leaving their rows for the next boot's stuck-deployment sweep", backgroundDeployGrace)
+		}
+		graceCancel()
+
 		if err := errors.Join(shutdownErrs...); err != nil {
 			return fmt.Errorf("server: shutdown: %w", err)
 		}
