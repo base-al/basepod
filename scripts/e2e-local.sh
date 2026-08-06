@@ -10,17 +10,20 @@
 # walking-skeleton exit criteria, plus (added in v0.2) env vars (PUT/GET
 # masking, redeploy-injects-into-container via podman inspect), custom
 # domains (POST/DELETE against the rendered Caddy config), log streaming
-# (finite SSE fetch, query-token auth scoped to the logs route only), the
+# (finite SSE fetch, scoped to the logs route only via a short-lived
+# stream token minted through POST /api/v1/stream-token — issue #4 — with
+# the session token itself proven rejected on that same query param), the
 # dashboard's static asset pipeline (hashed asset + immutable
 # Cache-Control), and (added in v0.3) the dashboard being served remotely
 # through Caddy over HTTPS at basepod.<root-domain> (proxied to a unix
 # socket only the bp-caddy container can reach — Linux-first, see README),
-# a tarball build-from-source deploy + its build-log endpoint, rollback
-# (deploy v1, deploy v2, roll back to v1, confirm the content flips back
-# without a rebuild), the basepod CLI binary itself driving that same
-# flow (login/apps/deploy/rollback/env/logs) as a client against the
-# server this script just started, and session logout invalidating its
-# token.
+# a tarball build-from-source deploy + its build-log endpoint (also
+# exercised over both header session-token auth and a minted "build_log"
+# stream token's ?access_token=), rollback (deploy v1, deploy v2, roll
+# back to v1, confirm the content flips back without a rebuild), the
+# basepod CLI binary itself driving that same flow
+# (login/apps/deploy/rollback/env/logs) as a client against the server
+# this script just started, and session logout invalidating its token.
 # Safe to run repeatedly on a dev machine or in CI
 # (GitHub Actions ubuntu-24.04 runner with rootless podman); requires a
 # reachable podman socket (`podman machine start` on macOS,
@@ -390,20 +393,36 @@ if grep -q "${CUSTOM_DOMAIN}" "${CADDY_CONFIG}"; then
 fi
 
 # ---------------------------------------------------------------------------
-# Logs — a finite (follow=0) SSE stream over the query-token auth path
-# must carry the app's own log output; query-token auth must NOT work on
-# any other route.
+# Logs — the full session token is no longer accepted as a query-string
+# ?access_token= on the logs route (issue #4: the SSE routes now demand a
+# short-lived, single-purpose stream token minted via
+# POST /api/v1/stream-token, scoped to exactly this app + scope). A finite
+# (follow=0) SSE stream fetched with a freshly-minted "app_logs" stream
+# token must carry the app's own log output; the session token itself must
+# now be REJECTED (401) on that same query param — the whole point of this
+# change — and query-token auth generally must still NOT work on any other
+# route.
 # ---------------------------------------------------------------------------
 log "curling the app to generate a log line..."
 curl -sk --max-time 5 \
 	--resolve "${SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
 	"https://${SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}/" >/dev/null 2>&1 || true
 
-log "fetching a finite (follow=0) log stream..."
+log "minting a stream token scoped to '${SLUG}' app logs..."
+logs_stream_token_resp=$(auth_curl -X POST "${API_BASE}/api/v1/stream-token" \
+	-d "{\"scope\":\"app_logs\",\"slug\":\"${SLUG}\"}")
+LOGS_STREAM_TOKEN=$(printf '%s' "${logs_stream_token_resp}" | jq -r '.token // empty')
+[ -n "${LOGS_STREAM_TOKEN}" ] || fail "mint app_logs stream token failed: ${logs_stream_token_resp}"
+
+log "fetching a finite (follow=0) log stream using the minted stream token..."
 logs_output=$(curl -sN --max-time 15 \
-	"${API_BASE}/api/v1/apps/${SLUG}/logs?follow=0&tail=50&access_token=${TOKEN}")
+	"${API_BASE}/api/v1/apps/${SLUG}/logs?follow=0&tail=50&access_token=${LOGS_STREAM_TOKEN}")
 printf '%s' "${logs_output}" | grep -q '^event: log$' || fail "logs stream missing an 'event: log' line: ${logs_output}"
 printf '%s' "${logs_output}" | grep -q '"stream"' || fail "logs stream missing a data line with a stream field: ${logs_output}"
+
+log "verifying the SESSION token is now rejected as ?access_token= on the logs route..."
+session_token_on_logs_code=$(http_code "${API_BASE}/api/v1/apps/${SLUG}/logs?follow=0&tail=1&access_token=${TOKEN}")
+[ "${session_token_on_logs_code}" = "401" ] || fail "expected the logs route with the session token as ?access_token= to be 401, got ${session_token_on_logs_code}"
 
 log "verifying query-token auth is rejected outside the logs route..."
 apps_query_token_code=$(http_code "${API_BASE}/api/v1/apps?access_token=${TOKEN}")
@@ -471,6 +490,24 @@ buildlog1_body=$(printf '%s' "${buildlog1_raw}" | sed '$d')
 [ "${buildlog1_code}" = "200" ] || fail "build log: expected 200, got ${buildlog1_code}: ${buildlog1_body}"
 [ -n "${buildlog1_body}" ] || fail "build log: unexpectedly empty"
 printf '%s' "${buildlog1_body}" | grep -qE 'COMMIT|busybox' || fail "build log missing expected build output (COMMIT/busybox pull lines): ${buildlog1_body}"
+
+log "minting a stream token scoped to '${BUILD_SLUG}' deployment 1's build log..."
+buildlog_stream_token_resp=$(auth_curl -X POST "${API_BASE}/api/v1/stream-token" \
+	-d "{\"scope\":\"build_log\",\"slug\":\"${BUILD_SLUG}\",\"deployment_number\":1}")
+BUILDLOG_STREAM_TOKEN=$(printf '%s' "${buildlog_stream_token_resp}" | jq -r '.token // empty')
+[ -n "${BUILDLOG_STREAM_TOKEN}" ] || fail "mint build_log stream token failed: ${buildlog_stream_token_resp}"
+
+log "fetching the build log for deployment 1 via the minted stream token's ?access_token=..."
+buildlog1_query_raw=$(curl -s -w '\n%{http_code}' --max-time 10 \
+	"${API_BASE}/api/v1/apps/${BUILD_SLUG}/deployments/1/log?access_token=${BUILDLOG_STREAM_TOKEN}")
+buildlog1_query_code=$(printf '%s' "${buildlog1_query_raw}" | tail -n1)
+buildlog1_query_body=$(printf '%s' "${buildlog1_query_raw}" | sed '$d')
+[ "${buildlog1_query_code}" = "200" ] || fail "build log via stream token: expected 200, got ${buildlog1_query_code}: ${buildlog1_query_body}"
+[ "${buildlog1_query_body}" = "${buildlog1_body}" ] || fail "build log via stream token: body did not match the header-authed fetch"
+
+log "verifying the SESSION token is rejected as ?access_token= on the build-log route..."
+session_token_on_buildlog_code=$(http_code "${API_BASE}/api/v1/apps/${BUILD_SLUG}/deployments/1/log?access_token=${TOKEN}")
+[ "${session_token_on_buildlog_code}" = "401" ] || fail "expected the build-log route with the session token as ?access_token= to be 401, got ${session_token_on_buildlog_code}"
 
 # ---------------------------------------------------------------------------
 # Rollback — a second tarball deploy (v2) must cut traffic over, and

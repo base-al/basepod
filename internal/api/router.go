@@ -174,7 +174,15 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(a
 		logs:          logs,
 		builder:       builder,
 	}
+	return newRouter(a)
+}
 
+// newRouter mounts every route onto a pre-built *api. Split out of New so
+// tests in this package can construct an *api directly (e.g. to inject a
+// fake clock into a.globalLimiter — see login_ratelimit_test.go's
+// newTrustedTestServerWithClock) and mount the exact same route table New
+// itself uses, rather than a hand-maintained duplicate that could drift.
+func newRouter(a *api) http.Handler {
 	r := chi.NewRouter()
 	r.Route("/api/v1", func(r chi.Router) {
 		// bodyLimit is applied per-group (here, and again below) rather
@@ -192,6 +200,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(a
 			r.Get("/auth/sessions", a.handleListSessions)
 			r.Delete("/auth/sessions/{id}", a.handleDeleteSession)
 			r.Post("/auth/password", a.handleChangePassword)
+			r.Post("/stream-token", a.handleCreateStreamToken)
 			r.Get("/system", a.handleSystem)
 			r.Post("/apps", a.handleCreateApp)
 			r.Get("/apps", a.handleListApps)
@@ -216,16 +225,16 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(a
 			r.Post("/apps/{slug}/deploy/tarball", a.handleDeployTarball)
 		})
 
-		// The logs route gets its own auth middleware rather than
-		// requireAuth: native EventSource cannot set an Authorization
-		// header, so this route (and only this route, plus the build-log
-		// route below — same reasoning) also accepts the session token via
-		// ?access_token=. See requireAuthLogs.
-		r.Group(func(r chi.Router) {
-			r.Use(a.requireAuthLogs)
-			r.Get("/apps/{slug}/logs", a.handleAppLogs)
-			r.Get("/apps/{slug}/deployments/{number}/log", a.handleDeploymentLog)
-		})
+		// The two SSE routes get their own, route-specific auth
+		// middleware rather than requireAuth: native EventSource cannot
+		// set an Authorization header, so each also accepts a stream
+		// token via ?access_token= — scoped to exactly this route (see
+		// requireAuthAppLogs/requireAuthBuildLog in stream_token.go, and
+		// handleCreateStreamToken for how that token is minted). A
+		// session token in ?access_token= is rejected on both routes —
+		// only the header form accepts one, same as everywhere else.
+		r.With(a.requireAuthAppLogs).Get("/apps/{slug}/logs", a.handleAppLogs)
+		r.With(a.requireAuthBuildLog).Get("/apps/{slug}/deployments/{number}/log", a.handleDeploymentLog)
 	})
 	return r
 }
@@ -237,9 +246,9 @@ type userContextKey struct{}
 // validateToken resolves a raw session token (however it was transported)
 // into its *store.User via the session-hash lookup, or reports false if
 // the token is missing/unknown/expired. Shared by requireAuth and
-// requireAuthLogs so their validation logic — which must stay identical,
-// a query token being an alternate transport for the same credential, not
-// a weaker one — can't silently drift apart.
+// requireAuthSSE (see stream_token.go) so their header-token validation
+// logic — which must stay identical, a header being the one transport
+// every authenticated route accepts — can't silently drift apart.
 func (a *api) validateToken(token string) (*store.User, bool) {
 	if token == "" {
 		return nil, false
@@ -261,8 +270,8 @@ const bearerPrefix = "bearer "
 // header, matching the "Bearer" scheme case-insensitively (see
 // bearerPrefix) while leaving the token itself — everything after the
 // scheme and the single space — untouched, byte for byte. Shared by
-// requireAuth and requireAuthLogs so their token-extraction logic can't
-// silently drift apart.
+// requireAuth and requireAuthSSE (see stream_token.go) so their
+// token-extraction logic can't silently drift apart.
 func bearerToken(header string) (string, bool) {
 	if len(header) < len(bearerPrefix) || !strings.EqualFold(header[:len(bearerPrefix)], bearerPrefix) {
 		return "", false
@@ -279,43 +288,6 @@ func (a *api) requireAuth(next http.Handler) http.Handler {
 		token, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok || token == "" {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization header")
-			return
-		}
-
-		user, ok := a.validateToken(token)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired session")
-			return
-		}
-
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
-	})
-}
-
-// requireAuthLogs is requireAuth's variant for the log-streaming route
-// only: native EventSource cannot set request headers, so a browser
-// client has no way to send "Authorization: Bearer <token>" when opening
-// the stream. This middleware therefore also accepts the session token as
-// a ?access_token= query parameter, tried only after the Authorization
-// header comes up empty (so a valid header always wins over a query
-// token, bogus or not — see TestHandleAppLogsBearerPrecedenceOverQueryToken
-// in logs_test.go), and validated through the exact same validateToken
-// helper requireAuth uses.
-//
-// This fallback is deliberately wired to this one route (see the router
-// group above) rather than folded into requireAuth: query strings end up
-// in access logs, browser history, and Referer headers far more readily
-// than headers do, so every other endpoint should keep requiring the
-// header. The token itself is never logged or echoed back by this
-// middleware or handleAppLogs's error paths.
-func (a *api) requireAuthLogs(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, ok := bearerToken(r.Header.Get("Authorization"))
-		if !ok || token == "" {
-			token = r.URL.Query().Get("access_token")
-		}
-		if token == "" {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization")
 			return
 		}
 

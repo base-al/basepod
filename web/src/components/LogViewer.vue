@@ -7,8 +7,10 @@
 // friendly panel instead of a silent, endlessly-reconnecting stream),
 // and only once that succeeds does sse.connect() open the actual
 // long-lived stream. Neither the preflight nor the stream URL is ever
-// logged or surfaced in an error message — the stream URL carries the
-// session token as ?access_token=.
+// logged or surfaced in an error message — the stream URL carries a
+// short-lived, single-purpose stream token (minted by sse.connect()
+// itself, re-minted on every reconnect) as ?access_token=, never the
+// page's own session token.
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { api, ApiError, BASE_URL } from '../lib/api'
@@ -81,18 +83,23 @@ function buildStreamURL() {
 }
 
 function startStream() {
-  connection = connect(buildStreamURL(), {
-    events: ['log'],
-    // follow=0 asks the server for a finite tail that ends on its own;
-    // EventSource reports that completion identically to a dropped
-    // connection, so retrying it would just re-fetch the same lines in a
-    // loop. Only a follow=1 stream — meant to stay open — should reconnect.
-    retry: follow.value,
-    onEvent: handleEvent,
-    onStateChange: (state) => {
-      connectionState.value = state
+  connection = connect(
+    buildStreamURL(),
+    { scope: 'app_logs', slug: props.slug },
+    {
+      events: ['log'],
+      // follow=0 asks the server for a finite tail that ends on its own;
+      // EventSource reports that completion identically to a dropped
+      // connection, so retrying it would just re-fetch the same lines in
+      // a loop. Only a follow=1 stream — meant to stay open — should
+      // reconnect.
+      retry: follow.value,
+      onEvent: handleEvent,
+      onStateChange: (state) => {
+        connectionState.value = state
+      },
     },
-  })
+  )
 }
 
 function stopStream() {

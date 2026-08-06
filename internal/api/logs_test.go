@@ -7,11 +7,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/base-al/basepod/internal/auth"
 	"github.com/base-al/basepod/internal/deploy"
 	"github.com/base-al/basepod/internal/store"
 )
@@ -381,9 +383,28 @@ func loginOnly(t *testing.T, st *store.Store) (*http.Response, loginResponse) {
 	return login(t, srv, testPassword)
 }
 
+// mintStreamToken calls POST /api/v1/stream-token (authenticated with
+// sessionToken) and returns the decoded response, failing the test if the
+// mint itself didn't succeed. Test helper shared by every test in this
+// file (and stream_token_test.go) that needs a real stream token rather
+// than a session token or garbage string in ?access_token=.
+func mintStreamToken(t *testing.T, srv *httptest.Server, sessionToken string, req streamTokenRequest) streamTokenResponse {
+	t.Helper()
+	var out streamTokenResponse
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/stream-token", sessionToken, req, &out)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mint stream token: status = %d, want 200", resp.StatusCode)
+	}
+	if out.Token == "" {
+		t.Fatal("mint stream token: got empty token")
+	}
+	return out
+}
+
 // TestHandleAppLogsQueryTokenAuth proves the logs endpoint accepts a valid
-// session token passed as ?access_token=, the fallback native EventSource
-// needs since it cannot set an Authorization header.
+// stream token (minted via POST /stream-token with scope "app_logs" for
+// this exact slug) passed as ?access_token=, the fallback native
+// EventSource needs since it cannot set an Authorization header.
 func TestHandleAppLogsQueryTokenAuth(t *testing.T) {
 	st := newTestStore(t)
 	createTestApp(t, st)
@@ -393,11 +414,12 @@ func TestHandleAppLogsQueryTokenAuth(t *testing.T) {
 	}
 	srv := newTestServerWithLogs(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{}, logsFn)
 	_, session := login(t, srv, testPassword)
-	token := session.Token
+
+	streamTok := mintStreamToken(t, srv, session.Token, streamTokenRequest{Scope: streamScopeAppLogs, Slug: "blog"})
 
 	// No Authorization header at all — only the query param, exactly as a
 	// browser's native EventSource would connect.
-	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=" + token)
+	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=" + streamTok.Token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,28 +429,132 @@ func TestHandleAppLogsQueryTokenAuth(t *testing.T) {
 	}
 }
 
-// TestHandleAppLogsQueryTokenRejectedElsewhere proves the ?access_token=
-// fallback is wired to the logs route only: a query token that would
-// authenticate /logs must not authenticate any other endpoint, since
-// query strings leak into access logs, browser history, and Referer
-// headers far more readily than headers do.
-func TestHandleAppLogsQueryTokenRejectedElsewhere(t *testing.T) {
+// TestHandleAppLogsSessionTokenInQueryRejected proves a session token
+// placed in ?access_token= is now rejected (401), not accepted the way it
+// was before stream tokens existed (audit finding M4: the query string is
+// visible in devtools/HAR exports, so it must never carry a token with
+// the session's full 30-day account authority).
+func TestHandleAppLogsSessionTokenInQueryRejected(t *testing.T) {
 	st := newTestStore(t)
+	createTestApp(t, st)
 	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
 	_, session := login(t, srv, testPassword)
-	token := session.Token
 
-	resp, err := http.Get(srv.URL + "/api/v1/apps?access_token=" + token)
+	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=" + session.Token)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (query token must not authenticate non-logs routes)", resp.StatusCode)
+		t.Fatalf("status = %d, want 401 (a session token must never authenticate ?access_token=)", resp.StatusCode)
 	}
 }
 
-// TestHandleAppLogsBearerPrecedenceOverQueryToken proves requireAuthLogs's
+// TestHandleAppLogsStreamTokenWrongSlugRejected proves a stream token
+// minted for one app cannot open a different app's log stream, even
+// though both are the same user and the same scope.
+func TestHandleAppLogsStreamTokenWrongSlugRejected(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st) // "blog"
+	if _, err := st.CreateApp("other", "nginx:v1", 80); err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	streamTok := mintStreamToken(t, srv, session.Token, streamTokenRequest{Scope: streamScopeAppLogs, Slug: "other"})
+
+	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=" + streamTok.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (a stream token minted for a different app must not work here)", resp.StatusCode)
+	}
+}
+
+// TestHandleAppLogsBuildLogScopedTokenRejected proves a stream token
+// minted with scope "build_log" cannot open the container-log route, even
+// for the very same app and user — the two SSE routes are entirely
+// separate credentials, not one token good for either.
+func TestHandleAppLogsBuildLogScopedTokenRejected(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	app, err := st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	buildTok := mintStreamToken(t, srv, session.Token, streamTokenRequest{Scope: streamScopeBuildLog, Slug: "blog", DeploymentNumber: &dep.Number})
+
+	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=" + buildTok.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (a build_log-scoped token must not open the container-log route)", resp.StatusCode)
+	}
+}
+
+// TestHandleAppLogsExpiredStreamTokenRejected proves a stream token whose
+// expiry has already passed is rejected exactly like an unknown one,
+// rather than any grace period being applied.
+func TestHandleAppLogsExpiredStreamTokenRejected(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	uid, err := st.UserByEmail("admin@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	token, hash := auth.NewStreamToken()
+	if err := st.CreateStreamToken(uid.ID, hash, streamScopeAppLogs, "blog", nil, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	resp, err := http.Get(srv.URL + "/api/v1/apps/blog/logs?access_token=" + token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestHandleAppLogsQueryTokenRejectedElsewhere proves the ?access_token=
+// fallback is wired to the two SSE routes only: a stream token that would
+// authenticate /logs must not authenticate any other endpoint, since
+// query strings leak into access logs, browser history, and Referer
+// headers far more readily than headers do.
+func TestHandleAppLogsQueryTokenRejectedElsewhere(t *testing.T) {
+	st := newTestStore(t)
+	createTestApp(t, st)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	streamTok := mintStreamToken(t, srv, session.Token, streamTokenRequest{Scope: streamScopeAppLogs, Slug: "blog"})
+
+	resp, err := http.Get(srv.URL + "/api/v1/apps?access_token=" + streamTok.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (query token must not authenticate non-SSE routes)", resp.StatusCode)
+	}
+}
+
+// TestHandleAppLogsBearerPrecedenceOverQueryToken proves requireAuthSSE's
 // "header first, else query" ordering holds even when both are present: a
 // valid Authorization header authenticates the request regardless of what
 // (if anything) garbage sits in ?access_token=, since a real client only

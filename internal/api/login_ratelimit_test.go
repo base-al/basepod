@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/base-al/basepod/internal/store"
 )
@@ -67,6 +68,35 @@ func TestClientIP(t *testing.T) {
 func newTrustedTestServer(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(TrustedProxyMiddleware(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, unusedLogSource, nil)))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// newTrustedTestServerWithClock is newTrustedTestServer's clock-injectable
+// twin: it builds the *api by hand (rather than through New, which always
+// wires both rate limiters to the real time.Now) and overrides
+// globalLimiter's nowFunc with clock before mounting the router, so a test
+// can drive the global failed-login ceiling's trailing window explicitly
+// instead of racing the real wall clock across many sequential HTTP round
+// trips — see TestHandleLoginGlobalCeilingTrips, the one test that needs
+// this (everywhere else, newTrustedTestServer's real-clock version is
+// fine).
+func newTrustedTestServerWithClock(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, clock func() time.Time) *httptest.Server {
+	t.Helper()
+	a := &api{
+		st:            st,
+		dep:           dep,
+		ping:          fakePinger(nil),
+		version:       "test-version",
+		limiter:       newRateLimiter(loginRateLimit, loginRateWindow),
+		globalLimiter: newRateLimiter(globalLoginRateLimit, loginRateWindow),
+		seal:          testSeal,
+		open:          testOpen,
+		routes:        routes,
+		logs:          unusedLogSource,
+	}
+	a.globalLimiter.nowFunc = clock
+	srv := httptest.NewServer(TrustedProxyMiddleware(newRouter(a)))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -199,17 +229,26 @@ func TestHandleLoginSuccessDoesNotConsumeRateLimit(t *testing.T) {
 // admin with a wrong password: handleLogin's credential check
 // short-circuits UserByEmail's "not found" before ever reaching
 // auth.VerifyPassword's argon2 hashing (see auth.go), so
-// globalLoginRateLimit sequential requests stay fast and — more
-// importantly — stay well inside loginRateWindow's real 1-minute wall
-// clock. (a.globalLimiter runs on the real clock here, not an injected
-// one — see TestRateLimiterGlobalCeilingTripsAndRecovers for the
-// clock-independent version of this same trip/recover behavior.) Using
-// the slow argon2 path here risked the earliest attempts aging back out
-// of the window before the last one was even sent, especially under
-// `go test -race`, making the test flaky rather than wrong.
+// globalLoginRateLimit sequential requests stay fast even on a loaded
+// runner.
+//
+// It also drives a.globalLimiter through an injected clock (via
+// newTrustedTestServerWithClock) rather than the real one: this is an
+// HTTP-level test making globalLoginRateLimit-plus-one real round trips
+// through httptest, and under `go test -race` that was slow enough
+// (60-70s observed for 101 requests, against loginRateWindow's real
+// 1-minute window) that the earliest attempts could age back out of the
+// window before the last one was even sent — intermittently sinking the
+// very ceiling this test exists to prove, exactly the kind of flake a
+// rate-limit test must not have. Freezing the clock at a fixed instant
+// for the whole run removes wall-clock speed from the equation entirely.
+// See TestRateLimiterGlobalCeilingTripsAndRecovers for the same
+// trip/recover behavior exercised directly against *rateLimiter, without
+// any HTTP in the loop.
 func TestHandleLoginGlobalCeilingTrips(t *testing.T) {
 	st := newTestStore(t)
-	srv := newTrustedTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	frozen := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	srv := newTrustedTestServerWithClock(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{}, func() time.Time { return frozen })
 
 	for i := 0; i < globalLoginRateLimit; i++ {
 		email := fmt.Sprintf("nobody-%d@example.com", i)

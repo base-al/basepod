@@ -696,6 +696,85 @@ func TestMigrationDefaultsApplyToExistingApp(t *testing.T) {
 	}
 }
 
+// TestAllMigrationsApplyCleanly guards against the exact failure class this
+// integration hit: two migrations racing for the same goose sequence number
+// (both feat/stream-tokens and fix/alias-namespace originally shipped a
+// 00005_*.sql). goose.Up hard-errors at boot on a duplicate version, so this
+// opens a brand-new DB, drives every migration in migrations/*.sql in order,
+// and asserts the full set landed — six files, six recorded versions — and
+// that both branches' schema objects (stream_tokens table from migration 6,
+// apps.alias_scheme column from migration 5) exist side by side.
+func TestAllMigrationsApplyCleanly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+
+	version, err := goose.GetDBVersion(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 6 {
+		t.Fatalf("db version after migrating = %d, want 6 (00001..00006)", version)
+	}
+
+	var appliedCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM goose_db_version WHERE is_applied = 1`).Scan(&appliedCount); err != nil {
+		t.Fatal(err)
+	}
+	// goose_db_version always carries a synthetic version-0 bootstrap row in
+	// addition to one row per applied migration file.
+	if appliedCount != 7 {
+		t.Fatalf("applied migration rows = %d, want 7 (bootstrap + 6 migrations)", appliedCount)
+	}
+
+	// apps.alias_scheme (migration 00005_alias_scheme.sql, from
+	// fix/alias-namespace) must exist.
+	rows, err := db.Query(`PRAGMA table_info(apps)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawAliasScheme bool
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if name == "alias_scheme" {
+			sawAliasScheme = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if !sawAliasScheme {
+		t.Fatal("apps.alias_scheme column missing after migrating to latest")
+	}
+
+	// stream_tokens table (migration 00006_stream_tokens.sql, from
+	// feat/stream-tokens) must exist.
+	var tableName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stream_tokens'`).Scan(&tableName); err != nil {
+		t.Fatalf("stream_tokens table missing after migrating to latest: %v", err)
+	}
+}
+
 func TestCountUsers(t *testing.T) {
 	s := open(t)
 	if count, err := s.CountUsers(); err != nil || count != 0 {
@@ -1007,5 +1086,117 @@ func TestDomainCascadeDelete(t *testing.T) {
 	domains, _ = s.ListDomains(app.ID)
 	if len(domains) != 0 {
 		t.Fatalf("expected 0 domains after app delete, got %d: %+v", len(domains), domains)
+	}
+}
+
+func TestUserByID(t *testing.T) {
+	s := open(t)
+	uid, err := s.CreateUser("a@b.c", "A", "hash", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := s.UserByID(uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Email != "a@b.c" || u.Name != "A" || !u.IsSuperadmin {
+		t.Fatalf("unexpected user: %+v", u)
+	}
+
+	if _, err := s.UserByID(999); err != ErrNotFound {
+		t.Fatalf("unknown id: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestStreamTokenRoundtrip proves a stream token minted for one (scope,
+// slug, deploymentNumber) triple is found by hash with exactly that
+// triple intact, for both the app_logs shape (no deployment number) and
+// the build_log shape (a deployment number set).
+func TestStreamTokenRoundtrip(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+
+	if err := s.CreateStreamToken(uid, "th-logs", "app_logs", "blog", nil, time.Now().Add(5*time.Minute)); err != nil {
+		t.Fatalf("create app_logs token: %v", err)
+	}
+	got, err := s.StreamTokenByHash("th-logs")
+	if err != nil {
+		t.Fatalf("lookup app_logs token: %v", err)
+	}
+	if got.UserID != uid || got.Scope != "app_logs" || got.Slug != "blog" || got.DeploymentNumber != nil {
+		t.Fatalf("unexpected app_logs token: %+v", got)
+	}
+
+	n := int64(3)
+	if err := s.CreateStreamToken(uid, "th-build", "build_log", "blog", &n, time.Now().Add(5*time.Minute)); err != nil {
+		t.Fatalf("create build_log token: %v", err)
+	}
+	got, err = s.StreamTokenByHash("th-build")
+	if err != nil {
+		t.Fatalf("lookup build_log token: %v", err)
+	}
+	if got.Scope != "build_log" || got.DeploymentNumber == nil || *got.DeploymentNumber != 3 {
+		t.Fatalf("unexpected build_log token: %+v (deployment_number=%v)", got, got.DeploymentNumber)
+	}
+}
+
+// TestStreamTokenByHashUnknown proves an unrecognized hash reports
+// ErrNotFound rather than a zero-value token.
+func TestStreamTokenByHashUnknown(t *testing.T) {
+	s := open(t)
+	if _, err := s.StreamTokenByHash("no-such-hash"); err != ErrNotFound {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+// TestStreamTokenExpiry proves an expired stream token is not returned by
+// StreamTokenByHash, mirroring TestSessionExpiry.
+func TestStreamTokenExpiry(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+
+	if err := s.CreateStreamToken(uid, "live", "app_logs", "blog", nil, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateStreamToken(uid, "dead", "app_logs", "blog", nil, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.StreamTokenByHash("live"); err != nil {
+		t.Fatalf("valid stream token rejected: %v", err)
+	}
+	if _, err := s.StreamTokenByHash("dead"); err != ErrNotFound {
+		t.Fatalf("expired stream token accepted: %v", err)
+	}
+}
+
+// TestStreamTokenByHashPrunesExpiredLazily proves StreamTokenByHash's
+// side-effecting prune (see its doc comment) actually deletes expired
+// rows — not just skips them in its own SELECT — by looking up an
+// unrelated live token afterward and confirming
+// PruneExpiredStreamTokens finds nothing left to do.
+func TestStreamTokenByHashPrunesExpiredLazily(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+
+	if err := s.CreateStreamToken(uid, "dead", "app_logs", "blog", nil, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateStreamToken(uid, "live", "app_logs", "blog", nil, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any lookup (even for the live token) sweeps every expired row.
+	if _, err := s.StreamTokenByHash("live"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PruneExpiredStreamTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected the lazy prune in StreamTokenByHash to have already removed the expired row, %d still pruneable", n)
 	}
 }
