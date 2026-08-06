@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -412,30 +413,89 @@ func TestDeployFromSourceRequiresContainerfile(t *testing.T) {
 	}
 }
 
+// tarballDeployServerOpts configures newTarballDeployServer's scripted
+// responses for the async tarball-deploy flow: POST .../deploy/tarball
+// (202 + a "deploying" deployment), POST /stream-token (mints a scoped
+// build_log token), GET .../deployments/{n}/log (an SSE stream carrying
+// logLine, closed by the handler returning — exactly how the real server
+// ends the stream once the deployment reaches a terminal status), and GET
+// .../deployments/{n} (polled — always answers with the terminal
+// deployment this is configured to report, matching a build that already
+// finished by the time the CLI's first poll lands).
+type tarballDeployServerOpts struct {
+	number       int
+	finalStatus  string
+	finalImage   string
+	finalError   string
+	logLine      string
+	streamToken  string
+	requestsSeen map[string]bool
+}
+
+// newTarballDeployServer builds an httptest.Server scripting the full
+// async tarball-deploy request sequence a real BasePod server drives
+// `basepod deploy`'s non-detach path through: upload -> 202 -> mint a
+// build_log stream token -> stream the build log -> poll to terminal.
+func newTarballDeployServer(t *testing.T, opts tarballDeployServerOpts) *httptest.Server {
+	t.Helper()
+	if opts.requestsSeen == nil {
+		opts.requestsSeen = map[string]bool{}
+	}
+	logPath := fmt.Sprintf("/api/v1/apps/blog/deployments/%d/log", opts.number)
+	depPath := fmt.Sprintf("/api/v1/apps/blog/deployments/%d", opts.number)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/apps/blog/deploy/tarball":
+			opts.requestsSeen["upload"] = true
+			_, _ = io.Copy(io.Discard, r.Body)
+			writeJSONResponse(w, http.StatusAccepted, Deployment{
+				Number: opts.number, Status: "deploying", Source: "tarball", Trigger: "api",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/stream-token":
+			opts.requestsSeen["stream-token"] = true
+			writeJSONResponse(w, http.StatusOK, StreamToken{Token: opts.streamToken, ExpiresAt: "2099-01-01T00:00:00Z"})
+		case r.Method == http.MethodGet && r.URL.Path == logPath:
+			opts.requestsSeen["log"] = true
+			if got := r.URL.Query().Get("access_token"); got != opts.streamToken {
+				t.Fatalf("build-log request access_token = %q, want %q", got, opts.streamToken)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "event: log\ndata: %s\n\n", opts.logLine)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			// Returning here closes the response body, ending the SSE
+			// stream exactly like the real server does once the
+			// deployment reaches a terminal status.
+		case r.Method == http.MethodGet && r.URL.Path == depPath:
+			opts.requestsSeen["poll"] = true
+			writeJSONResponse(w, http.StatusOK, Deployment{
+				Number: opts.number, Status: opts.finalStatus, Image: opts.finalImage,
+				Error: opts.finalError, Source: "tarball", Trigger: "api",
+			})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 // TestDeployFromSourceHappyPath proves the tarball path of `basepod
-// deploy` uploads a gzipped build context (Content-Type application/gzip)
-// to .../deploy/tarball and reports the deployment healthy when the
-// server's synchronous response says so.
+// deploy` uploads a gzipped build context (Content-Type application/gzip),
+// gets back 202 with a "deploying" deployment, streams its build log live
+// (via a minted build_log stream token) to stdout, polls until it lands
+// healthy, and reports success.
 func TestDeployFromSourceHappyPath(t *testing.T) {
 	path := setTestConfigPath(t)
 
-	var gotContentType string
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/apps/blog/deploy/tarball" {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
-		}
-		gotContentType = r.Header.Get("Content-Type")
-		gotPath = r.URL.Path
-		// Drain the body so the handler behaves like a real server that
-		// actually reads the upload before responding.
-		_, _ = io.Copy(io.Discard, r.Body)
-		writeJSONResponse(w, http.StatusOK, Deployment{
-			Number: 7, Image: "localhost/basepod/blog:7", Status: "healthy",
-			Source: "tarball", Trigger: "api",
-		})
-	}))
-	defer srv.Close()
+	seen := map[string]bool{}
+	srv := newTarballDeployServer(t, tarballDeployServerOpts{
+		number: 7, finalStatus: "healthy", finalImage: "localhost/basepod/blog:7",
+		logLine: "Successfully built abc123", streamToken: "stream-tok-7", requestsSeen: seen,
+	})
 	saveTestContext(t, path, srv.URL, "tok")
 
 	dir := t.TempDir()
@@ -446,56 +506,33 @@ func TestDeployFromSourceHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deploy: %v (out=%s)", err, out)
 	}
-	if gotPath != "/api/v1/apps/blog/deploy/tarball" {
-		t.Fatalf("request path = %q", gotPath)
+	for _, step := range []string{"upload", "stream-token", "log", "poll"} {
+		if !seen[step] {
+			t.Errorf("expected the %q request to have been made, got requests=%v", step, seen)
+		}
 	}
-	if gotContentType != "application/gzip" {
-		t.Fatalf("Content-Type = %q, want application/gzip", gotContentType)
+	if !strings.Contains(out, "Successfully built abc123") {
+		t.Fatalf("output missing live build-log line: %q", out)
 	}
 	if !strings.Contains(out, "deployment #7") || !strings.Contains(out, "healthy") {
-		t.Fatalf("output = %q", out)
+		t.Fatalf("output missing final summary: %q", out)
 	}
 }
 
-// TestDeployFromSourcePrintsBuildLogOnFailure proves that when the
-// tarball upload fails server-side (502 deploy_failed — no deployment
-// number in that response body at all, see internal/api's
-// handleDeployTarball), the CLI infers which deployment just failed by
-// GETting the app (deployments come back newest-first — see
-// store.ListDeployments' ORDER BY number DESC — so Deployments[0] is the
-// one that just failed) and prints its build log, then still reports the
-// original error.
-func TestDeployFromSourcePrintsBuildLogOnFailure(t *testing.T) {
+// TestDeployFromSourceFailurePolledStatus proves that when the polled
+// deployment lands on a terminal status other than "healthy", `basepod
+// deploy` exits non-zero with exactly the deployment's own Error message
+// (learned by polling GET .../deployments/{n} — not from the upload
+// response itself, which is always just 202 "deploying" now), after having
+// already streamed the build log live.
+func TestDeployFromSourceFailurePolledStatus(t *testing.T) {
 	path := setTestConfigPath(t)
 
-	var appDetailRequested, logRequested bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/apps/blog/deploy/tarball":
-			_, _ = io.Copy(io.Discard, r.Body)
-			writeJSONResponse(w, http.StatusBadGateway, map[string]any{
-				"error": map[string]string{"code": "deploy_failed", "message": "build failed: exit status 1"},
-			})
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/apps/blog":
-			appDetailRequested = true
-			writeJSONResponse(w, http.StatusOK, AppDetail{
-				AppInfo: AppInfo{Slug: "blog", Status: "failed"},
-				Deployments: []Deployment{
-					// Newest first, matching the real server's ordering.
-					{Number: 5, Status: "failed", Source: "tarball", HasBuildLog: true},
-					{Number: 4, Status: "healthy", Source: "tarball", HasBuildLog: true},
-				},
-			})
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/apps/blog/deployments/5/log":
-			logRequested = true
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("Step 1/2: FROM scratch\nStep 2/2: RUN false\nexit status 1\n"))
-		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer srv.Close()
+	seen := map[string]bool{}
+	srv := newTarballDeployServer(t, tarballDeployServerOpts{
+		number: 5, finalStatus: "failed", finalError: "build failed: exit status 1",
+		logLine: "Step 2/2: RUN false", streamToken: "stream-tok-5", requestsSeen: seen,
+	})
 	saveTestContext(t, path, srv.URL, "tok")
 
 	dir := t.TempDir()
@@ -506,19 +543,97 @@ func TestDeployFromSourcePrintsBuildLogOnFailure(t *testing.T) {
 		t.Fatal("want a non-nil error for a failed deploy")
 	}
 	if err.Error() != "build failed: exit status 1" {
-		t.Fatalf("err = %q, want the server's message verbatim", err.Error())
+		t.Fatalf("err = %q, want the polled deployment's own error message verbatim", err.Error())
 	}
-	if !appDetailRequested {
-		t.Fatal("CLI never GET the app to find the failed deployment")
+	if !seen["log"] || !seen["poll"] {
+		t.Fatalf("expected both the build-log stream and the poll to have been requested, got %v", seen)
 	}
-	if !logRequested {
-		t.Fatal("CLI never fetched deployment #5's build log")
+	if !strings.Contains(out, "Step 2/2: RUN false") {
+		t.Fatalf("output missing live build-log line: %q", out)
 	}
-	if !strings.Contains(out, "Step 2/2: RUN false") || !strings.Contains(out, "exit status 1") {
-		t.Fatalf("output missing build log text: %q", out)
+	if !strings.Contains(out, "deployment #5") || !strings.Contains(out, "failed") {
+		t.Fatalf("output missing final summary: %q", out)
 	}
-	if !strings.Contains(out, "--- build log ---") {
-		t.Fatalf("output missing build log delimiter: %q", out)
+}
+
+// TestFollowDeploymentPollsUntilTerminal proves pollDeploymentUntilTerminal
+// actually loops — re-polling GET .../deployments/{n} until the server
+// reports a terminal status — rather than trusting a single response.
+// Shrinks the package-level deployPollInterval so the test doesn't have to
+// wait out the real 2s default.
+func TestFollowDeploymentPollsUntilTerminal(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	orig := deployPollInterval
+	deployPollInterval = time.Millisecond
+	t.Cleanup(func() { deployPollInterval = orig })
+
+	var pollCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/apps/blog/deploy/tarball":
+			_, _ = io.Copy(io.Discard, r.Body)
+			writeJSONResponse(w, http.StatusAccepted, Deployment{Number: 3, Status: "deploying", Source: "tarball", Trigger: "api"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/stream-token":
+			writeJSONResponse(w, http.StatusOK, StreamToken{Token: "tok-3", ExpiresAt: "2099-01-01T00:00:00Z"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/apps/blog/deployments/3/log":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			// No log lines — this test cares about the polling loop, not
+			// the streamed content.
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/apps/blog/deployments/3":
+			pollCount++
+			status := "deploying"
+			if pollCount >= 3 {
+				status = "healthy"
+			}
+			writeJSONResponse(w, http.StatusOK, Deployment{Number: 3, Status: status, Source: "tarball", Trigger: "api"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	saveTestContext(t, path, srv.URL, "tok")
+
+	dir := t.TempDir()
+	writeFile(t, dir, "Containerfile", "FROM scratch\n")
+
+	out, _, err := runCLI(t, "", "deploy", "-a", "blog", dir)
+	if err != nil {
+		t.Fatalf("deploy: %v (out=%s)", err, out)
+	}
+	if pollCount < 3 {
+		t.Fatalf("pollCount = %d, want at least 3 (the loop must actually re-poll until terminal)", pollCount)
+	}
+}
+
+// TestDeployDetachSkipsFollow proves --detach prints the deployment
+// number and returns immediately after the upload's 202 response, never
+// minting a stream token or polling for a terminal status.
+func TestDeployDetachSkipsFollow(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	seen := map[string]bool{}
+	srv := newTarballDeployServer(t, tarballDeployServerOpts{
+		number: 9, finalStatus: "healthy", requestsSeen: seen,
+	})
+	saveTestContext(t, path, srv.URL, "tok")
+
+	dir := t.TempDir()
+	writeFile(t, dir, "Containerfile", "FROM scratch\n")
+
+	out, _, err := runCLI(t, "", "deploy", "-a", "blog", "--detach", dir)
+	if err != nil {
+		t.Fatalf("deploy --detach: %v (out=%s)", err, out)
+	}
+	if !seen["upload"] {
+		t.Fatal("expected the upload request to have been made")
+	}
+	if seen["stream-token"] || seen["log"] || seen["poll"] {
+		t.Fatalf("--detach must not follow the deployment, got requests=%v", seen)
+	}
+	if !strings.Contains(out, "deployment #9") || !strings.Contains(out, "deploying") {
+		t.Fatalf("output = %q, want it to name the deployment number and its (non-terminal) status", out)
 	}
 }
 

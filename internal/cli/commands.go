@@ -2,7 +2,10 @@ package cli
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/signal"
@@ -11,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -319,9 +323,10 @@ func newAppsCmd() *cobra.Command {
 	return cmd
 }
 
-// newDeployCmd builds `basepod deploy [path] -a/--app <slug> [--image <ref>]`.
+// newDeployCmd builds `basepod deploy [path] -a/--app <slug> [--image <ref>] [--detach]`.
 func newDeployCmd() *cobra.Command {
 	var appSlug, image string
+	var detach bool
 	cmd := &cobra.Command{
 		Use:          "deploy [path]",
 		Short:        "Deploy an app from a local build context, or an image reference",
@@ -345,6 +350,11 @@ func newDeployCmd() *cobra.Command {
 			}
 			out := cmd.OutOrStdout()
 
+			// The deploy-by-image path is unchanged: it hits the
+			// synchronous POST .../deploy endpoint (still fast — no
+			// build/upload involved), whose response is always already a
+			// terminal status, so there's nothing to follow. --detach has
+			// no effect here.
 			if image != "" {
 				dep, err := client.Deploy(cmd.Context(), appSlug, image)
 				if err != nil {
@@ -357,11 +367,12 @@ func newDeployCmd() *cobra.Command {
 				return nil
 			}
 
-			return deployFromSource(cmd, client, appSlug, path)
+			return deployFromSource(cmd, client, appSlug, path, detach)
 		},
 	}
 	cmd.Flags().StringVarP(&appSlug, "app", "a", "", "app slug to deploy (default: the `name` in basepod.yaml, if present)")
 	cmd.Flags().StringVar(&image, "image", "", "deploy this image reference instead of building from source")
+	cmd.Flags().BoolVar(&detach, "detach", false, "for a build-from-source deploy: print the deployment number and exit immediately, without following the build log or waiting for it to finish")
 	addContextFlag(cmd)
 	return cmd
 }
@@ -408,14 +419,18 @@ func appSlugFromManifest(dir string) (slug string, err error) {
 }
 
 // deployFromSource implements the tarball half of `basepod deploy`: pack
-// path into a gzipped tar (respecting .basepodignore), upload it, and
-// block until the server finishes building and rolling it out. Kept
-// deliberately simple and synchronous rather than streaming live build
-// logs — see the task brief's "keep v1 SIMPLE AND SYNC" note: on failure,
-// it fetches the app's most recent deployment and prints its build log
-// (if any) so the user sees why, rather than leaving them to go dig for
-// it themselves.
-func deployFromSource(cmd *cobra.Command, client *Client, appSlug, path string) error {
+// path into a gzipped tar (respecting .basepodignore) and upload it. The
+// server spools and validates the upload synchronously — a bad upload
+// (413/422) still fails fast right here, exactly as before — but responds
+// as soon as that succeeds, before the build even starts (see
+// internal/api.handleDeployTarball); the deployment it returns is always
+// still "deploying". Unless detach is set, this then follows that
+// deployment to a terminal status: streaming its build log live (see
+// followDeployment) and polling until it finishes, returning a non-nil
+// error naming the deployment's own failure reason if it didn't land
+// healthy. With detach, it prints the deployment number and returns
+// immediately without waiting for any of that.
+func deployFromSource(cmd *cobra.Command, client *Client, appSlug, path string, detach bool) error {
 	out := cmd.OutOrStdout()
 
 	info, err := os.Stat(path)
@@ -443,43 +458,117 @@ func deployFromSource(cmd *cobra.Command, client *Client, appSlug, path string) 
 	}
 
 	fmt.Fprintf(out, "Uploading %s...\n", humanBytes(size))
-	fmt.Fprintln(out, "Building & deploying (this may take a few minutes)...")
 
-	dep, deployErr := client.DeployTarball(cmd.Context(), appSlug, f, size)
-	if deployErr != nil {
-		printBuildLogOnFailure(cmd, client, appSlug)
-		return deployErr
+	dep, err := client.DeployTarball(cmd.Context(), appSlug, f, size)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Deployment #%d created — building...\n", dep.Number)
+
+	if detach {
+		fmt.Fprintf(out, "deployment #%d: %s\n", dep.Number, dep.Status)
+		return nil
+	}
+
+	return followDeployment(cmd, client, appSlug, dep.Number)
+}
+
+// deployPollInterval is how often followDeployment re-polls GET
+// .../deployments/{n} while a build-from-source deploy is still in
+// progress. A package-level var (not a const) so tests can shrink it to
+// keep the suite fast, matching internal/deploy's own probeInterval
+// pattern.
+var deployPollInterval = 2 * time.Second
+
+// followDeployment is the async half of `basepod deploy`'s build-from-
+// source flow (see deployFromSource): it streams the deployment's build
+// log live to stdout — via a minted "build_log" stream token, exactly the
+// credential model the dashboard's own SSE connections use (see
+// internal/api/stream_token.go) rather than a bare session token in a URL
+// — and then polls GET .../deployments/{number} until it reaches a
+// terminal status. A failure streaming the log is only a warning (printed
+// to stderr): the deploy itself may still be proceeding just fine, and
+// polling below is what actually decides this command's outcome. Returns
+// a non-nil error (naming the deployment's own Error message, if any) when
+// the deployment didn't land "healthy".
+func followDeployment(cmd *cobra.Command, client *Client, appSlug string, number int) error {
+	out := cmd.OutOrStdout()
+	ctx := cmd.Context()
+
+	if err := streamBuildLog(ctx, client, appSlug, number, out); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not stream the build log live: %v\n", err)
+	}
+
+	dep, err := pollDeploymentUntilTerminal(ctx, client, appSlug, number)
+	if err != nil {
+		return err
 	}
 
 	printDeployment(out, dep)
 	if dep.Status != "healthy" {
+		if dep.Error != "" {
+			return errors.New(dep.Error)
+		}
 		return fmt.Errorf("deploy finished with status %q", dep.Status)
 	}
 	return nil
 }
 
-// printBuildLogOnFailure looks up appSlug's most recent deployment (the
-// one the just-failed tarball upload created) and prints its build log,
-// best-effort — a failure here (network hiccup, the deployment somehow
-// having no log) is swallowed rather than compounding the original deploy
-// error.
-func printBuildLogOnFailure(cmd *cobra.Command, client *Client, appSlug string) {
-	detail, err := client.GetApp(cmd.Context(), appSlug)
-	if err != nil || len(detail.Deployments) == 0 {
-		return
+// streamBuildLog mints a "build_log" stream token for (appSlug, number) and
+// opens its build-log route, printing every line to out as it arrives.
+// The server serves this route two different ways depending on whether the
+// deployment was still "deploying" at the moment the request landed (see
+// internal/api.handleDeploymentLog): an SSE stream of "event: log" lines
+// (raw text payloads — NOT JSON, unlike the container-log stream; see
+// BuildLogPanel.vue's own doc comment for the same wire-format note) that
+// the server itself closes once the deployment reaches a terminal status,
+// or — if the build had already finished by the time this connects — a
+// single plain-text body. Content-Type distinguishes the two; either way
+// this returns once the response body is fully read/closed, so a caller
+// doesn't need to guess which shape it got before moving on to polling.
+func streamBuildLog(ctx context.Context, client *Client, appSlug string, number int, out io.Writer) error {
+	token, err := client.CreateBuildLogStreamToken(ctx, appSlug, number)
+	if err != nil {
+		return fmt.Errorf("mint build-log stream token: %w", err)
 	}
-	latest := detail.Deployments[0]
-	if !latest.HasBuildLog {
-		return
+
+	resp, err := client.OpenDeploymentLog(ctx, appSlug, number, token.Token)
+	if err != nil {
+		return fmt.Errorf("open build log: %w", err)
 	}
-	logText, err := client.DeploymentLog(cmd.Context(), appSlug, latest.Number)
-	if err != nil || logText == "" {
-		return
+	defer resp.Body.Close()
+
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return readSSE(resp.Body, func(ev sseEvent) bool {
+			if ev.event == "log" {
+				fmt.Fprintln(out, ev.data)
+			}
+			return true
+		})
 	}
-	out := cmd.OutOrStdout()
-	fmt.Fprintln(out, "--- build log ---")
-	fmt.Fprintln(out, logText)
-	fmt.Fprintln(out, "--- end build log ---")
+
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+// pollDeploymentUntilTerminal calls client.GetDeployment every
+// deployPollInterval until its Status is no longer "deploying" (or ctx is
+// done), returning the first terminal snapshot.
+func pollDeploymentUntilTerminal(ctx context.Context, client *Client, appSlug string, number int) (*Deployment, error) {
+	for {
+		dep, err := client.GetDeployment(ctx, appSlug, number)
+		if err != nil {
+			return nil, err
+		}
+		if dep.Status != "deploying" {
+			return dep, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(deployPollInterval):
+		}
+	}
 }
 
 // newLogsCmd builds `basepod logs <slug> [-f] [--tail N]`.
