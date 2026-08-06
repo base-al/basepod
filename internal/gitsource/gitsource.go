@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/base-al/basepod/internal/tarpack"
@@ -376,11 +377,54 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// runGit runs git with args and env, discarding stdout, under ctx.
-func (c *Cloner) runGit(ctx context.Context, env, args []string, token string) error {
+// waitDelay bounds how long Wait() blocks after cancellation as a
+// backstop only — see newGitCmd's doc comment for the primary mechanism.
+// Short, because the process-group kill below is expected to make this
+// moot in the overwhelming common case; it exists only in case something
+// unusual (e.g. a pipe fd leaked outside the group some other way)
+// leaves an I/O-copying goroutine blocked despite the kill.
+const waitDelay = 3 * time.Second
+
+// newGitCmd builds an *exec.Cmd for git, wired so that context
+// cancellation (Fetch's hard timeout) actually terminates the *entire*
+// process tree it spawns, not just the immediate git process.
+//
+// This matters because git forks its own subprocesses per transport
+// (e.g. git-remote-https for an https:// clone) and those inherit git's
+// process group by default. exec.CommandContext's default cancellation
+// behavior only signals cmd.Process — the direct child — via Kill. If
+// git's own child is still running (or, worse, hung on a stalled
+// network read) when that happens, it becomes orphaned rather than
+// terminated: it keeps this Cmd's stdout/stderr pipes open (inherited
+// file descriptors), which blocks Wait() until that orphan exits on its
+// own — potentially never, for a genuinely hostile or hung remote. This
+// was caught empirically: a fake git that forked a long-running child
+// made Fetch block for the child's full runtime despite the context
+// having already expired, defeating Options.Timeout as anything more
+// than advisory.
+//
+// The fix is Setpgid (put git in its own process group, separate from
+// basepod's) plus a custom Cancel that signals the *negative* PID —
+// SIGKILL to every process in that group at once, git and all its
+// descendants together — rather than relying on WaitDelay's forced pipe
+// closure alone (which only bounds how long *we* wait; it doesn't
+// guarantee the orphan itself is ever actually killed, so it can leave
+// a hung subprocess running indefinitely in the background even after
+// Fetch has returned an error).
+func (c *Cloner) newGitCmd(ctx context.Context, env, args []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, c.gitPath, args...)
 	cmd.Env = env
-	cmd.WaitDelay = 5 * time.Second
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = waitDelay
+	return cmd
+}
+
+// runGit runs git with args and env, discarding stdout, under ctx.
+func (c *Cloner) runGit(ctx context.Context, env, args []string, token string) error {
+	cmd := c.newGitCmd(ctx, env, args)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -392,9 +436,7 @@ func (c *Cloner) runGit(ctx context.Context, env, args []string, token string) e
 // runGitOutput runs git with args and env under ctx, returning its
 // captured stdout.
 func (c *Cloner) runGitOutput(ctx context.Context, env, args []string, token string) (string, error) {
-	cmd := exec.CommandContext(ctx, c.gitPath, args...)
-	cmd.Env = env
-	cmd.WaitDelay = 5 * time.Second
+	cmd := c.newGitCmd(ctx, env, args)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

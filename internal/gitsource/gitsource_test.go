@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -240,19 +242,50 @@ func TestFetchRejectsCheckoutOverSizeCap(t *testing.T) {
 }
 
 // TestFetchTimeoutKillsChild proves a clone that runs past Options.Timeout
-// is killed rather than left running, and Fetch returns promptly — this
-// fails without exec.CommandContext's cancellation wired through
-// correctly. Uses a fake "git" that sleeps well past the timeout and only
-// then writes a marker file, so an absent marker after Fetch returns
-// proves the child was actually killed, not merely that Fetch gave up
-// waiting on it.
+// is not just abandoned by Wait() but actually terminated — both the
+// direct "git" process AND a subprocess it spawns (standing in for
+// git's own transport helpers, e.g. git-remote-https, which inherit its
+// process group).
+//
+// This is deliberately not just a wall-clock assertion: a grandchild
+// that inherits the Cmd's stdout/stderr pipes keeps them open even
+// after the direct child dies, which blocks Wait() until the grandchild
+// exits on its own — a naive fix (e.g. only killing cmd.Process, or
+// relying solely on a long WaitDelay) can make Fetch *return* promptly
+// while leaving that grandchild running in the background, still
+// racing to finish whatever it was doing. So this test checks both:
+// Fetch returns within a small bound, AND the grandchild's own PID is
+// confirmed dead afterward — the property that actually matters (no
+// leaked process, no lingering background work), which a timing-only
+// assertion cannot distinguish from "Wait() gave up but the process
+// lives on".
 func TestFetchTimeoutKillsChild(t *testing.T) {
 	scriptDir := t.TempDir()
-	markerPath := filepath.Join(t.TempDir(), "ran-to-completion")
-	fakeGit := writeFakeGit(t, scriptDir, "#!/bin/sh\nsleep 3\ntouch "+shQuote(markerPath)+"\n")
+	workDir := t.TempDir()
+	markerPath := filepath.Join(workDir, "ran-to-completion")
+	pidPath := filepath.Join(workDir, "child.pid")
+
+	// Backgrounds a long sleep (well past the timeout below) as its own
+	// child process, records that child's PID, then waits on it — so the
+	// PID this test inspects belongs to a genuine grandchild of the Go
+	// test process, exactly the shape that leaked pipe file descriptors
+	// in the bug this test guards against.
+	fakeGit := writeFakeGit(t, scriptDir,
+		"#!/bin/sh\n"+
+			"sleep 5 &\n"+
+			"child=$!\n"+
+			"echo $child > "+shQuote(pidPath)+"\n"+
+			"wait $child\n"+
+			"touch "+shQuote(markerPath)+"\n")
 
 	opts := testOptions("file")
-	opts.Timeout = 100 * time.Millisecond
+	// Long enough for the shell to actually fork+exec `sleep 5 &` and
+	// write the pid file before being killed (a too-short timeout risks
+	// killing the script before it gets that far, which would fail this
+	// test for the wrong reason); short enough that the assertion below
+	// still meaningfully proves the grandchild didn't run anywhere near
+	// its full 5s.
+	opts.Timeout = 300 * time.Millisecond
 	c := gitsource.New(fakeGit, opts)
 
 	start := time.Now()
@@ -262,16 +295,46 @@ func TestFetchTimeoutKillsChild(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a timeout error")
 	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("Fetch took %s to return, want well under the 3s sleep — timeout did not fire promptly", elapsed)
+	// A tight bound: the fake git's sleep is 5s and WaitDelay's backstop
+	// is 3s, so anything approaching either of those means the
+	// grandchild was left running rather than actually killed at the
+	// ~300ms deadline.
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("Fetch took %s to return, want well under 1.5s — the process group was not killed promptly on timeout", elapsed)
 	}
-	// Give the killed process a brief moment in case it somehow raced to
-	// the touch anyway (it shouldn't have — it was killed at ~100ms into
-	// a 3s sleep).
-	time.Sleep(200 * time.Millisecond)
+
+	pidBytes, rerr := os.ReadFile(pidPath)
+	if rerr != nil {
+		t.Fatalf("fake git never recorded its background child's PID: %v", rerr)
+	}
+	pid, perr := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if perr != nil {
+		t.Fatalf("bad pid file contents %q: %v", pidBytes, perr)
+	}
+
+	// Poll briefly rather than assert instantaneously: the kill signal
+	// and the OS reaping it are asynchronous with Fetch's return.
+	deadline := time.Now().Add(1 * time.Second)
+	alive := processAlive(pid)
+	for alive && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		alive = processAlive(pid)
+	}
+	if alive {
+		t.Fatalf("fake git's background child (pid %d) is still running after Fetch returned — "+
+			"it was abandoned, not killed (see newGitCmd's process-group kill)", pid)
+	}
+
 	if _, statErr := os.Stat(markerPath); statErr == nil {
-		t.Fatal("marker file exists — the fake git process ran to completion instead of being killed on timeout")
+		t.Fatal("marker file exists — the fake git script ran to completion instead of being killed on timeout")
 	}
+}
+
+// processAlive reports whether pid refers to a still-running process, by
+// sending it signal 0 (a no-op existence probe — POSIX-portable, unlike
+// reading /proc which isn't available on macOS).
+func processAlive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
 }
 
 // TestFetchNeverPutsTokenInArgv proves the deploy token reaches git only
