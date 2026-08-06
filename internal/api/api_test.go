@@ -105,6 +105,12 @@ type fakeDeployer struct {
 	deployBuildPrepared *build.PreparedBuild
 	deployBuildBuilder  *build.Builder
 
+	// deployGitCloneCalled/deployGitCloneAsyncErr script/observe
+	// DeployGitCloneAsync (see its doc comment below) — the git-webhook
+	// counterpart to deployBuildCalled/deployBuildAsyncErr above.
+	deployGitCloneCalled   bool
+	deployGitCloneAsyncErr error
+
 	// rollbackErr, if set, is returned by Rollback as-is (mirroring how
 	// deployErr/deployBuildErr script Deploy/DeployBuild) — tests script
 	// this to deploy's typed rollback errors (or a generic error) to
@@ -167,6 +173,80 @@ func (f *fakeDeployer) DeployBuildAsync(ctx context.Context, app *store.App, pre
 	// goroutine does, later (see internal/deploy's own tests for that
 	// behavior). A test that needs a terminal state calls
 	// f.st.FinishDeployment directly after asserting the 202 response.
+	return dep, nil
+}
+
+// DeployGitAsync is a lightweight stand-in for deploy.Engine.DeployGitAsync
+// — like DeployBuildAsync above, it persists a real deployment row
+// (source "git") through the store and always closes prepared, but never
+// actually builds anything. internal/deploy's own tests cover the real
+// engine's git-clone bookkeeping (git_sha, source, background goroutine);
+// this only needs to prove the API layer's plumbing.
+func (f *fakeDeployer) DeployGitAsync(ctx context.Context, app *store.App, prepared *build.PreparedBuild, builder *build.Builder, gitSHA, triggerKind string) (*store.Deployment, error) {
+	f.deployBuildCalled = true
+	f.deployBuildBuilder = builder
+	f.deployBuildPrepared = prepared
+	if prepared != nil {
+		prepared.Close()
+	}
+
+	dep, err := f.st.CreateDeploymentFull(app.ID, "", "git", triggerKind)
+	if err != nil {
+		return nil, err
+	}
+	if f.deployBuildAsyncErr != nil {
+		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployBuildAsyncErr.Error())
+		return nil, f.deployBuildAsyncErr
+	}
+	_ = f.st.SetDeploymentGitSHA(dep.ID, gitSHA)
+	dep.GitSha = gitSHA
+	return dep, nil
+}
+
+// DeployGitCloneAsync is a lightweight stand-in for
+// deploy.Engine.DeployGitCloneAsync: it creates a real deployment row
+// (source "git"), then — synchronously, unlike the real engine, since
+// tests need deterministic ordering rather than a background goroutine —
+// calls fetch itself and invokes onDone with the outcome. Scripted via
+// deployGitCloneErr (returned by fetch) and deployGitCloneAsyncErr
+// (returned by this method's own bookkeeping, before fetch is ever
+// called).
+func (f *fakeDeployer) DeployGitCloneAsync(ctx context.Context, app *store.App, fetch func(ctx context.Context) (io.ReadCloser, string, error), builder *build.Builder, triggerKind, initialSHA string, onDone func(dep *store.Deployment, err error)) (*store.Deployment, error) {
+	f.deployGitCloneCalled = true
+
+	dep, err := f.st.CreateDeploymentFull(app.ID, "", "git", triggerKind)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.st.SetDeploymentGitSHA(dep.ID, initialSHA)
+	dep.GitSha = initialSHA
+
+	if f.deployGitCloneAsyncErr != nil {
+		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployGitCloneAsyncErr.Error())
+		return nil, f.deployGitCloneAsyncErr
+	}
+
+	go func() {
+		gzTar, headSHA, fetchErr := fetch(ctx)
+		if fetchErr != nil {
+			_ = f.st.FinishDeployment(dep.ID, "failed", fetchErr.Error())
+			dep.Status = "failed"
+			if onDone != nil {
+				onDone(dep, fetchErr)
+			}
+			return
+		}
+		defer gzTar.Close()
+		_ = f.st.SetDeploymentGitSHA(dep.ID, headSHA)
+		dep.GitSha = headSHA
+		io.Copy(io.Discard, gzTar) //nolint:errcheck
+		_ = f.st.FinishDeployment(dep.ID, "healthy", "")
+		dep.Status = "healthy"
+		if onDone != nil {
+			onDone(dep, nil)
+		}
+	}()
+
 	return dep, nil
 }
 
@@ -250,10 +330,19 @@ func newTestServerWithLogs(t *testing.T, st *store.Store, dep Deployer, routes R
 
 // newTestServerWithBuilder is the fullest-control constructor, for tests
 // (deploy_tarball_test.go) that need to assert the *build.Builder passed
-// to New is exactly what reaches Deployer.DeployBuild.
+// to New is exactly what reaches Deployer.DeployBuild. gitFetcher is nil
+// (git deploys disabled); tests exercising git.go/webhook.go use
+// newTestServerWithGit instead.
 func newTestServerWithBuilder(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder))
+	return newTestServerWithGit(t, st, dep, routes, logs, builder, nil)
+}
+
+// newTestServerWithGit is newTestServerWithBuilder with an explicit
+// GitFetcher, for git.go/webhook.go tests.
+func newTestServerWithGit(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder, gitFetcher))
 	t.Cleanup(srv.Close)
 	return srv
 }

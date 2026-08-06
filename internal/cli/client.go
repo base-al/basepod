@@ -160,6 +160,10 @@ type Deployment struct {
 	Source      string `json:"source"`
 	Trigger     string `json:"trigger"`
 	HasBuildLog bool   `json:"has_build_log"`
+	// GitSha is the resolved commit a "git"-sourced deployment built —
+	// "" for every other Source (see the v0.5 plan's Task 4/5 and
+	// store.Deployment.GitSha's doc comment).
+	GitSha string `json:"git_sha"`
 }
 
 // AppDetail is the wire shape of GET /apps/{slug}: an app plus its full
@@ -386,6 +390,126 @@ func (c *Client) PutEnv(ctx context.Context, slug string, vars []EnvVar) ([]EnvV
 		return nil, err
 	}
 	return out, nil
+}
+
+// GitSource is the wire shape of PUT/GET .../apps/{slug}/git — see
+// internal/api/git.go's gitSourceResponse. Secret is the plaintext
+// webhook secret (a deliberate deviation from write-only, so an operator
+// can paste it into a forge's webhook settings); Token is masked to
+// "set"/"" like a secret env value.
+type GitSource struct {
+	URL        string   `json:"url"`
+	Branch     string   `json:"branch"`
+	Provider   string   `json:"provider"`
+	HookID     string   `json:"hook_id"`
+	Secret     string   `json:"secret"`
+	Token      string   `json:"token"`
+	WebhookURL string   `json:"webhook_url"`
+	Warnings   []string `json:"warnings,omitempty"`
+}
+
+// GitDelivery is the wire shape of one row from GET
+// .../apps/{slug}/git/deliveries — see internal/api/git.go's
+// gitDeliveryResponse.
+type GitDelivery struct {
+	ID               int64  `json:"id"`
+	ReceivedAt       string `json:"received_at"`
+	Provider         string `json:"provider"`
+	Event            string `json:"event"`
+	Ref              string `json:"ref"`
+	CommitSHA        string `json:"commit_sha"`
+	Status           string `json:"status"`
+	Detail           string `json:"detail"`
+	DeploymentNumber *int   `json:"deployment_number,omitempty"`
+}
+
+// putGitSourceRequest mirrors internal/api/git.go's own request type —
+// kept private since callers use PutGitSource's named parameters instead.
+type putGitSourceRequest struct {
+	URL          string `json:"url"`
+	Branch       string `json:"branch"`
+	Token        string `json:"token"`
+	RotateSecret bool   `json:"rotate_secret"`
+}
+
+// PutGitSource connects (or reconnects) an app's git repo config. token
+// "" leaves any already-stored deploy token untouched (see
+// putGitSourceRequest's server-side counterpart); rotateSecret forces a
+// fresh hook_id and webhook secret even on a re-connect.
+func (c *Client) PutGitSource(ctx context.Context, slug, url, branch, token string, rotateSecret bool) (*GitSource, error) {
+	body, err := json.Marshal(putGitSourceRequest{URL: url, Branch: branch, Token: token, RotateSecret: rotateSecret})
+	if err != nil {
+		return nil, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPut, "/apps/"+slug+"/git", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var out GitSource
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetGitSource returns an app's connected git repo config. Returns
+// *ApiError with Code "git_not_connected" (Status 404) if none is
+// connected.
+func (c *Client) GetGitSource(ctx context.Context, slug string) (*GitSource, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/apps/"+slug+"/git", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out GitSource
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteGitSource disconnects an app's git repo config.
+func (c *Client) DeleteGitSource(ctx context.Context, slug string) error {
+	req, err := c.newRequest(ctx, http.MethodDelete, "/apps/"+slug+"/git", "", nil)
+	if err != nil {
+		return err
+	}
+	return c.do(req, nil)
+}
+
+// ListGitDeliveries returns an app's most recent webhook deliveries,
+// newest first (server default limit 20 if limit <= 0).
+func (c *Client) ListGitDeliveries(ctx context.Context, slug string, limit int) ([]GitDelivery, error) {
+	path := "/apps/" + slug + "/git/deliveries"
+	if limit > 0 {
+		path += "?limit=" + strconv.Itoa(limit)
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, path, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []GitDelivery
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeployGit triggers a manual "deploy now" of an app's connected git
+// repo: the server clones synchronously (so a clone failure surfaces here
+// as an *ApiError right away) and hands the result to the same async
+// build pipeline DeployTarball uses — the returned Deployment is always
+// still "deploying"; see followDeployment in commands.go for the
+// SSE-follow + poll-to-terminal flow both this and DeployTarball share.
+func (c *Client) DeployGit(ctx context.Context, slug string) (*Deployment, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/apps/"+slug+"/deploy/git", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out Deployment
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // System returns the control plane's version/runtime/app-count summary.

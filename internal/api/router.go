@@ -45,6 +45,28 @@ type Deployer interface {
 	// .../deployments/{n} or follow the build-log SSE stream instead. See
 	// deploy.Engine.DeployBuildAsync's doc comment for the full contract.
 	DeployBuildAsync(ctx context.Context, app *store.App, prepared *build.PreparedBuild, builder *build.Builder) (*store.Deployment, error)
+	// DeployGitAsync is DeployBuildAsync's git-sourced counterpart for a
+	// manual "deploy now" trigger (POST .../deploy/git — see
+	// internal/api/git.go's handleDeployGit): prepared is a build context
+	// this package has already cloned (via a GitFetcher) and spooled
+	// SYNCHRONOUSLY before ever calling this, so a bad clone still fails
+	// fast with its own 502/503 before a deployment row exists. gitSHA is
+	// the commit the clone resolved, recorded on the deployment row
+	// (deployments.git_sha) immediately. See deploy.Engine.DeployGitAsync's
+	// doc comment for the full contract.
+	DeployGitAsync(ctx context.Context, app *store.App, prepared *build.PreparedBuild, builder *build.Builder, gitSHA, triggerKind string) (*store.Deployment, error)
+	// DeployGitCloneAsync is DeployGitAsync's twin for the unauthenticated
+	// webhook receiver (internal/api/webhook.go): unlike DeployGitAsync,
+	// the clone itself has NOT happened yet — fetch performs it, deferred
+	// into the background goroutine this creates, so a webhook HTTP
+	// response never blocks on a multi-minute clone. onDone is called
+	// exactly once, from that background goroutine, once the whole
+	// clone+build+rollout has reached a terminal outcome (or failed
+	// earlier) — see deploy.Engine.DeployGitCloneAsync's doc comment for
+	// why: it's what lets the webhook receiver's per-app flood-coalescing
+	// state (see webhook.go's gitCoalescer) learn when it's safe to start
+	// a queued follow-up push's deploy.
+	DeployGitCloneAsync(ctx context.Context, app *store.App, fetch func(ctx context.Context) (gzTar io.ReadCloser, headSHA string, err error), builder *build.Builder, triggerKind, initialSHA string, onDone func(dep *store.Deployment, err error)) (*store.Deployment, error)
 	// Rollback redeploys app to an earlier deployment's exact image. See
 	// deploy.Engine.Rollback's doc comment for its typed failure modes
 	// (deploy.ErrRollbackTargetNotFound / ErrRollbackTargetUnhealthy /
@@ -104,6 +126,19 @@ const (
 	globalLimiterKey     = "global"
 )
 
+// webhookRateLimit and webhookRateWindow bound requests to the git webhook
+// route per hook_id (v0.5 plan Task 5) — generous enough that a legitimate
+// burst of pushes (e.g. a force-push storm during a rebase, or several
+// branches pushed in quick succession by a CI job) never trips it, but
+// bounded so a flood aimed at one hook_id can't spawn unbounded work: the
+// gitCoalescer (see webhook.go) already caps concurrent clones/builds per
+// app to at most 2, but nothing stops a flood from making 1000s of HTTP
+// requests and DB delivery-log writes without this.
+const (
+	webhookRateLimit  = 30
+	webhookRateWindow = time.Minute
+)
+
 // maxJSONBody caps the size of a JSON request body handlers behind
 // bodyLimit will decode. It exists to bound memory use against a
 // malicious or buggy client streaming an enormous body at a JSON
@@ -139,6 +174,18 @@ type api struct {
 	limiter       *rateLimiter
 	globalLimiter *rateLimiter
 
+	// webhookLimiter bounds requests to the unauthenticated git webhook
+	// route (see webhook.go), keyed by hook_id rather than client IP —
+	// the route's own security battery (v0.5 plan Task 5): a flood aimed
+	// at one app's hook must not be able to spawn unbounded clones/builds
+	// or exhaust the login limiters' unrelated key space.
+	webhookLimiter *rateLimiter
+
+	// gitCoalescer bounds how many webhook-triggered git deploys can be
+	// in flight or queued per app (see webhook.go's gitCoalescer): at
+	// most one running plus at most one pending, newest commit wins.
+	gitCoalescer *gitCoalescer
+
 	// seal/open encrypt and decrypt EnvVar.ValueEncrypted values, given
 	// the owning app's ID and the var's key. They close over the
 	// process's encryption key (see internal/crypto) so this package
@@ -166,22 +213,38 @@ type api struct {
 	// see the Deployer.DeployBuild doc comment for why it's threaded
 	// through per-call rather than held only by dep.
 	builder *build.Builder
+
+	// gitFetcher shallow-clones a configured git repo into a build
+	// context (see git.go's GitFetcher interface and *gitsource.Cloner,
+	// which satisfies it). nil disables every git deploy path exactly
+	// like a zero-value *gitsource.Cloner does (returns
+	// gitsource.ErrGitUnavailable, mapped to 503 "git_unavailable") —
+	// tests that don't exercise git deploys simply omit it.
+	gitFetcher GitFetcher
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
-func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder) http.Handler {
+// gitFetcher may be nil, disabling every git deploy/webhook path with a
+// 503 "git_unavailable" (see the gitFetcher field's doc comment) — the
+// production caller (internal/server.Run) always passes a real
+// *gitsource.Cloner, itself gracefully degraded (not nil) when the git
+// binary isn't installed.
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher) http.Handler {
 	a := &api{
-		st:            st,
-		dep:           dep,
-		ping:          ping,
-		version:       version,
-		limiter:       newRateLimiter(loginRateLimit, loginRateWindow),
-		globalLimiter: newRateLimiter(globalLoginRateLimit, loginRateWindow),
-		seal:          seal,
-		open:          open,
-		routes:        routes,
-		logs:          logs,
-		builder:       builder,
+		st:             st,
+		dep:            dep,
+		ping:           ping,
+		version:        version,
+		limiter:        newRateLimiter(loginRateLimit, loginRateWindow),
+		globalLimiter:  newRateLimiter(globalLoginRateLimit, loginRateWindow),
+		webhookLimiter: newRateLimiter(webhookRateLimit, webhookRateWindow),
+		gitCoalescer:   newGitCoalescer(),
+		seal:           seal,
+		open:           open,
+		routes:         routes,
+		logs:           logs,
+		builder:        builder,
+		gitFetcher:     gitFetcher,
 	}
 	return newRouter(a)
 }
@@ -225,7 +288,28 @@ func newRouter(a *api) http.Handler {
 			r.Get("/apps/{slug}/domains", a.handleListDomains)
 			r.Post("/apps/{slug}/domains", a.handleAddDomain)
 			r.Delete("/apps/{slug}/domains/{id}", a.handleDeleteDomain)
+
+			// Git config CRUD + manual deploy-from-git (v0.5 plan Task 4) —
+			// authenticated like every other app-scoped route above; the
+			// ONLY unauthenticated route in the whole API is the webhook
+			// receiver registered below, outside this group.
+			r.Put("/apps/{slug}/git", a.handlePutGitSource)
+			r.Get("/apps/{slug}/git", a.handleGetGitSource)
+			r.Delete("/apps/{slug}/git", a.handleDeleteGitSource)
+			r.Get("/apps/{slug}/git/deliveries", a.handleListGitDeliveries)
+			r.Post("/apps/{slug}/deploy/git", a.handleDeployGit)
 		})
+
+		// The git webhook receiver (v0.5 plan Task 5) is deliberately the
+		// only unauthenticated route in this API: a forge (GitHub/GitLab/
+		// Gitea) posts here directly, with no session/bearer token to send.
+		// Its own security battery — hook_id resolution, constant-time
+		// signature verification, a 1 MiB body cap independent of
+		// bodyLimit's maxJSONBody, per-hook rate limiting, and per-app
+		// flood coalescing — lives entirely in webhook.go's handler, not in
+		// any shared middleware, so it is never accidentally granted (or
+		// denied) auth by a change to the groups above.
+		r.Post("/webhooks/git/{hookID}", a.handleGitWebhook)
 
 		// The tarball upload route needs its own, much larger body cap
 		// (see maxTarballBody in apps.go) — a bare http.MaxBytesReader in

@@ -43,6 +43,7 @@ func Commands() []*cobra.Command {
 		newEnvCmd(),
 		newRollbackCmd(),
 		newStatusCmd(),
+		newGitCmd(),
 	}
 }
 
@@ -326,13 +327,17 @@ func newAppsCmd() *cobra.Command {
 // newDeployCmd builds `basepod deploy [path] -a/--app <slug> [--image <ref>] [--detach]`.
 func newDeployCmd() *cobra.Command {
 	var appSlug, image string
-	var detach bool
+	var detach, fromGit bool
 	cmd := &cobra.Command{
 		Use:          "deploy [path]",
-		Short:        "Deploy an app from a local build context, or an image reference",
+		Short:        "Deploy an app from a local build context, an image reference, or its connected git repo",
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if fromGit && image != "" {
+				return fmt.Errorf("--git and --image are mutually exclusive")
+			}
+
 			path := deployPathArg(args)
 			if appSlug == "" {
 				slug, mErr := appSlugFromManifest(path)
@@ -367,14 +372,45 @@ func newDeployCmd() *cobra.Command {
 				return nil
 			}
 
+			// --git triggers the app's connected repo (POST
+			// .../deploy/git): the server clones synchronously — a bad
+			// connection/branch surfaces here as an ordinary error — then
+			// hands off to the same async build pipeline DeployTarball
+			// uses, so the follow/poll flow below is shared with the
+			// build-from-source path.
+			if fromGit {
+				dep, err := client.DeployGit(cmd.Context(), appSlug)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(out, "Deployment #%d created from %s — building...\n", dep.Number, shortSHA(dep.GitSha))
+				if detach {
+					fmt.Fprintf(out, "deployment #%d: %s\n", dep.Number, dep.Status)
+					return nil
+				}
+				return followDeployment(cmd, client, appSlug, dep.Number)
+			}
+
 			return deployFromSource(cmd, client, appSlug, path, detach)
 		},
 	}
 	cmd.Flags().StringVarP(&appSlug, "app", "a", "", "app slug to deploy (default: the `name` in basepod.yaml, if present)")
 	cmd.Flags().StringVar(&image, "image", "", "deploy this image reference instead of building from source")
-	cmd.Flags().BoolVar(&detach, "detach", false, "for a build-from-source deploy: print the deployment number and exit immediately, without following the build log or waiting for it to finish")
+	cmd.Flags().BoolVar(&fromGit, "git", false, "deploy the app's connected git repo instead of building from a local path")
+	cmd.Flags().BoolVar(&detach, "detach", false, "for a build-from-source or --git deploy: print the deployment number and exit immediately, without following the build log or waiting for it to finish")
 	addContextFlag(cmd)
 	return cmd
+}
+
+// shortSHA truncates a full git commit SHA to its conventional 7-character
+// short form for display — "" (an unresolved/non-git deployment) passes
+// through unchanged rather than becoming a confusing 7-char slice of
+// nothing.
+func shortSHA(sha string) string {
+	if len(sha) <= 7 {
+		return sha
+	}
+	return sha[:7]
 }
 
 func deployPathArg(args []string) string {
@@ -850,6 +886,157 @@ func newStatusCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON instead of a table")
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newGitCmd builds `basepod git connect|status|disconnect` — the config
+// half of git push-to-deploy (v0.5 plan Task 4); `basepod deploy --git`
+// triggers the manual deploy itself (see newDeployCmd).
+func newGitCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "git",
+		Short: "Manage an app's connected git repo (push-to-deploy)",
+	}
+	cmd.AddCommand(newGitConnectCmd(), newGitStatusCmd(), newGitDisconnectCmd())
+	return cmd
+}
+
+// printGitSource prints a connected repo's config and webhook setup
+// instructions: the URL/branch, whether a deploy token is set, and the
+// webhook URL + secret an operator pastes into GitHub/GitLab/Gitea's
+// webhook settings (payload URL: WebhookURL, content type
+// application/json, secret: Secret — see gitSourceResponse's doc comment
+// for why the secret is readable here, unlike the deploy token).
+func printGitSource(w io.Writer, gs *GitSource) {
+	fmt.Fprintf(w, "url:      %s\n", gs.URL)
+	fmt.Fprintf(w, "branch:   %s\n", gs.Branch)
+	if gs.Provider != "" {
+		fmt.Fprintf(w, "provider: %s\n", gs.Provider)
+	}
+	token := "not set"
+	if gs.Token == "set" {
+		token = "set"
+	}
+	fmt.Fprintf(w, "token:    %s\n", token)
+	fmt.Fprintf(w, "\nwebhook (add this to your forge's webhook settings):\n")
+	fmt.Fprintf(w, "  payload URL:   %s\n", gs.WebhookURL)
+	fmt.Fprintf(w, "  content type:  application/json\n")
+	fmt.Fprintf(w, "  secret:        %s\n", gs.Secret)
+	for _, warning := range gs.Warnings {
+		fmt.Fprintf(w, "\nwarning: %s\n", warning)
+	}
+}
+
+// newGitConnectCmd builds `basepod git connect <slug> --url --branch [--token] [--rotate-secret]`.
+func newGitConnectCmd() *cobra.Command {
+	var url, branch, token string
+	var rotateSecret bool
+	cmd := &cobra.Command{
+		Use:          "connect <slug>",
+		Short:        "Connect (or reconfigure) an app's git repo for push-to-deploy",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if url == "" || branch == "" {
+				return fmt.Errorf("--url and --branch are required")
+			}
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			gs, err := client.PutGitSource(cmd.Context(), args[0], url, branch, token, rotateSecret)
+			if err != nil {
+				return err
+			}
+			printGitSource(cmd.OutOrStdout(), gs)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&url, "url", "", "the repo's https clone URL (required)")
+	cmd.Flags().StringVar(&branch, "branch", "", "the branch to deploy on push (required)")
+	cmd.Flags().StringVar(&token, "token", "", "a deploy token for a private repo (omit to keep any already-stored token unchanged)")
+	cmd.Flags().BoolVar(&rotateSecret, "rotate-secret", false, "mint a fresh webhook hook_id and secret, invalidating the old webhook URL")
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newGitStatusCmd builds `basepod git status <slug>` — the connected
+// repo's config plus its most recent webhook deliveries.
+func newGitStatusCmd() *cobra.Command {
+	var asJSON bool
+	var limit int
+	cmd := &cobra.Command{
+		Use:          "status <slug>",
+		Short:        "Show an app's connected git repo and recent webhook deliveries",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			gs, err := client.GetGitSource(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			deliveries, err := client.ListGitDeliveries(cmd.Context(), args[0], limit)
+			if err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			if asJSON {
+				return printJSON(out, struct {
+					GitSource
+					Deliveries []GitDelivery `json:"deliveries"`
+				}{GitSource: *gs, Deliveries: deliveries})
+			}
+
+			printGitSource(out, gs)
+			fmt.Fprintf(out, "\nrecent deliveries:\n")
+			if len(deliveries) == 0 {
+				fmt.Fprintf(out, "  (none yet)\n")
+				return nil
+			}
+			tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(tw, "RECEIVED\tEVENT\tREF\tSHA\tSTATUS\tDEPLOYMENT")
+			for _, d := range deliveries {
+				deployment := "-"
+				if d.DeploymentNumber != nil {
+					deployment = "#" + strconv.Itoa(*d.DeploymentNumber)
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+					d.ReceivedAt, d.Event, d.Ref, shortSHA(d.CommitSHA), d.Status, deployment)
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON instead of a table")
+	cmd.Flags().IntVar(&limit, "limit", 20, "how many recent deliveries to show")
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newGitDisconnectCmd builds `basepod git disconnect <slug>`.
+func newGitDisconnectCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "disconnect <slug>",
+		Short:        "Disconnect an app's git repo",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			if err := client.DeleteGitSource(cmd.Context(), args[0]); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "disconnected %s\n", args[0])
+			return nil
+		},
+	}
 	addContextFlag(cmd)
 	return cmd
 }

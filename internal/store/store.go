@@ -100,13 +100,17 @@ func ValidDeployStrategy(s string) bool {
 // Deployment is a single deploy attempt for an App. StartedAt is always
 // set (RFC3339 UTC); FinishedAt is "" until the deployment reaches a
 // terminal status (see FinishDeployment). Source is "image" (a registry
-// pull, the original v0.1 path) or "tarball" (Task 6's build-from-upload
-// path). BuildLogPath is "" for image-sourced deployments, and the path
-// to a build log file on disk for tarball-sourced ones (see
-// SetDeploymentBuildLog). TriggerKind records what initiated the deploy —
-// "api" for a normal deploy and "rollback" for one created by Rollback;
-// named trigger_kind in the schema because "trigger" is a SQLite keyword.
-// Future triggers (a git webhook, a cron redeploy) add values here.
+// pull, the original v0.1 path), "tarball" (Task 6's build-from-upload
+// path), or "git" (the v0.5 git+compose plan's Task 4/5 clone-and-build
+// path — manual POST .../deploy/git or a webhook push). BuildLogPath is
+// "" for image-sourced deployments, and the path to a build log file on
+// disk for tarball- and git-sourced ones (see SetDeploymentBuildLog).
+// TriggerKind records what initiated the deploy — "api" for a normal
+// deploy, "rollback" for one created by Rollback, and "webhook" for one
+// created by the git webhook receiver; named trigger_kind in the schema
+// because "trigger" is a SQLite keyword. GitSha is the resolved commit a
+// git-sourced deployment built (see migration 00007_git_sources.sql and
+// SetDeploymentGitSHA) — "" for every non-git deployment.
 type Deployment struct {
 	ID           int64
 	AppID        int64
@@ -119,6 +123,7 @@ type Deployment struct {
 	Source       string
 	BuildLogPath string
 	TriggerKind  string
+	GitSha       string
 }
 
 // EnvVar is an environment variable for an App.
@@ -722,15 +727,29 @@ func (s *Store) SetDeploymentBuildLog(id int64, path string) error {
 	return err
 }
 
+// SetDeploymentGitSHA sets a deployment's git_sha — used by the git
+// deploy paths (v0.5 plan Tasks 4/5) once the commit a clone actually
+// checked out is known: a manual POST .../deploy/git deploy resolves it
+// before the deployment row is even created (the clone runs
+// synchronously there), while a webhook-triggered deploy resolves it only
+// once its background clone completes (see
+// deploy.Engine.DeployGitCloneAsync) — so this is called at a different
+// point in each path, unlike SetDeploymentImage/SetDeploymentBuildLog
+// which both tarball paths call at the same point.
+func (s *Store) SetDeploymentGitSHA(id int64, sha string) error {
+	_, err := s.db.Exec(`UPDATE deployments SET git_sha = ? WHERE id = ?`, sha, id)
+	return err
+}
+
 // scanDeploymentRows scans the common deployment column set (id, app_id,
 // number, image_ref, status, error, started_at, finished_at, source,
-// build_log_path, trigger_kind — in that order) shared by ListDeployments
-// and DeploymentByNumber.
+// build_log_path, trigger_kind, git_sha — in that order) shared by
+// ListDeployments, DeploymentByNumber, and DeploymentByID.
 func scanDeploymentRow(scan func(...any) error) (Deployment, error) {
 	var d Deployment
 	var finishedAt sql.NullString
 	err := scan(&d.ID, &d.AppID, &d.Number, &d.ImageRef, &d.Status, &d.Error, &d.StartedAt, &finishedAt,
-		&d.Source, &d.BuildLogPath, &d.TriggerKind)
+		&d.Source, &d.BuildLogPath, &d.TriggerKind, &d.GitSha)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -738,7 +757,7 @@ func scanDeploymentRow(scan func(...any) error) (Deployment, error) {
 	return d, nil
 }
 
-const deploymentColumns = `id, app_id, number, image_ref, status, error, started_at, finished_at, source, build_log_path, trigger_kind`
+const deploymentColumns = `id, app_id, number, image_ref, status, error, started_at, finished_at, source, build_log_path, trigger_kind, git_sha`
 
 // ListDeployments returns all deployments for appID, newest first.
 func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
@@ -765,6 +784,23 @@ func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
 func (s *Store) DeploymentByNumber(appID int64, number int) (*Deployment, error) {
 	row := s.db.QueryRow(`SELECT `+deploymentColumns+`
 		FROM deployments WHERE app_id = ? AND number = ?`, appID, number)
+	d, err := scanDeploymentRow(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// DeploymentByID looks up a single deployment by its store row ID, as
+// opposed to DeploymentByNumber's per-app Number — used by
+// internal/api's git delivery listing (Task 4/5) to resolve a
+// GitDelivery.DeploymentID into a displayable deployment number. Returns
+// ErrNotFound if no such deployment exists.
+func (s *Store) DeploymentByID(id int64) (*Deployment, error) {
+	row := s.db.QueryRow(`SELECT `+deploymentColumns+` FROM deployments WHERE id = ?`, id)
 	d, err := scanDeploymentRow(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -1101,6 +1137,22 @@ func (s *Store) InsertGitDelivery(d GitDelivery) (*GitDelivery, error) {
 	d.ID = id
 	d.ReceivedAt = now
 	return &d, nil
+}
+
+// UpdateGitDeliveryStatus updates a previously recorded delivery's status,
+// detail, and deployment_id — used by the webhook receiver (v0.5 plan
+// Task 5) when a delivery's true outcome is only known after the row was
+// already inserted optimistically: an accepted push is recorded
+// status="deployed" as soon as its build is queued (the deployment row
+// exists, but its clone/build runs in the background — see
+// deploy.Engine.DeployGitCloneAsync), and this flips it to "error" if
+// that clone or build actually fails. deploymentID may be nil to leave
+// the column NULL. Not an error if id doesn't exist — best-effort
+// bookkeeping, mirroring FinishDeployment's own shape.
+func (s *Store) UpdateGitDeliveryStatus(id int64, status, detail string, deploymentID *int64) error {
+	_, err := s.db.Exec(`UPDATE git_deliveries SET status = ?, detail = ?, deployment_id = ? WHERE id = ?`,
+		status, detail, nullableInt64(deploymentID), id)
+	return err
 }
 
 // ListGitDeliveries returns appID's most recent git deliveries, newest

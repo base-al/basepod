@@ -113,6 +113,10 @@ type deploymentResponse struct {
 	Source      string `json:"source"`
 	Trigger     string `json:"trigger"`
 	HasBuildLog bool   `json:"has_build_log"`
+	// GitSha is the resolved commit a "git"-sourced deployment built —
+	// "" for every other Source (v0.5 plan Task 4/5; see
+	// store.Deployment.GitSha's doc comment).
+	GitSha string `json:"git_sha"`
 }
 
 func toDeploymentResponse(d store.Deployment) deploymentResponse {
@@ -126,6 +130,7 @@ func toDeploymentResponse(d store.Deployment) deploymentResponse {
 		Source:      d.Source,
 		Trigger:     d.TriggerKind,
 		HasBuildLog: d.BuildLogPath != "",
+		GitSha:      d.GitSha,
 	}
 }
 

@@ -1913,3 +1913,113 @@ func TestMigrationVolumesStrategyDefaultsAppliesToExistingApp(t *testing.T) {
 		t.Fatalf("ListVolumes after migration = %+v", vols)
 	}
 }
+
+// TestSetDeploymentGitSHA proves git_sha persists and defaults to "" for
+// every non-git deployment (migration 00007_git_sources.sql).
+func TestSetDeploymentGitSHA(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("blog", "nginx:alpine", 80)
+
+	d, err := s.CreateDeploymentFull(app.ID, "", "git", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.GitSha != "" {
+		t.Fatalf("GitSha = %q, want empty before SetDeploymentGitSHA", d.GitSha)
+	}
+
+	if err := s.SetDeploymentGitSHA(d.ID, "abc123def456"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.DeploymentByNumber(app.ID, d.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GitSha != "abc123def456" {
+		t.Fatalf("GitSha = %q, want abc123def456", got.GitSha)
+	}
+	if got.Source != "git" {
+		t.Fatalf("Source = %q, want git", got.Source)
+	}
+
+	// A registry-image deployment never touches git_sha — it defaults to
+	// "" rather than NULL or some other sentinel.
+	imageDep, err := s.CreateDeployment(app.ID, "nginx:alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imageDep.GitSha != "" {
+		t.Fatalf("image-sourced deployment GitSha = %q, want empty", imageDep.GitSha)
+	}
+}
+
+// TestDeploymentByID proves DeploymentByID resolves a deployment by its
+// store row ID (as opposed to DeploymentByNumber's per-app Number), and
+// returns ErrNotFound for an unknown ID.
+func TestDeploymentByID(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("blog", "nginx:alpine", 80)
+	d, err := s.CreateDeployment(app.ID, "nginx:alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.DeploymentByID(d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != d.ID || got.Number != d.Number || got.AppID != app.ID {
+		t.Fatalf("DeploymentByID = %+v, want matching %+v", got, d)
+	}
+
+	if _, err := s.DeploymentByID(999999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown id: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestUpdateGitDeliveryStatus proves a delivery row inserted optimistically
+// (as the webhook receiver does — see the v0.5 plan's Task 5) can later be
+// flipped to a different status/detail/deployment_id, and that an unknown
+// id is a harmless no-op rather than an error.
+func TestUpdateGitDeliveryStatus(t *testing.T) {
+	s := open(t)
+	app, _ := s.CreateApp("blog", "nginx:alpine", 80)
+
+	delivery, err := s.InsertGitDelivery(GitDelivery{
+		AppID: app.ID, Provider: "github", Event: "push", Ref: "refs/heads/main",
+		CommitSHA: "sha1", Status: "deployed", Detail: "build queued",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dep, err := s.CreateDeploymentFull(app.ID, "", "git", "webhook")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateGitDeliveryStatus(delivery.ID, "error", "clone failed: timed out", &dep.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := s.ListGitDeliveries(app.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 delivery, got %d", len(list))
+	}
+	got := list[0]
+	if got.Status != "error" || got.Detail != "clone failed: timed out" {
+		t.Fatalf("delivery not updated: %+v", got)
+	}
+	if got.DeploymentID == nil || *got.DeploymentID != dep.ID {
+		t.Fatalf("expected deployment_id %d, got %+v", dep.ID, got.DeploymentID)
+	}
+
+	// Unknown id: no error, no rows affected.
+	if err := s.UpdateGitDeliveryStatus(999999, "error", "should not apply", nil); err != nil {
+		t.Fatalf("update of unknown id should be a no-op, got err: %v", err)
+	}
+}
