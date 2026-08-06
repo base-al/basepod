@@ -13,7 +13,7 @@
 
 **Test summary:** `go test ./... -count=1` all green (14 packages); `go test ./internal/deploy/ ./internal/api/ -race -count=1` green; `go vet ./...` clean; `gofmt -l .` clean; `CGO_ENABLED=0 go build ./...` clean; `govulncheck ./...` 0 vulnerabilities; web `npm run build && npm run type-check && npm test` all green (37 tests); `npm audit --audit-level=high` clean (only a pre-existing low-severity esbuild dev-server advisory).
 
-**CI run:** https://github.com/base-al/basepod/actions/runs/31110106249 — `test`: success (1m27s), `e2e`: success (2m13s).
+**CI run:** https://github.com/base-al/basepod/actions/runs/31110359435 (final push) — `test`: success (1m37s), `e2e`: success (1m58s). Prior push also green: https://github.com/base-al/basepod/actions/runs/31110106249 — `test`: success (1m27s), `e2e`: success (2m13s).
 
 **Concerns / follow-ups:**
 - The dashboard (Task 6) needed no functional code change: `web/src/lib/api.ts`'s `uploadTarball` (XHR) and `requestRaw` (fetch) both already treat any 2xx status as success, so a 202 was already handled correctly before this change — only a doc-comment was added to make that explicit.
