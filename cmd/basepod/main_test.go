@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/base-al/basepod/internal/gitsource"
 )
 
 // TestWarnAdminPasswordFlagWarnsWhenUsed proves warnAdminPasswordFlag
@@ -37,5 +39,38 @@ func TestWarnAdminPasswordFlagSilentWhenEmpty(t *testing.T) {
 
 	if buf.Len() != 0 {
 		t.Fatalf("expected no output for an empty password, got %q", buf.String())
+	}
+}
+
+// TestGitAskpassCommandPrintsTokenForPasswordPrompt proves the hidden
+// `internal-git-askpass` subcommand (see internal/gitsource.Fetch's
+// GIT_ASKPASS wiring) is actually connected to gitsource.Askpass: given a
+// password-style prompt as its one argument, it prints exactly the
+// configured deploy token, read from the environment — never anywhere
+// else — and nothing more.
+func TestGitAskpassCommandPrintsTokenForPasswordPrompt(t *testing.T) {
+	t.Setenv(gitsource.GitTokenEnvVar, "test-token-xyz")
+
+	cmd := newGitAskpassCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"Password for 'https://example.com': "})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimSpace(out.String())
+	if got != "test-token-xyz" {
+		t.Fatalf("got %q, want the token and nothing else", got)
+	}
+}
+
+// TestGitAskpassCommandIsHidden proves the subcommand doesn't show up in
+// `basepod --help` — it's an internal implementation detail of git
+// credential transport, not something an operator should run by hand.
+func TestGitAskpassCommandIsHidden(t *testing.T) {
+	cmd := newGitAskpassCmd()
+	if !cmd.Hidden {
+		t.Fatal("internal-git-askpass command must be Hidden")
 	}
 }

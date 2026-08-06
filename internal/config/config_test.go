@@ -36,6 +36,32 @@ func TestLoadFileAndEnvOverride(t *testing.T) {
 	}
 }
 
+// TestLoadGitPathFileAndEnvOverride proves git_path is read from the
+// config file and overridden by BASEPOD_GIT_PATH, mirroring
+// podman_socket/BASEPOD_PODMAN_SOCKET's existing behavior — see
+// internal/gitsource.BinPath, which this setting feeds.
+func TestLoadGitPathFileAndEnvOverride(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	os.WriteFile(p, []byte("git_path: /from/yaml/git\n"), 0o600)
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitPath != "/from/yaml/git" {
+		t.Fatalf("git_path from yaml = %q, want /from/yaml/git", cfg.GitPath)
+	}
+
+	t.Setenv("BASEPOD_GIT_PATH", "/from/env/git")
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitPath != "/from/env/git" {
+		t.Fatalf("git_path with env override = %q, want /from/env/git", cfg.GitPath)
+	}
+}
+
 // TestValidateListenLoopbackForms proves every accepted loopback spelling
 // (audit finding M5's "127.0.0.0/8, ::1, or localhost") passes without
 // BASEPOD_ALLOW_PUBLIC_LISTEN set.

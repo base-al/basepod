@@ -109,6 +109,50 @@ type Domain struct {
 	Hostname string
 }
 
+// GitSource is an app's connected git repo (push-to-deploy) configuration
+// — see migration 00007_git_sources.sql. SecretEncrypted and
+// TokenEncrypted are XChaCha20-Poly1305 ciphertexts (see
+// internal/crypto.SealAAD/OpenAAD); the caller (internal/api, Task 4 of
+// the v0.5 git+compose plan) is responsible for sealing/opening them with
+// AAD bound to (AppID, "git_secret") and (AppID, "git_token") respectively
+// — the same appID|key binding env var values use (see
+// internal/crypto.AAD) — so a ciphertext relocated onto a different app's
+// row fails to decrypt there. The store itself never seals or opens
+// anything; it persists exactly the ciphertext strings it's given.
+// TokenEncrypted is "" for a public repo needing no credential. HookID is
+// a random, non-secret URL path segment identifying this app's webhook
+// endpoint — never the secret itself.
+type GitSource struct {
+	ID              int64
+	AppID           int64
+	URL             string
+	Branch          string
+	Provider        string
+	HookID          string
+	SecretEncrypted string
+	TokenEncrypted  string
+	CreatedAt       string
+	UpdatedAt       string
+}
+
+// GitDelivery is one received (or attempted) webhook event, recorded for
+// the dashboard's "recent deliveries" view (see migration
+// 00007_git_sources.sql). Detail is a short human-readable string only —
+// NEVER a raw payload body or a secret. DeploymentID is nil unless Status
+// is "deployed" (the only outcome that actually triggers one).
+type GitDelivery struct {
+	ID           int64
+	AppID        int64
+	ReceivedAt   string
+	Provider     string
+	Event        string
+	Ref          string
+	CommitSHA    string
+	Status       string
+	Detail       string
+	DeploymentID *int64
+}
+
 // Store wraps a SQLite database connection.
 type Store struct {
 	db *sql.DB
@@ -876,4 +920,175 @@ func (s *Store) DeleteDomain(id int64) error {
 func (s *Store) DomainByHostname(hostname string) (*Domain, error) {
 	row := s.db.QueryRow(`SELECT id, app_id, hostname FROM domains WHERE hostname = ?`, hostname)
 	return scanDomain(row)
+}
+
+// DefaultGitDeliveryKeep is how many of an app's most recent git
+// deliveries InsertGitDelivery retains — see PruneGitDeliveries.
+const DefaultGitDeliveryKeep = 50
+
+const gitSourceColumns = `id, app_id, url, branch, provider, hook_id, secret_encrypted, token_encrypted, created_at, updated_at`
+
+func scanGitSource(scan func(...any) error) (GitSource, error) {
+	var g GitSource
+	err := scan(&g.ID, &g.AppID, &g.URL, &g.Branch, &g.Provider, &g.HookID,
+		&g.SecretEncrypted, &g.TokenEncrypted, &g.CreatedAt, &g.UpdatedAt)
+	return g, err
+}
+
+// UpsertGitSource inserts appID's git source config, or replaces it in
+// place (keyed by the UNIQUE app_id column — an app has at most one
+// connected repo) if one already exists. created_at is preserved across
+// an update; updated_at always advances to now. The caller owns deciding
+// whether hook_id/secret should stay stable across a reconnect (Task 4's
+// PUT handler, which re-PUTs the existing values unless the operator
+// asked to rotate) or change; this method persists exactly the row it's
+// given. Returns ErrNotFound if appID doesn't reference an existing app;
+// returns the underlying error if hook_id collides with a different row
+// (UNIQUE constraint — hook_id values are 24 random bytes hex-encoded by
+// the caller, so a collision should never happen in practice).
+func (s *Store) UpsertGitSource(g GitSource) (*GitSource, error) {
+	now := time.Now().UTC().Format(timeFormat)
+	_, err := s.db.Exec(`INSERT INTO git_sources(app_id, url, branch, provider, hook_id, secret_encrypted, token_encrypted, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(app_id) DO UPDATE SET
+			url = excluded.url,
+			branch = excluded.branch,
+			provider = excluded.provider,
+			hook_id = excluded.hook_id,
+			secret_encrypted = excluded.secret_encrypted,
+			token_encrypted = excluded.token_encrypted,
+			updated_at = excluded.updated_at`,
+		g.AppID, g.URL, g.Branch, g.Provider, g.HookID, g.SecretEncrypted, g.TokenEncrypted, now, now)
+	if err != nil {
+		// Map FOREIGN KEY constraint violation to ErrNotFound (mirrors
+		// AddDomain).
+		if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return s.GitSourceByAppID(g.AppID)
+}
+
+// GitSourceByAppID looks up an app's git source config. Returns
+// ErrNotFound if the app has none connected.
+func (s *Store) GitSourceByAppID(appID int64) (*GitSource, error) {
+	row := s.db.QueryRow(`SELECT `+gitSourceColumns+` FROM git_sources WHERE app_id = ?`, appID)
+	g, err := scanGitSource(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &g, nil
+}
+
+// GitSourceByHookID looks up a git source by its webhook path segment —
+// the unauthenticated webhook receiver's only way to resolve which app a
+// POST /api/v1/webhooks/git/{hookID} request is for. Returns ErrNotFound
+// if no source has that hook_id, which the receiver must map to the same
+// generic 404 an unknown route gets — no oracle for whether a hook ID was
+// ever valid (see the v0.5 git+compose plan's Task 5).
+func (s *Store) GitSourceByHookID(hookID string) (*GitSource, error) {
+	row := s.db.QueryRow(`SELECT `+gitSourceColumns+` FROM git_sources WHERE hook_id = ?`, hookID)
+	g, err := scanGitSource(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &g, nil
+}
+
+// DeleteGitSource disconnects appID's git repo, if any — not an error if
+// none was connected.
+func (s *Store) DeleteGitSource(appID int64) error {
+	_, err := s.db.Exec(`DELETE FROM git_sources WHERE app_id = ?`, appID)
+	return err
+}
+
+const gitDeliveryColumns = `id, app_id, received_at, provider, event, ref, commit_sha, status, detail, deployment_id`
+
+func scanGitDelivery(scan func(...any) error) (GitDelivery, error) {
+	var d GitDelivery
+	var deploymentID sql.NullInt64
+	err := scan(&d.ID, &d.AppID, &d.ReceivedAt, &d.Provider, &d.Event, &d.Ref,
+		&d.CommitSHA, &d.Status, &d.Detail, &deploymentID)
+	if err != nil {
+		return GitDelivery{}, err
+	}
+	if deploymentID.Valid {
+		v := deploymentID.Int64
+		d.DeploymentID = &v
+	}
+	return d, nil
+}
+
+// InsertGitDelivery records one received (or attempted) webhook event for
+// appID (ReceivedAt is always set to now, overriding whatever the caller
+// passed in d), then prunes that app's delivery log down to the
+// DefaultGitDeliveryKeep most recent rows (see PruneGitDeliveries) — so a
+// flood of webhook traffic, forged or otherwise, can never grow this
+// table unboundedly. Returns ErrNotFound if appID doesn't reference an
+// existing app.
+func (s *Store) InsertGitDelivery(d GitDelivery) (*GitDelivery, error) {
+	now := time.Now().UTC().Format(timeFormat)
+	res, err := s.db.Exec(`INSERT INTO git_deliveries(app_id, received_at, provider, event, ref, commit_sha, status, detail, deployment_id)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.AppID, now, d.Provider, d.Event, d.Ref, d.CommitSHA, d.Status, d.Detail, nullableInt64(d.DeploymentID))
+	if err != nil {
+		if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.PruneGitDeliveries(d.AppID, DefaultGitDeliveryKeep); err != nil {
+		return nil, err
+	}
+	d.ID = id
+	d.ReceivedAt = now
+	return &d, nil
+}
+
+// ListGitDeliveries returns appID's most recent git deliveries, newest
+// first, capped at limit rows.
+func (s *Store) ListGitDeliveries(appID int64, limit int) ([]GitDelivery, error) {
+	rows, err := s.db.Query(`SELECT `+gitDeliveryColumns+`
+		FROM git_deliveries WHERE app_id = ? ORDER BY received_at DESC, id DESC LIMIT ?`, appID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deliveries []GitDelivery
+	for rows.Next() {
+		d, err := scanGitDelivery(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		deliveries = append(deliveries, d)
+	}
+	return deliveries, rows.Err()
+}
+
+// PruneGitDeliveries deletes every one of appID's git deliveries except
+// the keep most recent (ordered newest-first by received_at, ties broken
+// by id — matching ListGitDeliveries' ordering), returning the number of
+// rows removed. Called automatically by InsertGitDelivery after every
+// insert; exposed separately so it's independently testable and callable
+// with a non-default keep.
+func (s *Store) PruneGitDeliveries(appID int64, keep int) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM git_deliveries WHERE app_id = ? AND id NOT IN (
+		SELECT id FROM git_deliveries WHERE app_id = ? ORDER BY received_at DESC, id DESC LIMIT ?
+	)`, appID, appID, keep)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

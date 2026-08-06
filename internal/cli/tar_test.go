@@ -7,13 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
-	"strings"
 	"testing"
+
+	"github.com/base-al/basepod/internal/tarpack"
 )
 
-// writeFile creates path (and its parent dirs) under dir with contents.
+// writeFile creates path (and its parent dirs) under dir with
+// contents — a local copy of tarpack's own test helper, since that
+// package's test file is not importable from here.
 func writeFile(t *testing.T, dir, path, contents string) {
 	t.Helper()
 	full := filepath.Join(dir, filepath.FromSlash(path))
@@ -25,18 +27,7 @@ func writeFile(t *testing.T, dir, path, contents string) {
 	}
 }
 
-// packAndList packs dir and returns the sorted list of entry names in the
-// resulting tarball (directories keep their trailing "/").
-func packAndList(t *testing.T, dir string) []string {
-	t.Helper()
-	var buf bytes.Buffer
-	if err := packDir(dir, &buf); err != nil {
-		t.Fatalf("packDir: %v", err)
-	}
-	return listTarEntries(t, buf.Bytes())
-}
-
-func listTarEntries(t *testing.T, gzData []byte) []string {
+func goldenTarListing(t *testing.T, gzData []byte) []string {
 	t.Helper()
 	gz, err := gzip.NewReader(bytes.NewReader(gzData))
 	if err != nil {
@@ -59,248 +50,69 @@ func listTarEntries(t *testing.T, gzData []byte) []string {
 	return names
 }
 
-func containsName(names []string, name string) bool {
-	for _, n := range names {
-		if n == name {
-			return true
-		}
-	}
-	return false
-}
-
-func TestHasContainerfile(t *testing.T) {
-	t.Run("Containerfile at root", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, dir, "Containerfile", "FROM scratch\n")
-		if !hasContainerfile(dir) {
-			t.Fatal("want true")
-		}
-	})
-	t.Run("Dockerfile at root", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, dir, "Dockerfile", "FROM scratch\n")
-		if !hasContainerfile(dir) {
-			t.Fatal("want true")
-		}
-	})
-	t.Run("neither present", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, dir, "README.md", "hi\n")
-		if hasContainerfile(dir) {
-			t.Fatal("want false")
-		}
-	})
-	t.Run("nested Dockerfile does not count", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFile(t, dir, "sub/Dockerfile", "FROM scratch\n")
-		if hasContainerfile(dir) {
-			t.Fatal("want false — Containerfile/Dockerfile must be at the root")
-		}
-	})
-}
-
-func TestPackDirAlwaysExcludesGitAndIgnoreFileItself(t *testing.T) {
+// TestPackDirWrapperMatchesTarpackGoldenListing proves internal/cli's
+// packDir/packToTempFile/hasContainerfile (see tar.go) are pure
+// pass-throughs to internal/tarpack (audit note from the v0.5 git+compose
+// plan's Task 1: `basepod deploy`'s output must stay byte-identical
+// across the packer's move out of this package) — packing the same
+// fixture directory through both entry points must produce byte-for-byte
+// identical tarballs and an identical, expected entry listing.
+func TestPackDirWrapperMatchesTarpackGoldenListing(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "Containerfile", "FROM scratch\n")
-	writeFile(t, dir, ".git/HEAD", "ref: refs/heads/main\n")
-	writeFile(t, dir, ".git/objects/pack/foo.pack", "binary\n")
-	writeFile(t, dir, ".basepodignore", "*.log\n")
 	writeFile(t, dir, "main.go", "package main\n")
-
-	names := packAndList(t, dir)
-
-	for _, n := range names {
-		if n == ".git/" || strings.HasPrefix(n, ".git/") {
-			t.Fatalf("names contains %q, .git must always be excluded: %v", n, names)
-		}
-	}
-	if containsName(names, ".basepodignore") {
-		t.Fatalf("names contains .basepodignore, it must always be excluded: %v", names)
-	}
-	if !containsName(names, "main.go") {
-		t.Fatalf("names missing main.go: %v", names)
-	}
-	if !containsName(names, "Containerfile") {
-		t.Fatalf("names missing Containerfile: %v", names)
-	}
-}
-
-func TestPackDirIgnorePatternsMatrix(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "Containerfile", "FROM scratch\n")
-	writeFile(t, dir, "keep.go", "package main\n")
+	writeFile(t, dir, "sub/nested.txt", "nested\n")
+	writeFile(t, dir, ".git/HEAD", "ref: refs/heads/main\n")
 	writeFile(t, dir, "debug.log", "log line\n")
-	writeFile(t, dir, "sub/debug.log", "nested log\n")
-	writeFile(t, dir, "node_modules/pkg/index.js", "module.exports = {}\n")
-	writeFile(t, dir, "build/output.bin", "binary\n")
-	writeFile(t, dir, "sub/build/output.bin", "nested binary, build/ is unanchored so this goes too\n")
-	writeFile(t, dir, "vendor/lib.go", "package vendor\n")
-	writeFile(t, dir, "keep/vendor-ish.go", "package keep\n") // must NOT be excluded by "vendor" glob (different name)
-	writeFile(t, dir, ".env", "SECRET=1\n")
-	writeFile(t, dir, "notes.txt", "# not a comment, a real file\n")
+	writeFile(t, dir, ".basepodignore", "*.log\n")
 
-	writeFile(t, dir, ".basepodignore", strings.Join([]string{
-		"# comment lines and blank lines are skipped",
-		"",
-		"*.log",         // unanchored glob — matches at any depth by base name
-		"node_modules/", // unanchored dir suffix — matches this dir at any depth
-		"/build/",       // anchored dir suffix — matches only at root
-		"/vendor",       // anchored, non-dir — matches only the root-level literal path
-		".env",          // unanchored literal (no glob chars) — exact base-name match
-	}, "\n"))
-
-	names := packAndList(t, dir)
-
-	wantAbsent := []string{
-		"debug.log", "sub/debug.log",
-		"node_modules/", "node_modules/pkg/index.js",
-		"build/", "build/output.bin",
-		"vendor/", "vendor/lib.go",
-		".env",
+	wantListing := []string{
+		"Containerfile", "main.go", "sub/", "sub/nested.txt",
 	}
-	for _, n := range wantAbsent {
-		if containsName(names, n) {
-			t.Errorf("names contains %q, want excluded: %v", n, names)
+
+	var viaWrapper bytes.Buffer
+	if err := packDir(dir, &viaWrapper); err != nil {
+		t.Fatalf("cli.packDir: %v", err)
+	}
+	var viaTarpack bytes.Buffer
+	if err := tarpack.PackDir(dir, &viaTarpack); err != nil {
+		t.Fatalf("tarpack.PackDir: %v", err)
+	}
+
+	if !bytes.Equal(viaWrapper.Bytes(), viaTarpack.Bytes()) {
+		t.Fatal("cli.packDir and tarpack.PackDir produced different bytes for the same input — the wrapper must be byte-identical")
+	}
+
+	got := goldenTarListing(t, viaWrapper.Bytes())
+	if len(got) != len(wantListing) {
+		t.Fatalf("entry listing = %v, want %v", got, wantListing)
+	}
+	for i := range wantListing {
+		if got[i] != wantListing[i] {
+			t.Fatalf("entry listing = %v, want %v", got, wantListing)
 		}
 	}
 
-	wantPresent := []string{
-		"Containerfile", "keep.go", "notes.txt",
-		"keep/", "keep/vendor-ish.go",
-		"sub/", "sub/build/", "sub/build/output.bin", // /build/ is anchored to root, so sub/build/ survives
+	if !hasContainerfile(dir) {
+		t.Fatal("cli.hasContainerfile: want true for a fixture with a root Containerfile")
 	}
-	for _, n := range wantPresent {
-		if !containsName(names, n) {
-			t.Errorf("names missing %q, want present: %v", n, names)
-		}
-	}
-}
-
-func TestPackDirDeterministicAcrossRuns(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "Containerfile", "FROM scratch\n")
-	writeFile(t, dir, "a.txt", "a\n")
-	writeFile(t, dir, "sub/b.txt", "b\n")
-	writeFile(t, dir, "sub/c.txt", "c\n")
-
-	var buf1, buf2 bytes.Buffer
-	if err := packDir(dir, &buf1); err != nil {
-		t.Fatalf("packDir #1: %v", err)
-	}
-	if err := packDir(dir, &buf2); err != nil {
-		t.Fatalf("packDir #2: %v", err)
-	}
-	if !bytes.Equal(buf1.Bytes(), buf2.Bytes()) {
-		t.Fatal("two packDir runs over the same input produced different bytes, want identical (deterministic) output")
-	}
-}
-
-func TestPackDirEntryOrderIsLexicallySorted(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "Containerfile", "FROM scratch\n")
-	writeFile(t, dir, "zzz.txt", "z\n")
-	writeFile(t, dir, "aaa.txt", "a\n")
-	writeFile(t, dir, "mmm/nested.txt", "m\n")
-
-	var buf bytes.Buffer
-	if err := packDir(dir, &buf); err != nil {
-		t.Fatalf("packDir: %v", err)
-	}
-	gz, err := gzip.NewReader(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	var order []string
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		order = append(order, hdr.Name)
-	}
-	if !sort.StringsAreSorted(order) {
-		t.Fatalf("entries not in sorted order: %v", order)
-	}
-}
-
-func TestPackToTempFileSizeAndReadability(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "Containerfile", "FROM scratch\n")
-	writeFile(t, dir, "app.py", "print('hi')\n")
 
 	f, size, err := packToTempFile(dir)
 	if err != nil {
-		t.Fatalf("packToTempFile: %v", err)
+		t.Fatalf("cli.packToTempFile: %v", err)
 	}
 	defer func() {
 		f.Close()
 		os.Remove(f.Name())
 	}()
-
-	info, err := f.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Size() != size {
-		t.Fatalf("reported size %d != actual file size %d", size, info.Size())
-	}
 	if size == 0 {
-		t.Fatal("size == 0, want a non-empty tarball")
+		t.Fatal("cli.packToTempFile: size == 0, want a non-empty tarball")
 	}
-
 	data, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	names := listTarEntries(t, data)
-	if !containsName(names, "app.py") {
-		t.Fatalf("names missing app.py: %v", names)
-	}
-}
-
-// TestPackDirSkipsSymlinksPointingOutsideTheBuildContext proves packDir
-// neither includes a symlink entry itself nor follows it into the tarball
-// — a symlink that escapes the build context (e.g. into the packer's own
-// working directory, or anywhere else on the host filesystem the server
-// was never meant to see) must not leak its target's contents into an
-// uploaded build context.
-func TestPackDirSkipsSymlinksPointingOutsideTheBuildContext(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("os.Symlink requires elevated privileges on windows")
-	}
-
-	outside := t.TempDir()
-	secretPath := filepath.Join(outside, "secret.txt")
-	const secretContents = "outside-the-build-context-should-never-be-uploaded"
-	if err := os.WriteFile(secretPath, []byte(secretContents), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	dir := t.TempDir()
-	writeFile(t, dir, "Containerfile", "FROM scratch\n")
-	writeFile(t, dir, "app.py", "print('hi')\n")
-	if err := os.Symlink(secretPath, filepath.Join(dir, "escape-link")); err != nil {
-		t.Fatal(err)
-	}
-
-	var buf bytes.Buffer
-	if err := packDir(dir, &buf); err != nil {
-		t.Fatalf("packDir: %v", err)
-	}
-
-	names := listTarEntries(t, buf.Bytes())
-	if containsName(names, "escape-link") {
-		t.Fatalf("names contains the symlink itself, want it skipped: %v", names)
-	}
-	if !containsName(names, "app.py") || !containsName(names, "Containerfile") {
-		t.Fatalf("names missing real files: %v", names)
-	}
-	if bytes.Contains(buf.Bytes(), []byte(secretContents)) {
-		t.Fatal("packed tarball contains the symlink target's content — the symlink was followed instead of skipped")
+	if !bytes.Equal(data, viaWrapper.Bytes()) {
+		t.Fatal("cli.packToTempFile produced different bytes than cli.packDir for the same input")
 	}
 }

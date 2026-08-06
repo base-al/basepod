@@ -9,6 +9,7 @@ import (
 
 	"github.com/base-al/basepod/internal/cli"
 	"github.com/base-al/basepod/internal/config"
+	"github.com/base-al/basepod/internal/gitsource"
 	"github.com/base-al/basepod/internal/server"
 )
 
@@ -22,6 +23,7 @@ func main() {
 		}},
 		newServerCmd(),
 		newSetupCmd(),
+		newGitAskpassCmd(),
 	)
 	root.AddCommand(cli.Commands()...)
 	if err := root.Execute(); err != nil {
@@ -116,4 +118,29 @@ func newSetupCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "data directory (default: system data dir)")
 
 	return cmd
+}
+
+// newGitAskpassCmd wires internal/gitsource.Askpass into a hidden
+// subcommand: internal/gitsource.Cloner.Fetch points GIT_ASKPASS at a
+// small wrapper script that re-execs this same basepod binary as
+// `basepod internal-git-askpass <prompt>` for every credential prompt
+// git itself raises during a private-repo clone. Hidden because it's
+// never meant to be run directly by an operator — see gitsource's
+// package doc comment for why the token reaches git this way (never in
+// argv, the clone URL, or on-disk git config) rather than any simpler
+// alternative.
+func newGitAskpassCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "internal-git-askpass [prompt]",
+		Hidden: true,
+		Args:   cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var prompt string
+			if len(args) > 0 {
+				prompt = args[0]
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), gitsource.Askpass(prompt))
+			return nil
+		},
+	}
 }
