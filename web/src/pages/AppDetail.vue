@@ -7,6 +7,7 @@ import type { TabsItem } from '@nuxt/ui'
 
 import { api, ApiError } from '../lib/api'
 import { isPendingPlaceholder } from '../lib/pendingImage'
+import AppShell from '../components/AppShell.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import ImageRef from '../components/ImageRef.vue'
 import DeploymentList from '../components/DeploymentList.vue'
@@ -211,32 +212,36 @@ const deleteMutation = useMutation({
 </script>
 
 <template>
-  <div class="min-h-screen bg-slate-950">
-    <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
-      <div class="mx-auto flex max-w-5xl items-center gap-3 px-6 py-3">
-        <UButton to="/" color="neutral" variant="ghost" square size="sm" icon="i-lucide-arrow-left" aria-label="Back to apps" />
+  <AppShell max-width="5xl">
+    <div class="mb-6 flex flex-wrap items-center gap-3">
+      <RouterLink
+        :to="{ name: 'apps' }"
+        class="flex items-center gap-1 rounded-md text-sm text-slate-400 transition-colors hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400"
+      >
+        <UIcon name="i-lucide-arrow-left" class="h-4 w-4" aria-hidden="true" />
+        Apps
+      </RouterLink>
+      <span class="text-slate-700" aria-hidden="true">/</span>
 
-        <template v-if="app">
-          <span class="font-mono text-base font-semibold tracking-tight text-slate-100">{{ app.slug }}</span>
-          <StatusBadge :status="displayStatus" />
-          <a
-            v-if="generatedDomain"
-            :href="`https://${generatedDomain}`"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="flex items-center gap-1 font-mono text-xs text-emerald-400 hover:underline"
-          >
-            {{ generatedDomain }}
-            <UIcon name="i-lucide-external-link" class="h-3 w-3" />
-          </a>
-          <ImageRef :value="app.image" class="ml-auto max-w-xs" />
-        </template>
-        <span v-else-if="appQuery.isPending.value" class="text-sm text-slate-500">Loading…</span>
-      </div>
-    </header>
+      <template v-if="app">
+        <span class="font-mono text-base font-semibold tracking-tight text-slate-100">{{ app.slug }}</span>
+        <StatusBadge :status="displayStatus" />
+        <a
+          v-if="generatedDomain"
+          :href="`https://${generatedDomain}`"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="flex items-center gap-1 font-mono text-xs text-emerald-400 hover:underline"
+        >
+          {{ generatedDomain }}
+          <UIcon name="i-lucide-external-link" class="h-3 w-3" />
+        </a>
+        <ImageRef :value="app.image" class="ml-auto max-w-xs" />
+      </template>
+      <span v-else-if="appQuery.isPending.value" class="text-sm text-slate-500">Loading…</span>
+    </div>
 
-    <main class="mx-auto max-w-5xl px-6 py-8">
-      <UAlert
+    <UAlert
         v-if="appQuery.isError.value"
         color="error"
         variant="subtle"
@@ -431,7 +436,6 @@ const deleteMutation = useMutation({
           </UCard>
         </div>
       </template>
-    </main>
 
     <ConfirmDanger
       v-if="app"
@@ -444,5 +448,5 @@ const deleteMutation = useMutation({
       @update:open="(value) => (deleteModalOpen = value)"
       @confirm="deleteMutation.mutate()"
     />
-  </div>
+  </AppShell>
 </template>
