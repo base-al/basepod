@@ -616,6 +616,40 @@ func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
 	return nil
 }
 
+// EnsureVolume makes sure a named volume exists, creating it (with the
+// given labels — typically basepod.managed=true, basepod.app=<slug>, see
+// internal/deploy's VolumeName/runRollout) if it doesn't. Unlike
+// EnsureNetwork, an already-existing volume's labels are left untouched
+// (verified live: mounting a pre-existing named volume by name in a
+// container's "volumes" field preserves whatever labels it already has —
+// see volumeCreate's doc comment for the full trail) — there is no
+// self-heal case to handle, since BasePod always creates its own volumes
+// with the right labels up front and never mutates them afterward. name
+// is url.PathEscape'd for the same reason as every other name/ref this
+// file puts into a URL (see ImageExists's doc comment).
+func (c *Client) EnsureVolume(ctx context.Context, name string, labels map[string]string) error {
+	status, data, err := c.request(ctx, http.MethodGet, "/volumes/"+url.PathEscape(name)+"/exists", nil)
+	if err != nil {
+		return fmt.Errorf("podman: checking volume %q: %w", name, err)
+	}
+	if status < 300 {
+		return nil
+	}
+	if status != http.StatusNotFound {
+		return apiError(status, data)
+	}
+
+	body := volumeCreate{Name: name, Labels: labels}
+	status, data, err = c.request(ctx, http.MethodPost, "/volumes/create", body)
+	if err != nil {
+		return fmt.Errorf("podman: creating volume %q: %w", name, err)
+	}
+	if status >= 300 {
+		return apiError(status, data)
+	}
+	return nil
+}
+
 // selfHealNetworkDNS inspects an already-existing network and, if it has
 // DNS resolution disabled, recreates it with DNS enabled — but ONLY when
 // no basepod-managed container is currently attached to it: recreating a
@@ -793,6 +827,16 @@ func (c *Client) CreateContainer(ctx context.Context, spec CreateSpec) (string, 
 			sm.Options = []string{"ro"}
 		}
 		sg.Mounts = append(sg.Mounts, sm)
+	}
+
+	// spec.NamedVolumes are expected to already exist (see EnsureVolume,
+	// called by internal/deploy's runRollout before CreateContainer) so
+	// they carry BasePod's basepod.managed/basepod.app labels — libpod
+	// would otherwise auto-create an unlabeled volume on first reference
+	// here, which NamedVolume's wire type has no way to label anyway (see
+	// its doc comment).
+	for _, v := range spec.NamedVolumes {
+		sg.Volumes = append(sg.Volumes, namedVolume{Name: v.Name, Dest: v.Dest})
 	}
 
 	status, data, err := c.request(ctx, http.MethodPost, "/containers/create", sg)

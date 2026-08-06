@@ -58,12 +58,48 @@ type appResponse struct {
 	MemoryLimitMB int64   `json:"memory_limit_mb"`
 	CPULimit      float64 `json:"cpu_limit"`
 	PidsLimit     int64   `json:"pids_limit"`
+	// DeployStrategy ("zero-downtime" | "replace") and Volumes are v0.5
+	// Task 6's additions — see store.App.DeployStrategy's doc comment for
+	// what each strategy means and the "replace" trade (a failed replace
+	// deploy leaves the app down with status "error", by design, since
+	// there is no old container left to fall back to). Volumes lists the
+	// app's declared named volumes (never the underlying libpod volume's
+	// actual name — see volumeResponse).
+	DeployStrategy string           `json:"deploy_strategy"`
+	Volumes        []volumeResponse `json:"volumes"`
 }
 
-func toAppResponse(app *store.App) appResponse {
+// volumeResponse is the wire shape of one of an app's declared volumes —
+// backs both appResponse.Volumes and GET /api/v1/apps/{slug}/volumes.
+// Name is the app-scoped logical name (store.Volume.Name), NOT the
+// derived libpod volume name ("bp-<slug>-<name>", see
+// internal/deploy.VolumeName) — the API never needs to expose that
+// derivation; podman.CreateSpec/EnsureVolume are the only consumers of
+// the real name.
+type volumeResponse struct {
+	Name          string `json:"name"`
+	ContainerPath string `json:"container_path"`
+}
+
+func toVolumeResponses(volumes []store.Volume) []volumeResponse {
+	out := make([]volumeResponse, 0, len(volumes))
+	for _, v := range volumes {
+		out = append(out, volumeResponse{Name: v.Name, ContainerPath: v.ContainerPath})
+	}
+	return out
+}
+
+// toAppResponse builds an app's JSON representation. volumes is supplied
+// by the caller (rather than queried here) so a caller that already knows
+// there can't be any yet — handleCreateApp: manual volume create/delete
+// is out of scope this milestone, so a just-created app never has one —
+// can skip the extra store round trip.
+func toAppResponse(app *store.App, volumes []store.Volume) appResponse {
 	return appResponse{
 		Slug: app.Slug, Image: app.ImageRef, Port: app.Port, Status: app.Status,
 		MemoryLimitMB: app.MemoryLimitMB, CPULimit: app.CPULimit, PidsLimit: app.PidsLimit,
+		DeployStrategy: app.DeployStrategy,
+		Volumes:        toVolumeResponses(volumes),
 	}
 }
 
@@ -183,7 +219,12 @@ func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toAppResponse(app))
+	// A freshly created app can't have any declared volumes yet — manual
+	// volume create/delete is out of scope this milestone (Task 8's
+	// compose apply is the only writer, and it always operates on an app
+	// that already exists) — so this skips the extra ListVolumes round
+	// trip rather than querying for a result that's always empty.
+	writeJSON(w, http.StatusCreated, toAppResponse(app, nil))
 }
 
 // isUniqueConstraintErr reports whether err looks like a SQLite UNIQUE
@@ -203,7 +244,12 @@ func (a *api) handleListApps(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]appResponse, 0, len(apps))
 	for i := range apps {
-		out = append(out, toAppResponse(&apps[i]))
+		volumes, err := a.st.ListVolumes(apps[i].ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "failed to list volumes")
+			return
+		}
+		out = append(out, toAppResponse(&apps[i], volumes))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -237,9 +283,14 @@ func (a *api) handleGetApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to list deployments")
 		return
 	}
+	volumes, err := a.st.ListVolumes(app.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to list volumes")
+		return
+	}
 
 	out := appDetailResponse{
-		appResponse: toAppResponse(app),
+		appResponse: toAppResponse(app, volumes),
 		Deployments: make([]deploymentResponse, 0, len(deployments)),
 	}
 	for _, d := range deployments {
@@ -304,25 +355,32 @@ func validatePidsLimit(pids int64) string {
 	return ""
 }
 
-// patchAppRequest is the body for PATCH /api/v1/apps/{slug}: every field is
-// a pointer so an omitted field leaves that limit unchanged (a partial
-// update), distinguishing "not sent" from "sent as 0" (which is a real,
-// meaningful value — unlimited — not a no-op).
+// patchAppRequest is the body for PATCH /api/v1/apps/{slug}: the three
+// resource-limit fields are pointers so an omitted field leaves that limit
+// unchanged (a partial update), distinguishing "not sent" from "sent as 0"
+// (which is a real, meaningful value — unlimited — not a no-op).
+// DeployStrategy is a plain string pointer for the same "not sent" reason,
+// though it has no meaningful zero value of its own — see
+// store.ValidDeployStrategy.
 type patchAppRequest struct {
-	MemoryLimitMB *int64   `json:"memory_limit_mb"`
-	CPULimit      *float64 `json:"cpu_limit"`
-	PidsLimit     *int64   `json:"pids_limit"`
+	MemoryLimitMB  *int64   `json:"memory_limit_mb"`
+	CPULimit       *float64 `json:"cpu_limit"`
+	PidsLimit      *int64   `json:"pids_limit"`
+	DeployStrategy *string  `json:"deploy_strategy"`
 }
 
-// handlePatchApp updates an app's container resource limits (audit H2):
+// handlePatchApp updates an app's container resource limits (audit H2) —
 // memory_limit_mb, cpu_limit, and pids_limit, each independently optional
 // in the request body (an omitted field is left unchanged) and each
-// independently validated against its own min/max — a request naming more
-// than one out-of-range field still gets a single 422 naming whichever is
-// checked first (memory, then cpu, then pids). Values only take effect on
-// the app's containers starting from its *next* deploy; this endpoint
-// itself never touches a running container, matching how env var changes
-// (PUT .../env) work today.
+// independently validated against its own min/max, a request naming more
+// than one out-of-range field still getting a single 422 naming whichever
+// is checked first (memory, then cpu, then pids, then deploy_strategy) —
+// and, as of v0.5 Task 6, deploy_strategy (store.ValidDeployStrategy;
+// unknown value -> 422 "validation"). Values only take effect on the
+// app's containers starting from its *next* deploy/rollback (see
+// internal/deploy's runRollout); this endpoint itself never touches a
+// running container, matching how env var changes (PUT .../env) work
+// today.
 func (a *api) handlePatchApp(w http.ResponseWriter, r *http.Request) {
 	app, ok := a.appBySlugOrNotFound(w, r)
 	if !ok {
@@ -361,13 +419,35 @@ func (a *api) handlePatchApp(w http.ResponseWriter, r *http.Request) {
 		pids = *req.PidsLimit
 	}
 
+	strategy := app.DeployStrategy
+	if req.DeployStrategy != nil {
+		if !store.ValidDeployStrategy(*req.DeployStrategy) {
+			writeError(w, http.StatusUnprocessableEntity, "validation",
+				`deploy_strategy must be "zero-downtime" or "replace"`)
+			return
+		}
+		strategy = *req.DeployStrategy
+	}
+
 	if err := a.st.UpdateAppLimits(app.ID, memory, cpu, pids); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to update app limits")
 		return
 	}
+	if strategy != app.DeployStrategy {
+		if err := a.st.UpdateAppDeployStrategy(app.ID, strategy); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "failed to update app deploy strategy")
+			return
+		}
+	}
 
-	app.MemoryLimitMB, app.CPULimit, app.PidsLimit = memory, cpu, pids
-	writeJSON(w, http.StatusOK, toAppResponse(app))
+	app.MemoryLimitMB, app.CPULimit, app.PidsLimit, app.DeployStrategy = memory, cpu, pids, strategy
+
+	volumes, err := a.st.ListVolumes(app.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to list volumes")
+		return
+	}
+	writeJSON(w, http.StatusOK, toAppResponse(app, volumes))
 }
 
 type deployRequest struct {
@@ -594,6 +674,26 @@ func (a *api) handleGetDeployment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
 }
 
+// handleListAppVolumes returns an app's declared named volumes
+// (read-only — v0.5 Task 6: manual volume create/delete stays deferred to
+// v0.6+, Task 8's compose apply is the only writer this milestone). Same
+// shape as appResponse.Volumes; exposed as its own route so a caller that
+// only needs volumes doesn't have to fetch the full app+deployment-history
+// payload GET /apps/{slug} returns.
+func (a *api) handleListAppVolumes(w http.ResponseWriter, r *http.Request) {
+	app, ok := a.appBySlugOrNotFound(w, r)
+	if !ok {
+		return
+	}
+
+	volumes, err := a.st.ListVolumes(app.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to list volumes")
+		return
+	}
+	writeJSON(w, http.StatusOK, toVolumeResponses(volumes))
+}
+
 // handleDeleteApp tears down an app's containers/routes via the Deployer
 // and then removes its store row. If teardown fails, the app row is left
 // in place (matching the store's foreign-key ownership of deployments)
@@ -609,10 +709,29 @@ func (a *api) handleGetDeployment(w http.ResponseWriter, r *http.Request) {
 // error response: the app is already gone from the API's/store's
 // perspective by this point, so there's nothing left for the caller to
 // retry.
+//
+// v0.5 Task 6: an app's declared named volumes deliberately survive its
+// delete — the underlying libpod volume is never removed (data outlives
+// the app row; see migration 00008_volumes_strategy.sql's doc comment and
+// store.DeleteApp's — this matches BasePod's standing "never delete data
+// without confirmation" stance, and manual volume delete is out of scope
+// this milestone regardless). This handler's only obligation toward that
+// data is to tell the operator it's still there: it snapshots the app's
+// volumes via ListVolumes BEFORE DeleteApp removes the (cascade-deleted)
+// bookkeeping rows, and if any existed, logs their real libpod names
+// (internal/deploy.VolumeName) with a manual `podman volume rm` cleanup
+// hint — the same log-not-relay treatment as the teardown error above,
+// since the app is already gone from the caller's perspective by the time
+// this runs.
 func (a *api) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	app, ok := a.appBySlugOrNotFound(w, r)
 	if !ok {
 		return
+	}
+
+	volumes, err := a.st.ListVolumes(app.ID)
+	if err != nil {
+		log.Printf("api: delete app %s: list volumes: %v", app.Slug, err)
 	}
 
 	if err := a.dep.RemoveApp(r.Context(), app); err != nil {
@@ -629,6 +748,16 @@ func (a *api) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	if err := a.st.DeleteApp(app.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to delete app")
 		return
+	}
+
+	if len(volumes) > 0 {
+		names := make([]string, len(volumes))
+		for i, v := range volumes {
+			names[i] = deploy.VolumeName(app.Slug, v.Name)
+		}
+		log.Printf("api: delete app %s: %d named volume(s) were NOT removed (data outlives the app row) — "+
+			"run `podman volume rm %s` manually to reclaim disk space if the data is no longer needed",
+			app.Slug, len(volumes), strings.Join(names, " "))
 	}
 
 	if a.builder != nil {

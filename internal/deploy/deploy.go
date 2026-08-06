@@ -77,6 +77,33 @@ const (
 	legacyAliasPrefix = "bp-"
 )
 
+// VolumeName derives the actual libpod volume name for an app's declared
+// volume (store.Volume.Name, e.g. "data") — "bp-<slug>-<name>", per v0.5
+// Task 6. Podman namespaces volumes separately from containers/networks,
+// so this reusing the "bp-" prefix already used for container names
+// ("bp-<slug>-<n>", see runRollout) cannot collide with one — they are
+// different libpod resource kinds. Exported so the API layer
+// (handleDeleteApp) can log the names of volumes that survive an app
+// delete without duplicating this derivation — see store.DeleteApp's doc
+// comment.
+func VolumeName(slug, name string) string {
+	return "bp-" + slug + "-" + name
+}
+
+// volumeLabels returns the fixed label set every BasePod-managed named
+// volume carries (see EnsureVolume calls in runRollout) — mirrors the
+// basepod.managed/basepod.app pair every app container also carries (see
+// runRollout's spec.Labels), so volumes are discoverable/attributable the
+// same way containers already are. Deliberately NOT basepod.deployment:
+// unlike a container, a volume outlives any single deployment generation
+// (and the app row itself — see store.DeleteApp's doc comment).
+func volumeLabels(slug string) map[string]string {
+	return map[string]string{
+		"basepod.managed": "true",
+		"basepod.app":     slug,
+	}
+}
+
 // Engine drives app deployments: pull, create, start, probe, cut traffic
 // over, and tear down the previous container generation.
 type Engine struct {
@@ -581,8 +608,59 @@ func (e *Engine) Rollback(ctx context.Context, app *store.App, targetNumber int)
 // pulls imageRef itself: Deploy pulls before calling this, and
 // DeployBuild must not (see its doc comment) — a built image is already
 // local.
+//
+// v0.5 Task 6: every one of app's declared volumes (store.ListVolumes) is
+// mounted into the new container, and app.DeployStrategy governs cutover
+// ordering — see store.App's DeployStrategy doc comment and migration
+// 00008_volumes_strategy.sql for the full rationale. The default,
+// DeployStrategyZeroDowntime, is exactly the create-new-then-remove-old
+// sequence this function always ran before volumes existed. Volume-backed
+// (or operator-opted-in) apps instead use DeployStrategyReplace, which
+// removes the OLD container generation up front, before the new one is
+// even created — see the removeOldContainers call below. That is a
+// deliberate, documented trade: two containers must never write the same
+// named volume at once (SQLite/Postgres-style corruption), so the overlap
+// zero-downtime rollout depends on is unsafe here, and the cost is that a
+// deploy which fails after this point has no old container left to fall
+// back to — fail()'s own "is any other generation of this app still
+// running?" check finds none, and correctly leaves the app status
+// "error" rather than "running". This is surfaced in the app JSON
+// (deploy_strategy) and documented here and in the migration, not just
+// silently accepted.
 func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Deployment, imageRef string) (*store.Deployment, error) {
 	name := fmt.Sprintf("bp-%s-%d", app.Slug, dep.Number)
+
+	volumes, err := e.st.ListVolumes(app.ID)
+	if err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: list volumes: %w", err))
+	}
+	var namedVolumes []podman.NamedVolume
+	if len(volumes) > 0 {
+		labels := volumeLabels(app.Slug)
+		for _, v := range volumes {
+			volName := VolumeName(app.Slug, v.Name)
+			// Pre-create/label the volume rather than letting libpod
+			// auto-create it unlabeled on first container reference — see
+			// podman.Client.EnsureVolume's doc comment. A no-op for every
+			// rollout after the app's first (the volume already exists by
+			// then, labels untouched).
+			if err := e.rt.EnsureVolume(ctx, volName, labels); err != nil {
+				return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: ensure volume %s: %w", volName, err))
+			}
+			namedVolumes = append(namedVolumes, podman.NamedVolume{Name: volName, Dest: v.ContainerPath})
+		}
+	}
+
+	// DeployStrategyReplace: stop+remove every existing container
+	// generation for this app BEFORE creating the new one — see this
+	// function's doc comment. dep.Number is the deployment just created
+	// for THIS rollout, so no existing container can carry it yet;
+	// passing it as the "keep" number here removes every container
+	// currently up for the app, not just older-numbered ones.
+	if app.DeployStrategy == store.DeployStrategyReplace {
+		e.removeOldContainers(ctx, app.Slug, dep.Number)
+	}
+
 	spec := podman.CreateSpec{
 		Name:  name,
 		Image: imageRef,
@@ -614,6 +692,10 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 		MemoryLimitBytes: app.MemoryLimitMB * 1024 * 1024,
 		CPUQuota:         app.CPULimit,
 		PidsLimit:        app.PidsLimit,
+		// NamedVolumes (v0.5 Task 6): every one of app's declared volumes,
+		// mounted at its configured container path — see this function's
+		// doc comment.
+		NamedVolumes: namedVolumes,
 	}
 
 	envVars, err := e.st.ListEnvVars(app.ID)

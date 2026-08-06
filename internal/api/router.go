@@ -216,6 +216,7 @@ func newRouter(a *api) http.Handler {
 			r.Get("/apps/{slug}", a.handleGetApp)
 			r.Patch("/apps/{slug}", a.handlePatchApp)
 			r.Get("/apps/{slug}/deployments/{number}", a.handleGetDeployment)
+			r.Get("/apps/{slug}/volumes", a.handleListAppVolumes)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
 			r.Post("/apps/{slug}/rollback", a.handleRollback)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)
