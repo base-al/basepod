@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -558,6 +559,104 @@ func TestComposeDryRunMutatesNothing(t *testing.T) {
 	}
 	if len(dep.callOrder()) != 0 {
 		t.Fatalf("dry run must never call the deployer, got %v", dep.callOrder())
+	}
+}
+
+// TestComposeDryRunPreviewIncludesImageBuildVolumesEnvKeysButNeverEnvValues
+// proves issue #12's fix: a dry-run preview carries enough for an
+// operator to review a plan before it mutates anything — each service's
+// image ref, build context (for a `build:` service), named volumes, and
+// env var keys — while NEVER leaking an env var's value anywhere in the
+// response body, even though the uploaded compose file sets one to an
+// unmistakably secret-shaped string. This is the response's one hard
+// security property (env values are write-only everywhere else in the
+// product; a preview must not be the exception), checked twice: once via
+// the decoded struct (EnvKeys correct, values absent) and once as a raw
+// substring search over the whole response body (defense in depth against
+// a value leaking through some field this test didn't think to check).
+func TestComposeDryRunPreviewIncludesImageBuildVolumesEnvKeysButNeverEnvValues(t *testing.T) {
+	st := newTestStore(t)
+	dep := newComposeFakeDeployer(st)
+	srv := newTestServer(t, st, dep, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+
+	const secretValue = "sk_live_dry_run_should_never_leak_this_51fd2c"
+
+	yaml := "name: preview-full\n" +
+		"services:\n" +
+		"  db:\n" +
+		"    image: postgres:16\n" +
+		"    environment:\n" +
+		"      POSTGRES_PASSWORD: " + secretValue + "\n" +
+		"      POSTGRES_USER: app\n" +
+		"    volumes:\n" +
+		"      - data:/var/lib/postgresql/data\n" +
+		"  web:\n" +
+		"    build:\n" +
+		"      context: ./web\n" +
+		"      dockerfile: Dockerfile.prod\n" +
+		"    expose: [80]\n" +
+		"    depends_on: [db]\n" +
+		"volumes:\n" +
+		"  data:\n"
+
+	httpResp := postComposeUpload(t, srv.URL, session.Token, "dry_run=1", yaml)
+	if httpResp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", httpResp.StatusCode)
+	}
+	rawBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	// Defense in depth: the secret value must not appear ANYWHERE in the
+	// raw response bytes, regardless of which field this test does or
+	// doesn't otherwise assert on.
+	if strings.Contains(string(rawBody), secretValue) {
+		t.Fatalf("compose dry-run preview leaked an env var value into the response body: %s", rawBody)
+	}
+
+	var resp composePlanResponse
+	if err := json.Unmarshal(rawBody, &resp); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
+	if len(resp.Services) != 2 {
+		t.Fatalf("expected 2 services, got %+v", resp.Services)
+	}
+
+	db := resp.Services[0]
+	if db.Name != "db" {
+		t.Fatalf("expected db first (dependency order), got %+v", resp.Services)
+	}
+	if db.Image != "postgres:16" {
+		t.Fatalf("db.Image = %q, want postgres:16", db.Image)
+	}
+	if db.Build != nil {
+		t.Fatalf("db.Build = %+v, want nil (db has no build: block)", db.Build)
+	}
+	if len(db.Volumes) != 1 || db.Volumes[0].Name != "data" || db.Volumes[0].Path != "/var/lib/postgresql/data" {
+		t.Fatalf("db.Volumes = %+v, want [{data /var/lib/postgresql/data}]", db.Volumes)
+	}
+	wantKeys := []string{"POSTGRES_PASSWORD", "POSTGRES_USER"}
+	if len(db.EnvKeys) != len(wantKeys) || db.EnvKeys[0] != wantKeys[0] || db.EnvKeys[1] != wantKeys[1] {
+		t.Fatalf("db.EnvKeys = %v, want %v (keys only, sorted)", db.EnvKeys, wantKeys)
+	}
+
+	web := resp.Services[1]
+	if web.Name != "web" {
+		t.Fatalf("expected web second, got %+v", resp.Services)
+	}
+	if web.Image != "" {
+		t.Fatalf("web.Image = %q, want empty (web is a build service)", web.Image)
+	}
+	if web.Build == nil || web.Build.Context != "./web" || web.Build.Dockerfile != "Dockerfile.prod" {
+		t.Fatalf("web.Build = %+v, want {./web Dockerfile.prod}", web.Build)
+	}
+	if len(web.Volumes) != 0 {
+		t.Fatalf("web.Volumes = %+v, want none", web.Volumes)
+	}
+	if len(web.EnvKeys) != 0 {
+		t.Fatalf("web.EnvKeys = %v, want none", web.EnvKeys)
 	}
 }
 

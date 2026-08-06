@@ -99,16 +99,91 @@ const composeOrchestrationTimeout = 2 * time.Hour
 // (the CLI, the dashboard's compose preview — Task 10) doesn't need two
 // separate shapes to render. DeploymentNumber is 0 (omitted) for a
 // dry-run entry, since nothing was created.
+//
+// Image, Build, Volumes, and EnvKeys exist so a reviewer looking at a
+// dry-run preview can tell what a service will actually run — the image
+// ref, its build context (when it's a `build:` service rather than an
+// `image:` one), and its named volumes — without those fields, the
+// preview couldn't answer "is this pulling the image I expect, is my
+// database volume attached?" at all (issue #12). EnvKeys deliberately
+// carries only the compose file's env var *keys*, never their values:
+// env values may be secrets, and every other surface in this product
+// (env vars themselves, the git deploy token, GET .../apps/{slug}/env)
+// treats a value as write-only once it could be sensitive — a compose
+// preview leaking a value straight from the uploaded file would be the
+// one place that promise didn't hold.
 type composeServiceResponse struct {
-	Name             string   `json:"name"`
-	Slug             string   `json:"slug"`
-	Action           string   `json:"action"`
-	Internal         bool     `json:"internal"`
-	Port             int      `json:"port"`
-	Alias            string   `json:"alias"`
-	DeployStrategy   string   `json:"deploy_strategy,omitempty"`
-	DeploymentNumber int      `json:"deployment_number,omitempty"`
-	Warnings         []string `json:"warnings,omitempty"`
+	Name             string                         `json:"name"`
+	Slug             string                         `json:"slug"`
+	Action           string                         `json:"action"`
+	Internal         bool                           `json:"internal"`
+	Port             int                            `json:"port"`
+	Alias            string                         `json:"alias"`
+	Image            string                         `json:"image,omitempty"`
+	Build            *composeServiceBuildResponse   `json:"build,omitempty"`
+	Volumes          []composeServiceVolumeResponse `json:"volumes,omitempty"`
+	EnvKeys          []string                       `json:"env_keys,omitempty"`
+	DeployStrategy   string                         `json:"deploy_strategy,omitempty"`
+	DeploymentNumber int                            `json:"deployment_number,omitempty"`
+	Warnings         []string                       `json:"warnings,omitempty"`
+}
+
+// composeServiceBuildResponse is a service's `build:` block, present in
+// composeServiceResponse only for a build service (Build == nil for a
+// plain `image:` service) — Context is never empty when this is
+// non-nil (see compose.BuildRef's doc comment); Dockerfile is "" unless
+// the compose file named a custom one.
+type composeServiceBuildResponse struct {
+	Context    string `json:"context"`
+	Dockerfile string `json:"dockerfile,omitempty"`
+}
+
+// composeServiceVolumeResponse is one named-volume mount: the volume's
+// name and the container path it's mounted at — enough for a reviewer to
+// check "is my database volume attached?" without exposing anything
+// sensitive (a volume name and mount path are never secret).
+type composeServiceVolumeResponse struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// composeServiceBuild converts a compose.BuildRef into the wire shape,
+// nil in ⇄ nil out.
+func composeServiceBuild(b *compose.BuildRef) *composeServiceBuildResponse {
+	if b == nil {
+		return nil
+	}
+	return &composeServiceBuildResponse{Context: b.Context, Dockerfile: b.Dockerfile}
+}
+
+// composeServiceVolumesResponse converts a service's volumes into the
+// wire shape, nil for a volume-less service (so the JSON field is
+// omitted rather than an empty array).
+func composeServiceVolumesResponse(volumes []compose.VolumeRef) []composeServiceVolumeResponse {
+	if len(volumes) == 0 {
+		return nil
+	}
+	out := make([]composeServiceVolumeResponse, 0, len(volumes))
+	for _, v := range volumes {
+		out = append(out, composeServiceVolumeResponse{Name: v.Name, Path: v.Target})
+	}
+	return out
+}
+
+// composeServiceEnvKeys returns env's keys, sorted, and NEVER its
+// values — see composeServiceResponse's doc comment on why a value must
+// never reach this response. nil for an env-less service (omitted JSON
+// field rather than an empty array).
+func composeServiceEnvKeys(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // composePlanResponse is handleComposeUp's response body for both a
@@ -266,6 +341,8 @@ func dryRunServiceResponses(plan *compose.Plan) []composeServiceResponse {
 		out = append(out, composeServiceResponse{
 			Name: sp.Name, Slug: sp.Slug, Action: sp.Action, Internal: sp.Internal,
 			Port: sp.Port, Alias: sp.Alias, DeployStrategy: sp.RecommendedStrategy,
+			Image: sp.Image, Build: composeServiceBuild(sp.Build),
+			Volumes: composeServiceVolumesResponse(sp.Volumes), EnvKeys: composeServiceEnvKeys(sp.Env),
 			Warnings: warnings,
 		})
 	}
@@ -407,6 +484,8 @@ func (a *api) applyComposePlan(project string, plan *compose.Plan) ([]composeOrc
 			response: composeServiceResponse{
 				Name: sp.Name, Slug: sp.Slug, Action: sp.Action, Internal: sp.Internal,
 				Port: sp.Port, Alias: sp.Alias, DeployStrategy: app.DeployStrategy,
+				Image: sp.Image, Build: composeServiceBuild(sp.Build),
+				Volumes: composeServiceVolumesResponse(sp.Volumes), EnvKeys: composeServiceEnvKeys(sp.Env),
 				DeploymentNumber: dep.Number, Warnings: warnings,
 			},
 		})
