@@ -5,7 +5,7 @@ Implementation complete on branch `feat/stream-tokens` (from `origin/main`). All
 frontend verification is clean locally; pushed and CI to be confirmed (see below).
 
 ## What changed
-- `internal/store/migrations/00005_stream_tokens.sql` (new): `stream_tokens` table
+- `internal/store/migrations/00006_stream_tokens.sql` (new; renumbered from 00005 during integration with fix/alias-namespace, which also shipped a 00005): `stream_tokens` table
   (`token_hash` unique, `user_id`, `scope`, `slug`, `deployment_number` nullable,
   `expires_at`), indexed on `expires_at`.
 - `internal/store/store.go`: `StreamToken` type, `CreateStreamToken`,

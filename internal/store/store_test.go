@@ -696,6 +696,85 @@ func TestMigrationDefaultsApplyToExistingApp(t *testing.T) {
 	}
 }
 
+// TestAllMigrationsApplyCleanly guards against the exact failure class this
+// integration hit: two migrations racing for the same goose sequence number
+// (both feat/stream-tokens and fix/alias-namespace originally shipped a
+// 00005_*.sql). goose.Up hard-errors at boot on a duplicate version, so this
+// opens a brand-new DB, drives every migration in migrations/*.sql in order,
+// and asserts the full set landed — six files, six recorded versions — and
+// that both branches' schema objects (stream_tokens table from migration 6,
+// apps.alias_scheme column from migration 5) exist side by side.
+func TestAllMigrationsApplyCleanly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+
+	version, err := goose.GetDBVersion(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 6 {
+		t.Fatalf("db version after migrating = %d, want 6 (00001..00006)", version)
+	}
+
+	var appliedCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM goose_db_version WHERE is_applied = 1`).Scan(&appliedCount); err != nil {
+		t.Fatal(err)
+	}
+	// goose_db_version always carries a synthetic version-0 bootstrap row in
+	// addition to one row per applied migration file.
+	if appliedCount != 7 {
+		t.Fatalf("applied migration rows = %d, want 7 (bootstrap + 6 migrations)", appliedCount)
+	}
+
+	// apps.alias_scheme (migration 00005_alias_scheme.sql, from
+	// fix/alias-namespace) must exist.
+	rows, err := db.Query(`PRAGMA table_info(apps)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawAliasScheme bool
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if name == "alias_scheme" {
+			sawAliasScheme = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if !sawAliasScheme {
+		t.Fatal("apps.alias_scheme column missing after migrating to latest")
+	}
+
+	// stream_tokens table (migration 00006_stream_tokens.sql, from
+	// feat/stream-tokens) must exist.
+	var tableName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stream_tokens'`).Scan(&tableName); err != nil {
+		t.Fatalf("stream_tokens table missing after migrating to latest: %v", err)
+	}
+}
+
 func TestCountUsers(t *testing.T) {
 	s := open(t)
 	if count, err := s.CountUsers(); err != nil || count != 0 {
