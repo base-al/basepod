@@ -308,6 +308,152 @@ func (e *Engine) DeployBuildAsync(ctx context.Context, app *store.App, prepared 
 	return dep, nil
 }
 
+// DeployGitAsync is DeployBuildAsync's git-sourced counterpart, for a
+// manual "deploy now" trigger (internal/api's POST .../deploy/git): the
+// caller has already cloned the configured repo and packed it into
+// prepared SYNCHRONOUSLY (via internal/gitsource.Cloner.Fetch and
+// builder.PrepareBuild, before this is ever called) — so, like
+// DeployBuildAsync, a bad upload/clone still fails fast with the caller's
+// own status/error mapping, before any deployment row exists. gitSHA is
+// the commit the clone actually resolved, recorded on the deployment row
+// immediately (deployments.git_sha — see SetDeploymentGitSHA) rather than
+// smuggled into image_ref or left to a delivery lookup (there is no
+// delivery row for a manual trigger). triggerKind is normally "api".
+//
+// Everything else — the deployment row's source ("git"), the background
+// goroutine, its detached context and timeout, and the returned
+// deployment's "still deploying" contract — mirrors DeployBuildAsync
+// exactly; see its doc comment for the parts not repeated here.
+func (e *Engine) DeployGitAsync(ctx context.Context, app *store.App, prepared *build.PreparedBuild, builder *build.Builder, gitSHA, triggerKind string) (*store.Deployment, error) {
+	dep, err := e.createGitDeployment(ctx, app, builder, gitSHA, triggerKind)
+	if err != nil {
+		prepared.Close()
+		return dep, err
+	}
+
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncBuildTimeout)
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		defer cancel()
+		e.buildAndRollout(bgCtx, app, dep, prepared, builder)
+	}()
+
+	return dep, nil
+}
+
+// DeployGitCloneAsync is DeployGitAsync's twin for the webhook receiver
+// (v0.5 plan Task 5): unlike DeployGitAsync (and DeployBuildAsync), the
+// clone itself has NOT already happened by the time this is called — a
+// webhook HTTP response must not block on a clone that can take up to
+// gitsource's own configured timeout (default 5 minutes), so fetch (which
+// wraps internal/gitsource.Cloner.Fetch with the caller's resolved repo
+// URL/branch/token already bound in — see internal/api's
+// triggerGitDeploy) is itself deferred into the background goroutine this
+// method starts, run under the same detached bgCtx/asyncBuildTimeout the
+// build+rollout that follows it runs under.
+//
+// The deployment row is still created synchronously, before this method
+// returns, exactly like every other …Async entry point — its Number and
+// ID are valid for the caller to act on (e.g. link a delivery row to it)
+// immediately. initialSHA seeds git_sha with the caller's best-effort
+// value (informational only — see the doc comment on
+// internal/api.triggerGitDeploy for why the payload must never be trusted
+// to select what's actually cloned); it is overwritten with the clone's
+// own resolved HEAD once fetch returns, which is what actually ends up
+// recorded once the deploy finishes.
+//
+// onDone, if non-nil, is called exactly once from the background
+// goroutine, after buildAndRollout returns (success or failure) — or
+// immediately, from that same goroutine, if fetch or builder.PrepareBuild
+// themselves fail first. It exists so the caller (the webhook receiver's
+// per-app flood-coalescing state — see internal/api's gitCoalescer) can
+// learn when the "running" slot it claimed for this app is free again,
+// without deploy.Engine needing to know anything about coalescing,
+// deliveries, or the API layer at all.
+func (e *Engine) DeployGitCloneAsync(ctx context.Context, app *store.App, fetch func(ctx context.Context) (gzTar io.ReadCloser, headSHA string, err error), builder *build.Builder, triggerKind, initialSHA string, onDone func(dep *store.Deployment, err error)) (*store.Deployment, error) {
+	dep, err := e.createGitDeployment(ctx, app, builder, initialSHA, triggerKind)
+	if err != nil {
+		return dep, err
+	}
+
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncBuildTimeout)
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		defer cancel()
+
+		gzTar, headSHA, fetchErr := fetch(bgCtx)
+		if fetchErr != nil {
+			result, failErr := e.fail(bgCtx, app, dep, "", fmt.Errorf("deploy: git clone: %w", fetchErr))
+			if onDone != nil {
+				onDone(result, failErr)
+			}
+			return
+		}
+		defer gzTar.Close()
+
+		// The clone's own resolved HEAD is the only commit that is ever
+		// actually built — record it now, superseding initialSHA, whether
+		// or not it differs (a webhook payload's claimed SHA is
+		// informational only; see this method's doc comment).
+		if headSHA != dep.GitSha {
+			if err := e.st.SetDeploymentGitSHA(dep.ID, headSHA); err != nil {
+				fmt.Fprintf(e.log, "deploy: set git sha for deployment %d: %v\n", dep.ID, err)
+			}
+			dep.GitSha = headSHA
+		}
+
+		prepared, buildErr := builder.PrepareBuild(gzTar)
+		if buildErr != nil {
+			result, failErr := e.fail(bgCtx, app, dep, "", fmt.Errorf("deploy: build: %w", buildErr))
+			if onDone != nil {
+				onDone(result, failErr)
+			}
+			return
+		}
+
+		result, rollErr := e.buildAndRollout(bgCtx, app, dep, prepared, builder)
+		if onDone != nil {
+			onDone(result, rollErr)
+		}
+	}()
+
+	return dep, nil
+}
+
+// createGitDeployment is createBuildDeployment's git-sourced counterpart,
+// shared by DeployGitAsync and DeployGitCloneAsync: create the deployment
+// row (source "git", the caller's triggerKind — "api" for a manual
+// trigger, "webhook" for one), record gitSHA and the build-log path, and
+// mark the app "deploying". See createBuildDeployment's doc comment for
+// the shared error-handling shape (a failure marking "deploying" goes
+// through fail(); every earlier failure has no deployment row yet and is
+// returned as a plain error).
+func (e *Engine) createGitDeployment(ctx context.Context, app *store.App, builder *build.Builder, gitSHA, triggerKind string) (*store.Deployment, error) {
+	dep, err := e.st.CreateDeploymentFull(app.ID, "", "git", triggerKind)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: create deployment: %w", err)
+	}
+
+	if err := e.st.SetDeploymentGitSHA(dep.ID, gitSHA); err != nil {
+		fmt.Fprintf(e.log, "deploy: set git sha for deployment %d: %v\n", dep.ID, err)
+	}
+	dep.GitSha = gitSHA
+
+	logPath := builder.LogPath(app.Slug, dep.Number)
+	if err := e.st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		fmt.Fprintf(e.log, "deploy: set build log path for deployment %d: %v\n", dep.ID, err)
+	}
+	dep.BuildLogPath = logPath
+
+	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
+	}
+
+	return dep, nil
+}
+
 // WaitForBackgroundDeploys blocks until every background deploy goroutine
 // started by DeployBuildAsync has finished, or ctx is done — whichever
 // comes first. Called from internal/server's graceful-shutdown path with a

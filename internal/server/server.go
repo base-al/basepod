@@ -152,12 +152,18 @@ func Run(ctx context.Context, cfgPath string) error {
 	// unaffected either way) — see gitsource.BinPath's resolution order
 	// (cfg.GitPath, then $BASEPOD_GIT_BIN, then $PATH) and
 	// gitsource.New's doc comment on why an empty path is a valid,
-	// non-fatal Cloner state.
-	if gitBin, err := gitsource.BinPath(cfg.GitPath); err != nil {
-		log.Printf("basepod: git: %s — git push-to-deploy disabled until git is installed", err)
+	// non-fatal Cloner state. gitCloner is constructed either way — with
+	// gitBin == "" when unavailable — and passed to api.New unconditionally
+	// (Task 4/5): every git deploy/webhook handler then fails with a
+	// uniform 503 "git_unavailable" via gitsource.ErrGitUnavailable rather
+	// than the API layer needing its own "is git installed" branch.
+	gitBin, gitErr := gitsource.BinPath(cfg.GitPath)
+	if gitErr != nil {
+		log.Printf("basepod: git: %s — git push-to-deploy disabled until git is installed", gitErr)
 	} else {
 		log.Printf("basepod: git: using %s for git push-to-deploy", gitBin)
 	}
+	gitCloner := gitsource.New(gitBin, gitsource.DefaultOptions())
 
 	mgr := caddy.NewManager(pc, caddy.PodmanExec, filepath.Join(cfg.DataDir, "caddy"), cfg.HTTPPort, cfg.HTTPSPort)
 	if err := mgr.Ensure(ctx); err != nil {
@@ -302,7 +308,7 @@ func Run(ctx context.Context, cfgPath string) error {
 	// there is no header or other client-controlled input that can spoof
 	// it, since a request reaching the loopback listener never touches
 	// TrustedProxyMiddleware at all.
-	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder))
+	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder, gitCloner))
 	srv := newHTTPServer(cfg.Listen, handler)
 
 	// dashboardSrv is a second *http.Server sharing every setting
