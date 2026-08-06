@@ -259,6 +259,60 @@ func (c *Client) DeployTarball(ctx context.Context, slug string, body io.Reader,
 	return &out, nil
 }
 
+// ComposeService is the wire shape of one service entry in a compose
+// apply/dry-run response (mirrors internal/api's composeServiceResponse).
+type ComposeService struct {
+	Name             string   `json:"name"`
+	Slug             string   `json:"slug"`
+	Action           string   `json:"action"`
+	Internal         bool     `json:"internal"`
+	Port             int      `json:"port"`
+	Alias            string   `json:"alias"`
+	DeployStrategy   string   `json:"deploy_strategy"`
+	DeploymentNumber int      `json:"deployment_number"`
+	Warnings         []string `json:"warnings"`
+}
+
+// ComposeResult is the wire shape of POST /compose/up's response, for
+// both a dry run (DryRun true, nothing changed, every
+// DeploymentNumber 0) and a real apply (202 — every service's deployment
+// already created and pollable, in dependency order).
+type ComposeResult struct {
+	Project  string           `json:"project"`
+	DryRun   bool             `json:"dry_run"`
+	Services []ComposeService `json:"services"`
+	// Orphans lists the slugs of apps that belong to this compose
+	// project from a prior apply but have no corresponding service in
+	// the file just applied — never deleted automatically, only
+	// reported; see internal/api/compose.go's package doc comment.
+	Orphans  []string `json:"orphans"`
+	Warnings []string `json:"warnings"`
+}
+
+// ComposeUp uploads a gzipped tar (body, size bytes — packed via
+// packToTempFile the same way deployFromSource packs a build context)
+// carrying compose.yaml (or compose.yml/docker-compose.yml) at its root
+// plus any per-service build contexts, to
+// POST /compose/up?project=<project>&dry_run=<dryRun>. project may be ""
+// to fall back to the compose file's own top-level `name:` (the server
+// 422s if neither is present).
+func (c *Client) ComposeUp(ctx context.Context, project string, dryRun bool, body io.Reader, size int64) (*ComposeResult, error) {
+	path := "/compose/up?dry_run=" + strconv.FormatBool(dryRun)
+	if project != "" {
+		path += "&project=" + url.QueryEscape(project)
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, path, "application/gzip", body)
+	if err != nil {
+		return nil, err
+	}
+	req.ContentLength = size
+	var out ComposeResult
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // GetDeployment fetches a single deployment by number (GET
 // .../deployments/{number}) — the polling half of the async tarball deploy
 // flow: followDeployment (commands.go) calls this in a loop until Status
