@@ -495,12 +495,14 @@ paths:
       tags: [git]
       summary: Connect (or update) an app's git push-to-deploy source
       description: |
-        First connect generates a webhook `hook_id` and HMAC secret; a
-        re-PUT keeps both stable unless `rotate_secret` is set. Unlike most
-        of this API, the webhook **secret is readable** on both this
-        response and `GET` — the operator must paste it into the forge's
-        webhook settings UI, possibly repeatedly. The deploy `token`, by
-        contrast, is write-only (masked on every read).
+        First connect generates a webhook `hook_id` and HMAC secret, and
+        returns the secret **in plaintext exactly this once** — the
+        operator's only chance to copy it, matching how every other
+        secret in this product works (env values, the deploy `token`,
+        which is masked on every read). A re-PUT (updating the URL,
+        branch, or token) keeps `hook_id` and the secret unchanged and
+        never reveals the secret again. To get a new secret, use
+        `POST .../git/rotate-secret`.
       requestBody:
         required: true
         content:
@@ -508,7 +510,7 @@ paths:
             schema: { $ref: "#/components/schemas/PutGitSourceRequest" }
       responses:
         "200":
-          description: Git source (including the webhook URL and readable secret)
+          description: Git source, with `secret` set only on first connect (empty on every later re-PUT)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/GitSource" }
@@ -519,9 +521,12 @@ paths:
       operationId: getGitSource
       tags: [git]
       summary: Get an app's connected git source
+      description: |
+        `secret` is always empty here — the webhook secret is write-only,
+        like every other secret in this product (see PUT's description).
       responses:
         "200":
-          description: Git source (deploy token masked; secret readable — see PUT's description)
+          description: Git source (deploy token masked; webhook secret always empty)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/GitSource" }
@@ -535,6 +540,30 @@ paths:
         "204": { description: Disconnected }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /apps/{slug}/git/rotate-secret:
+    post:
+      operationId: rotateGitSecret
+      tags: [git]
+      summary: Mint a fresh webhook secret for an app's connected git source
+      description: |
+        The only way to see the webhook secret again after first connect
+        — mirrors how a lost env secret or deploy token is recovered: by
+        replacing it, never by reading it back. Leaves `hook_id`, the URL,
+        branch, and deploy token untouched, so the webhook's payload URL
+        stays valid; only the secret value needs updating in the forge's
+        webhook settings.
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      responses:
+        "200":
+          description: Git source, with a freshly minted `secret` revealed exactly once
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GitSource" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { description: "No git source connected for this app", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /apps/{slug}/git/deliveries:
     get:
@@ -999,7 +1028,7 @@ components:
         branch: { type: string }
         provider: { type: string, enum: ["", github, gitlab, gitea] }
         hook_id: { type: string }
-        secret: { type: string, description: "Readable — see PUT /apps/{slug}/git's description." }
+        secret: { type: string, description: "Write-only: empty except on the response that just minted it (first connect via PUT, or POST .../git/rotate-secret)." }
         token: { type: string, description: "Masked (\"set\" or \"\") on read.", writeOnly: false }
         webhook_url: { type: string }
         warnings:
@@ -1013,7 +1042,6 @@ components:
         url: { type: string }
         branch: { type: string }
         token: { type: string, writeOnly: true, description: "https deploy token; omit/empty for a public repo." }
-        rotate_secret: { type: boolean, default: false }
 
     GitDelivery:
       type: object
@@ -1039,6 +1067,25 @@ components:
         internal: { type: boolean }
         port: { type: integer }
         alias: { type: string, description: "Bare service-name network alias other services reach it by." }
+        image: { type: string, description: "The service's image ref; empty for a build service." }
+        build:
+          type: object
+          description: "Present only for a `build:` service (absent for a plain `image:` one)."
+          properties:
+            context: { type: string }
+            dockerfile: { type: string }
+        volumes:
+          type: array
+          description: "This service's named-volume mounts."
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              path: { type: string, description: "Container mount path." }
+        env_keys:
+          type: array
+          description: "The compose file's env var KEYS for this service, never values — a value may be a secret and is never returned, matching every other secret in this product."
+          items: { type: string }
         deploy_strategy: { type: string }
         deployment_number: { type: integer }
         warnings:

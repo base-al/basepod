@@ -62,9 +62,11 @@ func TestGitStatusCmdPrintsConfigAndDeliveries(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/v1/apps/blog/git" && r.Method == http.MethodGet:
+			// GET never carries the secret (issue #13: write-only) — this
+			// fixture deliberately omits it to match the real server.
 			writeJSONResponse(w, http.StatusOK, GitSource{
 				URL: "https://github.com/example/repo.git", Branch: "main", Provider: "github",
-				HookID: "abc123", Secret: "supersecret", Token: "set",
+				HookID: "abc123", Token: "set",
 				WebhookURL: "https://basepod.example.com/api/v1/webhooks/git/abc123",
 			})
 		case r.URL.Path == "/api/v1/apps/blog/git/deliveries" && r.Method == http.MethodGet:
@@ -91,6 +93,37 @@ func TestGitStatusCmdPrintsConfigAndDeliveries(t *testing.T) {
 	}
 	if !strings.Contains(out, "#5") {
 		t.Fatalf("expected the linked deployment number in output, got %q", out)
+	}
+	if !strings.Contains(out, "write-only") || !strings.Contains(out, "rotate-secret") {
+		t.Fatalf("expected `git status` to say the secret is write-only and point at `git rotate-secret`, got %q", out)
+	}
+}
+
+// TestGitRotateSecretCmdPostsAndPrintsFreshSecret proves `basepod git
+// rotate-secret` posts to the dedicated rotate route (not a PUT with a
+// flag) and prints the freshly minted secret exactly once (issue #13).
+func TestGitRotateSecretCmdPostsAndPrintsFreshSecret(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/apps/blog/git/rotate-secret" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		writeJSONResponse(w, http.StatusOK, GitSource{
+			URL: "https://github.com/example/repo.git", Branch: "main", Provider: "github",
+			HookID: "abc123", Secret: "freshlyrotated", Token: "",
+			WebhookURL: "https://basepod.example.com/api/v1/webhooks/git/abc123",
+		})
+	}))
+	defer srv.Close()
+	saveTestContext(t, path, srv.URL, "tok")
+
+	out, _, err := runCLI(t, "", "git", "rotate-secret", "blog")
+	if err != nil {
+		t.Fatalf("git rotate-secret: %v (out=%s)", err, out)
+	}
+	if !strings.Contains(out, "freshlyrotated") {
+		t.Fatalf("expected the freshly rotated secret in the output, got %q", out)
 	}
 }
 

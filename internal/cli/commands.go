@@ -1053,17 +1053,21 @@ func newGitCmd() *cobra.Command {
 		Use:   "git",
 		Short: "Manage an app's connected git repo (push-to-deploy)",
 	}
-	cmd.AddCommand(newGitConnectCmd(), newGitStatusCmd(), newGitDisconnectCmd())
+	cmd.AddCommand(newGitConnectCmd(), newGitStatusCmd(), newGitRotateSecretCmd(), newGitDisconnectCmd())
 	return cmd
 }
 
 // printGitSource prints a connected repo's config and webhook setup
 // instructions: the URL/branch, whether a deploy token is set, and the
-// webhook URL + secret an operator pastes into GitHub/GitLab/Gitea's
-// webhook settings (payload URL: WebhookURL, content type
-// application/json, secret: Secret — see gitSourceResponse's doc comment
-// for why the secret is readable here, unlike the deploy token).
-func printGitSource(w io.Writer, gs *GitSource) {
+// webhook payload URL an operator pastes into GitHub/GitLab/Gitea's
+// webhook settings. The secret itself is write-only (see GitSource's doc
+// comment): gs.Secret is only ever non-empty on the exact response from
+// `git connect` (first connect) or `git rotate-secret` — printGitSource
+// prints it when present, and otherwise says so explicitly (naming the
+// rotate command for slug) rather than printing a blank line, so a
+// caller reading `git status` output never mistakes "not shown" for
+// "empty secret".
+func printGitSource(w io.Writer, slug string, gs *GitSource) {
 	fmt.Fprintf(w, "url:      %s\n", gs.URL)
 	fmt.Fprintf(w, "branch:   %s\n", gs.Branch)
 	if gs.Provider != "" {
@@ -1077,16 +1081,19 @@ func printGitSource(w io.Writer, gs *GitSource) {
 	fmt.Fprintf(w, "\nwebhook (add this to your forge's webhook settings):\n")
 	fmt.Fprintf(w, "  payload URL:   %s\n", gs.WebhookURL)
 	fmt.Fprintf(w, "  content type:  application/json\n")
-	fmt.Fprintf(w, "  secret:        %s\n", gs.Secret)
+	if gs.Secret != "" {
+		fmt.Fprintf(w, "  secret:        %s   (copy this now — it will not be shown again)\n", gs.Secret)
+	} else {
+		fmt.Fprintf(w, "  secret:        (write-only — not shown; run `basepod git rotate-secret %s` for a new one)\n", slug)
+	}
 	for _, warning := range gs.Warnings {
 		fmt.Fprintf(w, "\nwarning: %s\n", warning)
 	}
 }
 
-// newGitConnectCmd builds `basepod git connect <slug> --url --branch [--token] [--rotate-secret]`.
+// newGitConnectCmd builds `basepod git connect <slug> --url --branch [--token]`.
 func newGitConnectCmd() *cobra.Command {
 	var url, branch, token string
-	var rotateSecret bool
 	cmd := &cobra.Command{
 		Use:          "connect <slug>",
 		Short:        "Connect (or reconfigure) an app's git repo for push-to-deploy",
@@ -1100,18 +1107,46 @@ func newGitConnectCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			gs, err := client.PutGitSource(cmd.Context(), args[0], url, branch, token, rotateSecret)
+			gs, err := client.PutGitSource(cmd.Context(), args[0], url, branch, token)
 			if err != nil {
 				return err
 			}
-			printGitSource(cmd.OutOrStdout(), gs)
+			printGitSource(cmd.OutOrStdout(), args[0], gs)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&url, "url", "", "the repo's https clone URL (required)")
 	cmd.Flags().StringVar(&branch, "branch", "", "the branch to deploy on push (required)")
 	cmd.Flags().StringVar(&token, "token", "", "a deploy token for a private repo (omit to keep any already-stored token unchanged)")
-	cmd.Flags().BoolVar(&rotateSecret, "rotate-secret", false, "mint a fresh webhook hook_id and secret, invalidating the old webhook URL")
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newGitRotateSecretCmd builds `basepod git rotate-secret <slug>` — mints
+// a fresh webhook secret, printed exactly once (issue #13: the webhook
+// secret is write-only, matching every other secret in this product; a
+// lost secret is recovered by rotating, not by reading it back). Leaves
+// hook_id/URL/branch/token untouched — only the secret value needs
+// updating in the forge's webhook settings afterward.
+func newGitRotateSecretCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "rotate-secret <slug>",
+		Short:        "Mint a fresh webhook secret for an app's connected git repo",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			gs, err := client.RotateGitSecret(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			printGitSource(cmd.OutOrStdout(), args[0], gs)
+			return nil
+		},
+	}
 	addContextFlag(cmd)
 	return cmd
 }
@@ -1148,7 +1183,7 @@ func newGitStatusCmd() *cobra.Command {
 				}{GitSource: *gs, Deliveries: deliveries})
 			}
 
-			printGitSource(out, gs)
+			printGitSource(out, args[0], gs)
 			fmt.Fprintf(out, "\nrecent deliveries:\n")
 			if len(deliveries) == 0 {
 				fmt.Fprintf(out, "  (none yet)\n")

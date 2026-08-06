@@ -150,20 +150,21 @@ export interface SystemInfo {
 }
 
 /** An app's connected git repo config, in the exact wire shape
- * internal/api/git.go's gitSourceResponse returns from both PUT and GET
- * .../apps/{slug}/git. `secret` IS the plaintext webhook secret — a
- * deliberate deviation from strict write-only (see git.go's doc comment
- * on gitSourceResponse): the operator must be able to paste it into a
- * forge's webhook settings, possibly more than once, so the server
- * returns it every time this is fetched, not just on first connect.
- * `token` is masked to "set"/"" like a secret env value and never
+ * internal/api/git.go's gitSourceResponse returns from PUT, GET, and
+ * POST .../apps/{slug}/git/rotate-secret. `secret` is write-only (issue
+ * #13): it's "" except on the ONE response that just minted a fresh
+ * value — a first connect (PUT with nothing previously connected) or a
+ * rotate — matching how every other secret in this product works (env
+ * values, `token` below). Treat a non-empty `secret` as something to
+ * show the caller immediately and never again; nothing re-fetches it
+ * later. `token` is masked to "set"/"" like a secret env value and never
  * round-trips — see PutGitSourceRequest. */
 export interface GitSource {
   url: string
   branch: string
   provider: string
   hook_id: string
-  secret: string
+  secret?: string
   token: string
   webhook_url: string
   warnings?: string[]
@@ -173,15 +174,15 @@ export interface GitSource {
  * putGitSourceRequest). `token` write-only: omit or send "" to leave an
  * already-stored token untouched (mirrors env var PUT's keep-on-empty-
  * secret semantics) — never used to clear a token; DELETE disconnects
- * entirely instead. `rotate_secret: true` forces a fresh hook_id AND
- * secret even on a re-PUT of an already-connected repo; a plain re-PUT
- * keeps both stable so editing just the branch/token doesn't invalidate
- * a webhook already configured on the forge side. */
+ * entirely instead. There is no rotate flag any more — minting a fresh
+ * webhook secret is `api.rotateGitSecret`'s one job (issue #13); a plain
+ * PUT always keeps hook_id/secret stable, so editing just the
+ * branch/token never invalidates a webhook already configured on the
+ * forge side. */
 export interface PutGitSourceRequest {
   url: string
   branch: string
   token?: string
-  rotate_secret?: boolean
 }
 
 /** One webhook delivery outcome (see migration 00007_git_sources.sql's
@@ -212,13 +213,34 @@ export interface GitDelivery {
   deployment_number?: number
 }
 
+/** A service's `build:` block, present only for a build service (an
+ * `image:` service has no `build` field at all) — see
+ * internal/api/compose.go's composeServiceBuildResponse. dockerfile is
+ * omitted unless the compose file named a custom one. */
+export interface ComposeServiceBuild {
+  context: string
+  dockerfile?: string
+}
+
+/** One named-volume mount: the volume's name and the container path it's
+ * mounted at — see internal/api/compose.go's composeServiceVolumeResponse. */
+export interface ComposeServiceVolume {
+  name: string
+  path: string
+}
+
 /** One service's entry in a ComposePlan (dry-run preview or real apply
  * response), in the exact wire shape internal/api/compose.go's
  * composeServiceResponse returns. deployment_number is 0/omitted for a
  * dry-run entry (nothing was created yet). deploy_strategy is set (with a
  * warning explaining why in `warnings`) only when the plan force-applies
  * "replace" for a volume-bearing service — see internal/compose's
- * ServicePlan.RecommendedStrategy. */
+ * ServicePlan.RecommendedStrategy. image/build/volumes/env_keys exist so a
+ * preview can show what a service will actually run (issue #12);
+ * env_keys carries ONLY the compose file's env var keys, never their
+ * values — a value may be a secret, and this response must never round
+ * one back out, matching how every other secret in this product is
+ * write-only. */
 export interface ComposeService {
   name: string
   slug: string
@@ -226,6 +248,10 @@ export interface ComposeService {
   internal: boolean
   port: number
   alias: string
+  image?: string
+  build?: ComposeServiceBuild
+  volumes?: ComposeServiceVolume[]
+  env_keys?: string[]
   deploy_strategy?: DeployStrategy | ''
   deployment_number?: number
   warnings?: string[]
@@ -705,13 +731,21 @@ export const api = {
   getGitSource: (slug: string) => request<GitSource>(`/apps/${slug}/git`),
 
   /** Connects (first PUT) or updates (re-PUT) an app's git repo config —
-   * see PutGitSourceRequest's doc comment for the token/rotate_secret
-   * semantics. internal/api/git.go's handlePutGitSource. */
+   * see PutGitSourceRequest's doc comment for the token semantics. Only
+   * a first connect's response carries `secret` (issue #13) — GitPanel.vue
+   * shows it once, right off this call's result, never from a later GET.
+   * internal/api/git.go's handlePutGitSource. */
   putGitSource: (slug: string, payload: PutGitSourceRequest) =>
     request<GitSource>(`/apps/${slug}/git`, {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
+
+  /** Mints a fresh webhook secret, returned in the response's `secret`
+   * exactly once (issue #13) — the only way to see it again after first
+   * connect. hook_id/url/branch/token are all left untouched.
+   * internal/api/git.go's handleRotateGitSecret. */
+  rotateGitSecret: (slug: string) => request<GitSource>(`/apps/${slug}/git/rotate-secret`, { method: 'POST' }),
 
   /** Disconnects an app's git repo config. Not an error if none was
    * connected. internal/api/git.go's handleDeleteGitSource. */

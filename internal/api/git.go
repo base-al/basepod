@@ -90,18 +90,23 @@ func detectProvider(rawURL string) string {
 	}
 }
 
-// gitSourceResponse is the wire shape of PUT/GET .../apps/{slug}/git.
-// Secret is the plaintext webhook secret — a deliberate deviation from
-// strict write-only (the operator must paste it into a forge's webhook
-// settings, possibly repeatedly; see the v0.5 plan's Task 4 and its
-// self-review notes). Token is masked like a secret env value ("set" or
-// "") — the deploy token is write-only and never round-trips.
+// gitSourceResponse is the wire shape of PUT/GET .../apps/{slug}/git and
+// POST .../apps/{slug}/git/rotate-secret. Secret is write-only, matching
+// every other secret in this product (env values, the deploy token, the
+// audit's stated principle that secrets don't come back out — issue
+// #13): it's empty/omitted on every response EXCEPT the one that just
+// minted it — a first connect (handlePutGitSource, hadExisting == false)
+// or an explicit rotation (handleRotateGitSecret) — where it carries the
+// new plaintext exactly once, the operator's only chance to copy it
+// before it's sealed at rest. GET and a steady-state re-PUT never
+// populate it at all. Token is masked the same way, to "set" or "" — the
+// deploy token is write-only and never round-trips.
 type gitSourceResponse struct {
 	URL        string   `json:"url"`
 	Branch     string   `json:"branch"`
 	Provider   string   `json:"provider"`
 	HookID     string   `json:"hook_id"`
-	Secret     string   `json:"secret"`
+	Secret     string   `json:"secret,omitempty"`
 	Token      string   `json:"token"`
 	WebhookURL string   `json:"webhook_url"`
 	Warnings   []string `json:"warnings,omitempty"`
@@ -125,10 +130,14 @@ func (a *api) webhookURLFor(hookID string) (webhookURL string, warnings []string
 	return "https://" + domain + path, nil, nil
 }
 
-// gitSourceResponseFor builds the wire response for gs, with secret
-// already decrypted by the caller (handlePutGitSource/handleGetGitSource
-// each have their own reason to have it in hand).
-func (a *api) gitSourceResponseFor(gs store.GitSource, secret string) (gitSourceResponse, error) {
+// gitSourceResponseFor builds the wire response for gs. revealSecret is
+// "" for every caller except the one that just minted a fresh secret
+// (handlePutGitSource on first connect, handleRotateGitSecret) — see
+// gitSourceResponse's doc comment on why it's the sole exception to
+// write-only. Passing "" never needs a decrypt: unlike the old
+// always-readable design, a steady-state GET/PUT no longer opens the
+// sealed secret at all.
+func (a *api) gitSourceResponseFor(gs store.GitSource, revealSecret string) (gitSourceResponse, error) {
 	tokenState := ""
 	if gs.TokenEncrypted != "" {
 		tokenState = "set"
@@ -139,7 +148,7 @@ func (a *api) gitSourceResponseFor(gs store.GitSource, secret string) (gitSource
 	}
 	return gitSourceResponse{
 		URL: gs.URL, Branch: gs.Branch, Provider: gs.Provider, HookID: gs.HookID,
-		Secret: secret, Token: tokenState, WebhookURL: webhookURL, Warnings: warnings,
+		Secret: revealSecret, Token: tokenState, WebhookURL: webhookURL, Warnings: warnings,
 	}, nil
 }
 
@@ -147,25 +156,29 @@ func (a *api) gitSourceResponseFor(gs store.GitSource, secret string) (gitSource
 // write-only: omitted or "" leaves any already-stored token untouched
 // (matching env var PUT's keep-on-empty-secret semantics — see
 // handlePutEnv), never used to clear a token; disconnecting entirely goes
-// through DELETE instead. RotateSecret, when true, forces a fresh hook_id
-// AND secret even on a re-PUT of an already-connected repo — the only way
-// to change either, since a plain re-PUT is idempotent on them.
+// through DELETE instead. There is no rotate flag here any more — minting
+// a fresh webhook secret is POST .../apps/{slug}/git/rotate-secret's one
+// job (issue #13: rotation is a distinct, deliberate action, not a
+// side-effect flag on an otherwise-idempotent connection-details update).
 type putGitSourceRequest struct {
-	URL          string `json:"url"`
-	Branch       string `json:"branch"`
-	Token        string `json:"token"`
-	RotateSecret bool   `json:"rotate_secret"`
+	URL    string `json:"url"`
+	Branch string `json:"branch"`
+	Token  string `json:"token"`
 }
 
 // handlePutGitSource connects (or reconnects) an app's git repo config.
-// On first connect it mints a fresh hook_id and secret; a re-PUT keeps
-// both stable unless rotate_secret is set, so an operator can update the
-// branch or token without invalidating a webhook already configured on
-// the forge side. See putGitSourceRequest's doc comment for the
-// keep-on-empty-token / rotate_secret semantics, and the v0.5 plan's Task
-// 4 for the AAD binding (secret/token are sealed with AAD bound to
-// (appID, "git_secret") / (appID, "git_token") — the same appID|key
-// binding env var values use).
+// On first connect it mints a fresh hook_id and secret, returned in
+// plaintext exactly this once (see gitSourceResponse's doc comment) — an
+// operator who loses it rotates via POST .../git/rotate-secret, the same
+// way a lost env secret or deploy token is handled: by replacing it, not
+// by reading it back. A re-PUT of an already-connected repo keeps
+// hook_id and secret untouched (so it can update just the branch or
+// token without invalidating a webhook already configured on the forge
+// side) and never needs to decrypt the stored secret to do so. See
+// putGitSourceRequest's doc comment for the keep-on-empty-token
+// semantics, and the v0.5 plan's Task 4 for the AAD binding (secret/token
+// are sealed with AAD bound to (appID, "git_secret") / (appID,
+// "git_token") — the same appID|key binding env var values use).
 func (a *api) handlePutGitSource(w http.ResponseWriter, r *http.Request) {
 	app, ok := a.appBySlugOrNotFound(w, r)
 	if !ok {
@@ -198,15 +211,15 @@ func (a *api) handlePutGitSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var hookID, secret string
-	if hadExisting && !req.RotateSecret {
+	// revealSecret carries the new plaintext into the response ONLY on
+	// first connect — a re-PUT reuses the existing sealed secret verbatim
+	// (no decrypt, no re-seal) and never reveals it again.
+	var hookID, secretEncrypted, revealSecret string
+	if hadExisting {
 		hookID = existing.HookID
-		secret, err = a.open(app.ID, "git_secret", existing.SecretEncrypted)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal", "failed to decrypt webhook secret")
-			return
-		}
+		secretEncrypted = existing.SecretEncrypted
 	} else {
+		var secret string
 		if hookID, err = newHookID(); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal", "failed to generate webhook id")
 			return
@@ -215,12 +228,11 @@ func (a *api) handlePutGitSource(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal", "failed to generate webhook secret")
 			return
 		}
-	}
-
-	secretEncrypted, err := a.seal(app.ID, "git_secret", secret)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "failed to save webhook secret")
-		return
+		if secretEncrypted, err = a.seal(app.ID, "git_secret", secret); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "failed to save webhook secret")
+			return
+		}
+		revealSecret = secret
 	}
 
 	tokenEncrypted := ""
@@ -243,7 +255,7 @@ func (a *api) handlePutGitSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := a.gitSourceResponseFor(*gs, secret)
+	resp, err := a.gitSourceResponseFor(*gs, revealSecret)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to build response")
 		return
@@ -252,9 +264,10 @@ func (a *api) handlePutGitSource(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetGitSource returns an app's connected git repo config, if any —
-// 404 "git_not_connected" otherwise. The webhook secret IS returned in
-// plaintext (see gitSourceResponse's doc comment); the deploy token is
-// masked to "set"/"".
+// 404 "git_not_connected" otherwise. The webhook secret is write-only
+// (omitted here, same treatment as a secret env value and the deploy
+// token — issue #13): this handler never even decrypts it, since nothing
+// about a GET needs the plaintext.
 func (a *api) handleGetGitSource(w http.ResponseWriter, r *http.Request) {
 	app, ok := a.appBySlugOrNotFound(w, r)
 	if !ok {
@@ -271,11 +284,61 @@ func (a *api) handleGetGitSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	secret, err := a.open(app.ID, "git_secret", gs.SecretEncrypted)
+	resp, err := a.gitSourceResponseFor(*gs, "")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "failed to decrypt webhook secret")
+		writeError(w, http.StatusInternalServerError, "internal", "failed to build response")
 		return
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleRotateGitSecret mints a fresh webhook secret for an app's
+// connected git repo, returned in plaintext exactly once (see
+// gitSourceResponse's doc comment) — the one deliberate way to see the
+// secret again after first connect, mirroring how a lost env secret or
+// deploy token is recovered: by replacing it, never by reading it back
+// (issue #13). hook_id, url, branch, and the deploy token are all left
+// untouched — only the secret changes, so the webhook's payload URL
+// stays valid; the operator updates just the secret value in their
+// forge's webhook settings. 422 "git_not_connected" if no repo is
+// connected (matching handleDeployGit's own deviation from a plain 404:
+// the app exists, it's the git config that's missing).
+func (a *api) handleRotateGitSecret(w http.ResponseWriter, r *http.Request) {
+	app, ok := a.appBySlugOrNotFound(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := a.st.GitSourceByAppID(app.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusUnprocessableEntity, "git_not_connected", "no git repo connected for this app")
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal", "failed to look up git source")
+		}
+		return
+	}
+
+	secret, err := newGitSecret()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to generate webhook secret")
+		return
+	}
+	secretEncrypted, err := a.seal(app.ID, "git_secret", secret)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to save webhook secret")
+		return
+	}
+
+	gs, err := a.st.UpsertGitSource(store.GitSource{
+		AppID: app.ID, URL: existing.URL, Branch: existing.Branch, Provider: existing.Provider,
+		HookID: existing.HookID, SecretEncrypted: secretEncrypted, TokenEncrypted: existing.TokenEncrypted,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to save git source")
+		return
+	}
+
 	resp, err := a.gitSourceResponseFor(*gs, secret)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to build response")

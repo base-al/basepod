@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -98,10 +99,13 @@ func setupGitTest(t *testing.T, gitFetcher GitFetcher) (srv string, token string
 	return s.URL, tok
 }
 
-// TestGitSourceConnectReadRotateDisconnect proves the full PUT/GET/DELETE
-// lifecycle: first connect mints a hook_id and secret; a re-PUT (no
-// rotate_secret) keeps both stable; rotate_secret mints fresh ones;
-// DELETE disconnects, after which GET reports 404 "git_not_connected".
+// TestGitSourceConnectReadRotateDisconnect proves the full PUT/GET/
+// rotate/DELETE lifecycle, and issue #13's write-only fix in particular:
+// first connect mints a hook_id and reveals the secret exactly once; a
+// re-PUT keeps hook_id stable and never reveals the secret again; GET
+// never reveals it either; POST .../git/rotate-secret mints a fresh
+// secret (keeping hook_id stable) and reveals THAT exactly once; DELETE
+// disconnects, after which GET reports 404 "git_not_connected".
 func TestGitSourceConnectReadRotateDisconnect(t *testing.T) {
 	srv, token := setupGitTest(t, nil)
 
@@ -112,7 +116,7 @@ func TestGitSourceConnectReadRotateDisconnect(t *testing.T) {
 		t.Fatalf("PUT: got status %d, want 200", resp.StatusCode)
 	}
 	if first.HookID == "" || first.Secret == "" {
-		t.Fatalf("expected hook_id/secret to be minted, got %+v", first)
+		t.Fatalf("expected hook_id/secret to be minted and revealed on first connect, got %+v", first)
 	}
 	if first.Provider != "github" {
 		t.Fatalf("Provider = %q, want github (detected from hostname)", first.Provider)
@@ -121,41 +125,59 @@ func TestGitSourceConnectReadRotateDisconnect(t *testing.T) {
 		t.Fatalf("webhook_url %q does not contain hook_id %q", first.WebhookURL, first.HookID)
 	}
 
-	// GET returns the same hook_id/secret.
+	// GET never reveals the secret — write-only, same as the deploy token.
 	var got gitSourceResponse
 	resp = doJSON(t, http.MethodGet, srv+"/api/v1/apps/my-blog/git", token, nil, &got)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET: got status %d, want 200", resp.StatusCode)
 	}
-	if got.HookID != first.HookID || got.Secret != first.Secret {
-		t.Fatalf("GET diverged from PUT: got %+v, want hook_id/secret matching %+v", got, first)
+	if got.Secret != "" {
+		t.Fatalf("GET revealed the secret: got %+v, want Secret empty", got)
+	}
+	if got.HookID != first.HookID {
+		t.Fatalf("GET hook_id diverged from PUT: got %q, want %q", got.HookID, first.HookID)
 	}
 
-	// Re-PUT (different branch, no rotate_secret) keeps hook_id/secret
-	// stable — an operator changing the branch must not have to
-	// reconfigure the webhook on the forge side.
+	// Re-PUT (different branch) keeps hook_id stable — an operator
+	// changing the branch must not have to reconfigure the webhook on the
+	// forge side — and never reveals the secret again.
 	var second gitSourceResponse
 	resp = doJSON(t, http.MethodPut, srv+"/api/v1/apps/my-blog/git", token,
 		putGitSourceRequest{URL: "https://github.com/example/repo.git", Branch: "develop"}, &second)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("re-PUT: got status %d, want 200", resp.StatusCode)
 	}
-	if second.HookID != first.HookID || second.Secret != first.Secret {
-		t.Fatalf("re-PUT changed hook_id/secret: got %+v, want them stable from %+v", second, first)
+	if second.HookID != first.HookID {
+		t.Fatalf("re-PUT changed hook_id: got %q, want stable %q", second.HookID, first.HookID)
+	}
+	if second.Secret != "" {
+		t.Fatalf("re-PUT revealed the secret: got %+v, want Secret empty", second)
 	}
 	if second.Branch != "develop" {
 		t.Fatalf("Branch = %q, want develop", second.Branch)
 	}
 
-	// rotate_secret mints a fresh hook_id and secret.
+	// POST .../git/rotate-secret mints a fresh secret, revealed exactly
+	// this once, while leaving hook_id (and therefore webhook_url)
+	// stable — rotating the secret must not also force re-pasting a new
+	// URL into the forge.
 	var rotated gitSourceResponse
-	resp = doJSON(t, http.MethodPut, srv+"/api/v1/apps/my-blog/git", token,
-		putGitSourceRequest{URL: "https://github.com/example/repo.git", Branch: "develop", RotateSecret: true}, &rotated)
+	resp = doJSON(t, http.MethodPost, srv+"/api/v1/apps/my-blog/git/rotate-secret", token, nil, &rotated)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("rotate PUT: got status %d, want 200", resp.StatusCode)
+		t.Fatalf("rotate: got status %d, want 200", resp.StatusCode)
 	}
-	if rotated.HookID == first.HookID || rotated.Secret == first.Secret {
-		t.Fatalf("rotate_secret did not change hook_id/secret: got %+v", rotated)
+	if rotated.Secret == "" || rotated.Secret == first.Secret {
+		t.Fatalf("rotate-secret did not mint+reveal a fresh secret: got %+v, want new value differing from %q", rotated, first.Secret)
+	}
+	if rotated.HookID != first.HookID {
+		t.Fatalf("rotate-secret changed hook_id: got %q, want stable %q", rotated.HookID, first.HookID)
+	}
+
+	// GET after rotation still never reveals the secret.
+	var gotAfterRotate gitSourceResponse
+	resp = doJSON(t, http.MethodGet, srv+"/api/v1/apps/my-blog/git", token, nil, &gotAfterRotate)
+	if resp.StatusCode != http.StatusOK || gotAfterRotate.Secret != "" {
+		t.Fatalf("GET after rotate: status=%d Secret=%q, want 200/empty", resp.StatusCode, gotAfterRotate.Secret)
 	}
 
 	// DELETE disconnects.
@@ -172,13 +194,103 @@ func TestGitSourceConnectReadRotateDisconnect(t *testing.T) {
 	if errBody.Error.Code != "git_not_connected" {
 		t.Fatalf("unexpected error code: %+v", errBody)
 	}
+
+	// rotate-secret on a disconnected app is 422 "git_not_connected" (not
+	// 404 — matches handleDeployGit's own deviation: the app exists, it's
+	// the git config that's missing).
+	var rotateErr errorResponse
+	resp = doJSON(t, http.MethodPost, srv+"/api/v1/apps/my-blog/git/rotate-secret", token, nil, &rotateErr)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("rotate after disconnect: got status %d, want 422", resp.StatusCode)
+	}
+	if rotateErr.Error.Code != "git_not_connected" {
+		t.Fatalf("unexpected error code: %+v", rotateErr)
+	}
+}
+
+// TestGitSourceWebhookSecretAbsentFromGetPresentOnceOnCreateAndRotate is
+// issue #13's fix, checked at the raw-body level (defense in depth
+// alongside TestGitSourceConnectReadRotateDisconnect's field-level
+// assertions): the webhook secret must never appear anywhere in a GET
+// response's bytes, and must appear in the create response and the
+// rotate response — and nowhere else, including a steady-state re-PUT.
+func TestGitSourceWebhookSecretAbsentFromGetPresentOnceOnCreateAndRotate(t *testing.T) {
+	srv, token := setupGitTest(t, nil)
+
+	// Create: the secret is present exactly once, right here.
+	createResp := doJSON(t, http.MethodPut, srv+"/api/v1/apps/my-blog/git", token,
+		putGitSourceRequest{URL: "https://github.com/example/repo.git", Branch: "main"}, nil)
+	createBody, err := io.ReadAll(createResp.Body)
+	if err != nil {
+		t.Fatalf("read create response: %v", err)
+	}
+	var created gitSourceResponse
+	if err := json.Unmarshal(createBody, &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if created.Secret == "" {
+		t.Fatalf("create response did not carry the secret: %s", createBody)
+	}
+
+	// GET: the secret string must not appear anywhere in the body.
+	getResp := doJSON(t, http.MethodGet, srv+"/api/v1/apps/my-blog/git", token, nil, nil)
+	getBody, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		t.Fatalf("read GET response: %v", err)
+	}
+	if strings.Contains(string(getBody), created.Secret) {
+		t.Fatalf("GET response leaked the webhook secret: %s", getBody)
+	}
+	var got gitSourceResponse
+	if err := json.Unmarshal(getBody, &got); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	if got.Secret != "" {
+		t.Fatalf("GET response's secret field is non-empty: %q", got.Secret)
+	}
+
+	// A steady-state re-PUT: the secret string must not appear either.
+	rePutResp := doJSON(t, http.MethodPut, srv+"/api/v1/apps/my-blog/git", token,
+		putGitSourceRequest{URL: "https://github.com/example/repo.git", Branch: "develop"}, nil)
+	rePutBody, err := io.ReadAll(rePutResp.Body)
+	if err != nil {
+		t.Fatalf("read re-PUT response: %v", err)
+	}
+	if strings.Contains(string(rePutBody), created.Secret) {
+		t.Fatalf("re-PUT response leaked the webhook secret: %s", rePutBody)
+	}
+
+	// Rotate: a FRESH secret is present exactly once, in this response —
+	// and the old secret never appears here either.
+	rotateResp := doJSON(t, http.MethodPost, srv+"/api/v1/apps/my-blog/git/rotate-secret", token, nil, nil)
+	rotateBody, err := io.ReadAll(rotateResp.Body)
+	if err != nil {
+		t.Fatalf("read rotate response: %v", err)
+	}
+	var rotated gitSourceResponse
+	if err := json.Unmarshal(rotateBody, &rotated); err != nil {
+		t.Fatalf("decode rotate response: %v", err)
+	}
+	if rotated.Secret == "" || rotated.Secret == created.Secret {
+		t.Fatalf("rotate response did not carry a fresh secret: got %q, old was %q", rotated.Secret, created.Secret)
+	}
+
+	// GET after rotate: the NEW secret must not appear either.
+	getAfterRotateResp := doJSON(t, http.MethodGet, srv+"/api/v1/apps/my-blog/git", token, nil, nil)
+	getAfterRotateBody, err := io.ReadAll(getAfterRotateResp.Body)
+	if err != nil {
+		t.Fatalf("read GET-after-rotate response: %v", err)
+	}
+	if strings.Contains(string(getAfterRotateBody), rotated.Secret) {
+		t.Fatalf("GET after rotate leaked the new webhook secret: %s", getAfterRotateBody)
+	}
 }
 
 // TestGitSourceTokenMaskedOnGet proves a deploy token is write-only: PUT
-// with a token reports it as "set" (never the plaintext, unlike the
-// webhook secret — a deliberate deviation, see gitSourceResponse's doc
-// comment), and a subsequent PUT with no token keeps the stored one
-// (matching env var PUT's keep-on-empty-secret semantics).
+// with a token reports it as "set" (never the plaintext — masked the same
+// way the webhook secret now is, see gitSourceResponse's doc comment),
+// and a subsequent PUT with no token keeps the stored one (matching env
+// var PUT's keep-on-empty-secret semantics).
 func TestGitSourceTokenMaskedOnGet(t *testing.T) {
 	srv, token := setupGitTest(t, nil)
 

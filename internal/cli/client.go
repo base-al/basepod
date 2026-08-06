@@ -446,17 +446,18 @@ func (c *Client) PutEnv(ctx context.Context, slug string, vars []EnvVar) ([]EnvV
 	return out, nil
 }
 
-// GitSource is the wire shape of PUT/GET .../apps/{slug}/git — see
-// internal/api/git.go's gitSourceResponse. Secret is the plaintext
-// webhook secret (a deliberate deviation from write-only, so an operator
-// can paste it into a forge's webhook settings); Token is masked to
-// "set"/"" like a secret env value.
+// GitSource is the wire shape of PUT/GET .../apps/{slug}/git and POST
+// .../apps/{slug}/git/rotate-secret — see internal/api/git.go's
+// gitSourceResponse. Secret is write-only: empty except on the one
+// response that just minted it (PutGitSource on first connect, or
+// RotateGitSecret) — matching Token, which is masked to "set"/"" like a
+// secret env value and never round-trips either.
 type GitSource struct {
 	URL        string   `json:"url"`
 	Branch     string   `json:"branch"`
 	Provider   string   `json:"provider"`
 	HookID     string   `json:"hook_id"`
-	Secret     string   `json:"secret"`
+	Secret     string   `json:"secret,omitempty"`
 	Token      string   `json:"token"`
 	WebhookURL string   `json:"webhook_url"`
 	Warnings   []string `json:"warnings,omitempty"`
@@ -480,22 +481,39 @@ type GitDelivery struct {
 // putGitSourceRequest mirrors internal/api/git.go's own request type —
 // kept private since callers use PutGitSource's named parameters instead.
 type putGitSourceRequest struct {
-	URL          string `json:"url"`
-	Branch       string `json:"branch"`
-	Token        string `json:"token"`
-	RotateSecret bool   `json:"rotate_secret"`
+	URL    string `json:"url"`
+	Branch string `json:"branch"`
+	Token  string `json:"token"`
 }
 
 // PutGitSource connects (or reconnects) an app's git repo config. token
 // "" leaves any already-stored deploy token untouched (see
-// putGitSourceRequest's server-side counterpart); rotateSecret forces a
-// fresh hook_id and webhook secret even on a re-connect.
-func (c *Client) PutGitSource(ctx context.Context, slug, url, branch, token string, rotateSecret bool) (*GitSource, error) {
-	body, err := json.Marshal(putGitSourceRequest{URL: url, Branch: branch, Token: token, RotateSecret: rotateSecret})
+// putGitSourceRequest's server-side counterpart). On first connect, the
+// returned GitSource's Secret carries the fresh webhook secret in
+// plaintext exactly once; a re-connect's Secret is always "" — use
+// RotateGitSecret to mint (and see) a new one.
+func (c *Client) PutGitSource(ctx context.Context, slug, url, branch, token string) (*GitSource, error) {
+	body, err := json.Marshal(putGitSourceRequest{URL: url, Branch: branch, Token: token})
 	if err != nil {
 		return nil, err
 	}
 	req, err := c.newRequest(ctx, http.MethodPut, "/apps/"+slug+"/git", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var out GitSource
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RotateGitSecret mints a fresh webhook secret for an app's connected git
+// source, returned in the response's Secret field in plaintext exactly
+// once — the only way to see the secret again after first connect.
+// hook_id, the URL, branch, and deploy token are all left untouched.
+func (c *Client) RotateGitSecret(ctx context.Context, slug string) (*GitSource, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/apps/"+slug+"/git/rotate-secret", "", nil)
 	if err != nil {
 		return nil, err
 	}
