@@ -174,7 +174,15 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(a
 		logs:          logs,
 		builder:       builder,
 	}
+	return newRouter(a)
+}
 
+// newRouter mounts every route onto a pre-built *api. Split out of New so
+// tests in this package can construct an *api directly (e.g. to inject a
+// fake clock into a.globalLimiter — see login_ratelimit_test.go's
+// newTrustedTestServerWithClock) and mount the exact same route table New
+// itself uses, rather than a hand-maintained duplicate that could drift.
+func newRouter(a *api) http.Handler {
 	r := chi.NewRouter()
 	r.Route("/api/v1", func(r chi.Router) {
 		// bodyLimit is applied per-group (here, and again below) rather
