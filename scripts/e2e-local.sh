@@ -275,6 +275,40 @@ deploy_curl() {
 	curl -s --max-time 90 -H "Authorization: Bearer ${TOKEN}" "$@"
 }
 
+# wait_for_deployment_healthy <slug> <number> — polls GET
+# .../deployments/<number> (see internal/api's handleGetDeployment) once a
+# second until it reports a terminal status, failing fast on "failed"
+# (naming the deployment's own error) rather than waiting out the full
+# MAX_WAIT budget, and failing on timeout otherwise. This is the async
+# tarball-deploy counterpart to wait_for's generic polling loop: a tarball
+# deploy's own POST .../deploy/tarball now returns 202 immediately (issue
+# #2), well before the build+rollout finishes, so every caller must poll
+# this route (not just check the initial response) to learn how it turns
+# out.
+wait_for_deployment_healthy() {
+	slug=$1
+	number=$2
+	desc="${slug} deployment ${number} healthy"
+	start_ts=$(date +%s)
+	while :; do
+		dep_resp=$(auth_curl "${API_BASE}/api/v1/apps/${slug}/deployments/${number}")
+		dep_status=$(printf '%s' "${dep_resp}" | jq -r '.status // empty')
+		if [ "${dep_status}" = "healthy" ]; then
+			log "ready: ${desc} ($(($(date +%s) - start_ts))s)"
+			return 0
+		fi
+		if [ "${dep_status}" = "failed" ]; then
+			dep_error=$(printf '%s' "${dep_resp}" | jq -r '.error // empty')
+			fail "${desc}: deployment failed: ${dep_error}"
+		fi
+		now_ts=$(date +%s)
+		if [ $((now_ts - start_ts)) -ge "${MAX_WAIT}" ]; then
+			fail "${desc}: timed out after ${MAX_WAIT}s (last status=${dep_status}, response=${dep_resp})"
+		fi
+		sleep 1
+	done
+}
+
 # ---------------------------------------------------------------------------
 # Create app
 # ---------------------------------------------------------------------------
@@ -463,14 +497,25 @@ EOF
 printf '%s' "e2e-build-v1" >"${BUILD_DIR}/index.txt"
 tar czf "${TARBALL}" -C "${BUILD_DIR}" .
 
+# Issue #2: the tarball endpoint now spools+validates the upload
+# synchronously but responds 202 Accepted the moment that succeeds — well
+# before the build even starts — rather than blocking until the deploy is
+# healthy. Assert the 202 + still-"deploying" shape here, then poll
+# GET .../deployments/{number} (wait_for_deployment_healthy) for the real
+# outcome before asserting anything about served content below.
 log "deploying '${BUILD_SLUG}' from an uploaded tarball (v1)..."
-build1_resp=$(deploy_curl -X POST -H "Content-Type: application/gzip" \
+build1_raw=$(deploy_curl -w '\n%{http_code}' -X POST -H "Content-Type: application/gzip" \
 	--data-binary @"${TARBALL}" \
 	"${API_BASE}/api/v1/apps/${BUILD_SLUG}/deploy/tarball")
-build1_status=$(printf '%s' "${build1_resp}" | jq -r '.status // empty')
+build1_code=$(printf '%s' "${build1_raw}" | tail -n1)
+build1_resp=$(printf '%s' "${build1_raw}" | sed '$d')
+[ "${build1_code}" = "202" ] || fail "tarball deploy (v1): expected 202, got ${build1_code}: ${build1_resp}"
+build1_number=$(printf '%s' "${build1_resp}" | jq -r '.number // empty')
 build1_source=$(printf '%s' "${build1_resp}" | jq -r '.source // empty')
-[ "${build1_status}" = "healthy" ] || fail "tarball deploy (v1) failed: ${build1_resp}"
+[ -n "${build1_number}" ] || fail "tarball deploy (v1): missing deployment number: ${build1_resp}"
 [ "${build1_source}" = "tarball" ] || fail "tarball deploy (v1): expected source=tarball, got ${build1_source}: ${build1_resp}"
+
+wait_for_deployment_healthy "${BUILD_SLUG}" "${build1_number}"
 
 EXPECTED_CONTENT="e2e-build-v1"
 buildtest_serves() {
@@ -518,11 +563,16 @@ printf '%s' "e2e-build-v2" >"${BUILD_DIR}/index.txt"
 tar czf "${TARBALL}" -C "${BUILD_DIR}" .
 
 log "deploying '${BUILD_SLUG}' from an uploaded tarball (v2)..."
-build2_resp=$(deploy_curl -X POST -H "Content-Type: application/gzip" \
+build2_raw=$(deploy_curl -w '\n%{http_code}' -X POST -H "Content-Type: application/gzip" \
 	--data-binary @"${TARBALL}" \
 	"${API_BASE}/api/v1/apps/${BUILD_SLUG}/deploy/tarball")
-build2_status=$(printf '%s' "${build2_resp}" | jq -r '.status // empty')
-[ "${build2_status}" = "healthy" ] || fail "tarball deploy (v2) failed: ${build2_resp}"
+build2_code=$(printf '%s' "${build2_raw}" | tail -n1)
+build2_resp=$(printf '%s' "${build2_raw}" | sed '$d')
+[ "${build2_code}" = "202" ] || fail "tarball deploy (v2): expected 202, got ${build2_code}: ${build2_resp}"
+build2_number=$(printf '%s' "${build2_resp}" | jq -r '.number // empty')
+[ -n "${build2_number}" ] || fail "tarball deploy (v2): missing deployment number: ${build2_resp}"
+
+wait_for_deployment_healthy "${BUILD_SLUG}" "${build2_number}"
 
 EXPECTED_CONTENT="e2e-build-v2"
 if ! wait_for "built app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
@@ -561,10 +611,18 @@ log "cli: listing apps..."
 cli_apps_json=$(BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" apps --json)
 printf '%s' "${cli_apps_json}" | grep -q "\"${BUILD_SLUG}\"" || fail "cli apps --json missing ${BUILD_SLUG}: ${cli_apps_json}"
 
+# Issue #2: `basepod deploy` now follows the async tarball deploy live —
+# uploads, mints a build_log stream token, streams the build log to
+# stdout as the build runs, then polls to a terminal status — rather than
+# just blocking silently on the upload request. Capture its output (both
+# streams, since the live build log and the final summary both print to
+# stdout) and assert it actually contains real build output, not just a
+# success message.
 log "cli: deploying '${BUILD_SLUG}' from source (v2 content again)..."
-if ! BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" deploy "${BUILD_DIR}" -a "${BUILD_SLUG}"; then
-	fail "cli deploy failed"
-fi
+cli_deploy_out=$(BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" deploy "${BUILD_DIR}" -a "${BUILD_SLUG}" 2>&1) ||
+	fail "cli deploy failed: ${cli_deploy_out}"
+printf '%s' "${cli_deploy_out}" | grep -qE 'COMMIT|busybox' ||
+	fail "cli deploy: live build-log output missing expected build output (COMMIT/busybox pull lines): ${cli_deploy_out}"
 EXPECTED_CONTENT="e2e-build-v2"
 if ! wait_for "cli-deployed app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
 	fail "cli deploy: app did not serve ${EXPECTED_CONTENT} within ${MAX_WAIT}s"
