@@ -66,6 +66,18 @@ type fakeRuntime struct {
 	// that ContainerInfo doesn't carry.
 	createdSpecs map[string]podman.CreateSpec
 
+	// volumes is an in-memory set of "created" named volumes, keyed by
+	// name, mirroring images's role for PullImage/ImageExists —
+	// EnsureVolume records a volume's labels here (and never overwrites
+	// them on a repeat call, matching the real Client.EnsureVolume's
+	// leave-existing-labels-untouched behavior — see its doc comment).
+	volumes map[string]map[string]string
+
+	ensureVolumeErr error
+	// ensureVolumeCalls records every EnsureVolume call's name, in call
+	// order — used by tests asserting which volumes a rollout ensured.
+	ensureVolumeCalls []string
+
 	// logsReader/logsErr script ContainerLogs; logsCalls records every
 	// call's arguments for assertions.
 	logsReader io.ReadCloser
@@ -154,6 +166,24 @@ func (f *fakeRuntime) ListImageTags(ctx context.Context, repoPrefix string) ([]s
 		}
 	}
 	return tags, nil
+}
+
+func (f *fakeRuntime) EnsureVolume(ctx context.Context, name string, labels map[string]string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.record("ensure-volume:" + name)
+	f.ensureVolumeCalls = append(f.ensureVolumeCalls, name)
+	if f.ensureVolumeErr != nil {
+		return f.ensureVolumeErr
+	}
+	if f.volumes == nil {
+		f.volumes = map[string]map[string]string{}
+	}
+	if _, exists := f.volumes[name]; !exists {
+		f.volumes[name] = labels
+	}
+	return nil
 }
 
 func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error) {
@@ -2439,5 +2469,286 @@ func TestDeployBuildRemovesOrphanImageWhenRolloutFails(t *testing.T) {
 	}
 	if got := rt.containers[oldID]; got.State != "running" {
 		t.Errorf("bp-blog-1 state = %q, want still running (untouched)", got.State)
+	}
+}
+
+// ---------------------------------------------------------------------
+// v0.5 Task 6: named volumes + the `replace` deploy strategy.
+// ---------------------------------------------------------------------
+
+// TestDeployMountsAppVolumesIntoNewContainer proves runRollout ensures
+// (labels) each of an app's declared volumes and passes them through to
+// CreateContainer's spec, derived as "bp-<slug>-<name>" — the exact
+// derivation VolumeName implements.
+func TestDeployMountsAppVolumesIntoNewContainer(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertVolume(app.ID, "data", "/var/lib/postgresql/data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertVolume(app.ID, "logs", "/var/log/postgresql"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.Deploy(ctx, app, "postgres:16"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	spec, ok := rt.createdSpecs["bp-db-1"]
+	if !ok {
+		t.Fatal("bp-db-1's CreateSpec was not recorded")
+	}
+	want := map[string]string{
+		VolumeName("db", "data"): "/var/lib/postgresql/data",
+		VolumeName("db", "logs"): "/var/log/postgresql",
+	}
+	if len(spec.NamedVolumes) != len(want) {
+		t.Fatalf("spec.NamedVolumes = %+v, want %d entries", spec.NamedVolumes, len(want))
+	}
+	for _, nv := range spec.NamedVolumes {
+		dest, ok := want[nv.Name]
+		if !ok {
+			t.Errorf("unexpected NamedVolume %+v", nv)
+			continue
+		}
+		if nv.Dest != dest {
+			t.Errorf("NamedVolume %q Dest = %q, want %q", nv.Name, nv.Dest, dest)
+		}
+	}
+
+	for volName := range want {
+		labels, ok := rt.volumes[volName]
+		if !ok {
+			t.Errorf("EnsureVolume was never called for %q", volName)
+			continue
+		}
+		if labels["basepod.managed"] != "true" || labels["basepod.app"] != "db" {
+			t.Errorf("volume %q labels = %+v, want basepod.managed=true, basepod.app=db", volName, labels)
+		}
+	}
+}
+
+// TestDeployNoVolumesLeavesSpecEmpty proves an app with no declared
+// volumes gets an empty NamedVolumes and never calls EnsureVolume — every
+// deploy path that existed before this task must be unaffected when
+// volumes aren't in play.
+func TestDeployNoVolumesLeavesSpecEmpty(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:alpine", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:alpine"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	spec, ok := rt.createdSpecs["bp-blog-1"]
+	if !ok {
+		t.Fatal("bp-blog-1's CreateSpec was not recorded")
+	}
+	if len(spec.NamedVolumes) != 0 {
+		t.Fatalf("spec.NamedVolumes = %+v, want empty", spec.NamedVolumes)
+	}
+	if len(rt.ensureVolumeCalls) != 0 {
+		t.Fatalf("EnsureVolume calls = %v, want none", rt.ensureVolumeCalls)
+	}
+}
+
+// TestZeroDowntimeStrategyCreatesNewBeforeRemovingOld proves the default
+// strategy's ordering is unchanged by this task: the new container is
+// created BEFORE the old one is stopped — this task's required "the
+// zero-downtime path is unchanged when no volumes [or a non-replace
+// strategy] are in play" regression, made explicit rather than left to be
+// inferred from TestSecondDeployRemovesOld's own (broader) ordering
+// assertion.
+func TestZeroDowntimeStrategyCreatesNewBeforeRemovingOld(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, ops := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "nginx:v1"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+	*ops = nil // only care about ordering within the second deploy
+
+	if _, err := eng.Deploy(ctx, app, "nginx:v2"); err != nil {
+		t.Fatalf("second Deploy: %v", err)
+	}
+
+	createIdx := opIndex(*ops, "create:bp-blog-2")
+	stopIdx := opIndex(*ops, "stop:")
+	if createIdx == -1 || stopIdx == -1 {
+		t.Fatalf("missing expected op in %v", *ops)
+	}
+	if !(createIdx < stopIdx) {
+		t.Errorf("op order = %v, want create-new before stop-old (zero-downtime)", *ops)
+	}
+}
+
+// TestReplaceStrategyStopsOldBeforeCreatingNew is this task's core
+// ordering regression: with DeployStrategy "replace", the OLD container
+// generation must be stopped+removed strictly BEFORE the new one is
+// created — the opposite of zero-downtime's overlap, required so a
+// volume-backed app never has two containers writing the same named
+// volume at once.
+func TestReplaceStrategyStopsOldBeforeCreatingNew(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, ops := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertVolume(app.ID, "data", "/var/lib/postgresql/data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppDeployStrategy(app.ID, store.DeployStrategyReplace); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.Deploy(ctx, app, "postgres:16"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+	*ops = nil // only care about ordering within the second (replace) deploy
+
+	app, err = st.AppBySlug("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "postgres:17"); err != nil {
+		t.Fatalf("second (replace) Deploy: %v", err)
+	}
+
+	stopIdx := opIndex(*ops, "stop:")
+	removeIdx := opIndex(*ops, "remove:")
+	createIdx := opIndex(*ops, "create:bp-db-2")
+	if stopIdx == -1 || removeIdx == -1 || createIdx == -1 {
+		t.Fatalf("missing expected op in %v", *ops)
+	}
+	if !(stopIdx < createIdx && removeIdx < createIdx) {
+		t.Errorf("op order = %v, want stop-old and remove-old strictly before create-new (replace)", *ops)
+	}
+}
+
+// TestReplaceStrategyFailureLeavesAppDownWithoutResurrectingOld is this
+// task's other core regression: a failed 'replace' deploy must NOT
+// resurrect the old container generation (there is none left to
+// resurrect — it was already removed before the new one was even
+// created) and must mark the app "error", not "running" — the accepted
+// trade documented on runRollout and App.DeployStrategy: a failed replace
+// leaves the app down because there is nothing to fall back to.
+func TestReplaceStrategyFailureLeavesAppDownWithoutResurrectingOld(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, prober, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppDeployStrategy(app.ID, store.DeployStrategyReplace); err != nil {
+		t.Fatal(err)
+	}
+	app, err = st.AppBySlug("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "postgres:16"); err != nil {
+		t.Fatalf("first Deploy: %v", err)
+	}
+
+	prober.failUpstream = "bp-db-2:5432"
+
+	app, err = st.AppBySlug("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep2, err := eng.Deploy(ctx, app, "postgres:17")
+	if err == nil {
+		t.Fatal("expected error from failed probe")
+	}
+	if dep2.Status != "failed" {
+		t.Errorf("dep2.Status = %q, want failed", dep2.Status)
+	}
+
+	for _, c := range rt.containers {
+		if c.Name == "bp-db-1" {
+			t.Errorf("bp-db-1 (old) should have been removed BEFORE the new one was even created (replace strategy) — a failed replace must not resurrect it, still present: %+v", c)
+		}
+		if c.Name == "bp-db-2" {
+			t.Errorf("bp-db-2 (the failed new container) should have been removed by fail()'s own cleanup, still present: %+v", c)
+		}
+	}
+
+	gotApp, err := st.AppBySlug("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.Status != "error" {
+		t.Errorf(`app.Status = %q, want "error" (no old container survives to fall back to — the accepted "replace" trade)`, gotApp.Status)
+	}
+}
+
+// TestRollbackHonorsReplaceStrategy proves Rollback goes through the same
+// strategy-aware runRollout Deploy uses: rolling back an app whose
+// DeployStrategy is "replace" still stops the currently-running container
+// before creating the rollback target's.
+func TestRollbackHonorsReplaceStrategy(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, ops := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppDeployStrategy(app.ID, store.DeployStrategyReplace); err != nil {
+		t.Fatal(err)
+	}
+	app, err = st.AppBySlug("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "postgres:16"); err != nil {
+		t.Fatalf("deploy 1: %v", err)
+	}
+	app, err = st.AppBySlug("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, app, "postgres:17"); err != nil {
+		t.Fatalf("deploy 2: %v", err)
+	}
+	*ops = nil // only care about ordering within the rollback
+
+	app, err = st.AppBySlug("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Rollback(ctx, app, 1); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	stopIdx := opIndex(*ops, "stop:")
+	createIdx := opIndex(*ops, "create:bp-db-3")
+	if stopIdx == -1 || createIdx == -1 {
+		t.Fatalf("missing expected op in %v", *ops)
+	}
+	if !(stopIdx < createIdx) {
+		t.Errorf("op order = %v, want stop-old before create-new even on rollback (replace strategy)", *ops)
 	}
 }

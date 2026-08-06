@@ -779,9 +779,11 @@ func TestMigrationDefaultsApplyToExistingApp(t *testing.T) {
 // (both feat/stream-tokens and fix/alias-namespace originally shipped a
 // 00005_*.sql). goose.Up hard-errors at boot on a duplicate version, so this
 // opens a brand-new DB, drives every migration in migrations/*.sql in order,
-// and asserts the full set landed — six files, six recorded versions — and
-// that both branches' schema objects (stream_tokens table from migration 6,
-// apps.alias_scheme column from migration 5) exist side by side.
+// and asserts the full set landed — eight files, eight recorded versions —
+// and that every branch's schema objects (stream_tokens table from
+// migration 6, apps.alias_scheme column from migration 5, git_sources/
+// git_deliveries tables + deployments.git_sha from migration 7, volumes
+// table + apps.deploy_strategy from migration 8) exist side by side.
 func TestAllMigrationsApplyCleanly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
@@ -803,8 +805,8 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 7 {
-		t.Fatalf("db version after migrating = %d, want 7 (00001..00007)", version)
+	if version != 8 {
+		t.Fatalf("db version after migrating = %d, want 8 (00001..00008)", version)
 	}
 
 	var appliedCount int
@@ -813,17 +815,18 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	}
 	// goose_db_version always carries a synthetic version-0 bootstrap row in
 	// addition to one row per applied migration file.
-	if appliedCount != 8 {
-		t.Fatalf("applied migration rows = %d, want 8 (bootstrap + 7 migrations)", appliedCount)
+	if appliedCount != 9 {
+		t.Fatalf("applied migration rows = %d, want 9 (bootstrap + 8 migrations)", appliedCount)
 	}
 
 	// apps.alias_scheme (migration 00005_alias_scheme.sql, from
-	// fix/alias-namespace) must exist.
+	// fix/alias-namespace) and apps.deploy_strategy (migration
+	// 00008_volumes_strategy.sql) must exist.
 	rows, err := db.Query(`PRAGMA table_info(apps)`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sawAliasScheme bool
+	var sawAliasScheme, sawDeployStrategy bool
 	for rows.Next() {
 		var cid int
 		var name, ctype string
@@ -836,6 +839,9 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 		if name == "alias_scheme" {
 			sawAliasScheme = true
 		}
+		if name == "deploy_strategy" {
+			sawDeployStrategy = true
+		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -843,6 +849,9 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	rows.Close()
 	if !sawAliasScheme {
 		t.Fatal("apps.alias_scheme column missing after migrating to latest")
+	}
+	if !sawDeployStrategy {
+		t.Fatal("apps.deploy_strategy column missing after migrating to latest")
 	}
 
 	// stream_tokens table (migration 00006_stream_tokens.sql, from
@@ -858,6 +867,12 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, want).Scan(&tableName); err != nil {
 			t.Fatalf("%s table missing after migrating to latest: %v", want, err)
 		}
+	}
+
+	// volumes table (migration 00008_volumes_strategy.sql, v0.5's Task 6)
+	// must exist.
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'volumes'`).Scan(&tableName); err != nil {
+		t.Fatalf("volumes table missing after migrating to latest: %v", err)
 	}
 
 	// deployments.git_sha (migration 00007_git_sources.sql) must exist.
@@ -1605,5 +1620,296 @@ func TestPruneGitDeliveriesKeepsExactlyNNewest(t *testing.T) {
 		if got[gone] {
 			t.Fatalf("expected delivery %q pruned, but it survived: %+v", gone, list)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------
+// v0.5: named volumes + deploy_strategy (migration
+// 00008_volumes_strategy.sql). Kept in its own block for the same reason
+// as store.go's own block — see that file's comment.
+// ---------------------------------------------------------------------
+
+// TestCreateAppDefaultsDeployStrategy proves a brand-new app starts with
+// DeployStrategy "zero-downtime" (the schema default) on both the
+// returned App and what AppBySlug/ListApps read back — mirrors
+// TestCreateAppDefaultsAliasScheme's shape for the sibling column this
+// task adds.
+func TestCreateAppDefaultsDeployStrategy(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("blog", "nginx:alpine", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.DeployStrategy != DeployStrategyZeroDowntime {
+		t.Fatalf("app.DeployStrategy = %q, want %q", app.DeployStrategy, DeployStrategyZeroDowntime)
+	}
+
+	got, err := s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeployStrategy != DeployStrategyZeroDowntime {
+		t.Fatalf("AppBySlug DeployStrategy = %q, want %q", got.DeployStrategy, DeployStrategyZeroDowntime)
+	}
+
+	apps, err := s.ListApps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(apps) != 1 || apps[0].DeployStrategy != DeployStrategyZeroDowntime {
+		t.Fatalf("ListApps DeployStrategy = %+v, want %q", apps, DeployStrategyZeroDowntime)
+	}
+}
+
+// TestUpdateAppDeployStrategy proves UpdateAppDeployStrategy persists and
+// round-trips through both values.
+func TestUpdateAppDeployStrategy(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("blog", "nginx:alpine", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateAppDeployStrategy(app.ID, DeployStrategyReplace); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeployStrategy != DeployStrategyReplace {
+		t.Fatalf("DeployStrategy after update = %q, want %q", got.DeployStrategy, DeployStrategyReplace)
+	}
+
+	if err := s.UpdateAppDeployStrategy(app.ID, DeployStrategyZeroDowntime); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeployStrategy != DeployStrategyZeroDowntime {
+		t.Fatalf("DeployStrategy after second update = %q, want %q", got.DeployStrategy, DeployStrategyZeroDowntime)
+	}
+}
+
+// TestValidDeployStrategy covers the validator PATCH /api/v1/apps/{slug}
+// relies on to 422 an unknown deploy_strategy value.
+func TestValidDeployStrategy(t *testing.T) {
+	cases := []struct {
+		value string
+		want  bool
+	}{
+		{"zero-downtime", true},
+		{"replace", true},
+		{"", false},
+		{"Replace", false},
+		{"rolling", false},
+	}
+	for _, tc := range cases {
+		if got := ValidDeployStrategy(tc.value); got != tc.want {
+			t.Errorf("ValidDeployStrategy(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+// TestUpsertVolumeCreatesAndUpdates proves UpsertVolume both inserts a new
+// row and, on a second call for the same (app_id, name), updates
+// container_path in place rather than erroring or duplicating — the
+// upsert contract Task 8's compose apply (a re-appliable operation) relies
+// on.
+func TestUpsertVolumeCreatesAndUpdates(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := s.UpsertVolume(app.ID, "data", "/var/lib/postgresql/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.AppID != app.ID || v.Name != "data" || v.ContainerPath != "/var/lib/postgresql/data" || v.ID == 0 || v.CreatedAt == "" {
+		t.Fatalf("unexpected volume: %+v", v)
+	}
+
+	// Re-upsert with a different container_path: same row, updated path.
+	v2, err := s.UpsertVolume(app.ID, "data", "/var/lib/postgresql/17/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v2.ID != v.ID {
+		t.Fatalf("re-upsert created a new row: first ID %d, second ID %d", v.ID, v2.ID)
+	}
+	if v2.ContainerPath != "/var/lib/postgresql/17/data" {
+		t.Fatalf("ContainerPath after re-upsert = %q, want updated path", v2.ContainerPath)
+	}
+
+	got, err := s.ListVolumes(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListVolumes = %+v, want exactly 1 (re-upsert must not duplicate)", got)
+	}
+}
+
+// TestListVolumesOrderedByNameAndIsolatedPerApp proves ListVolumes returns
+// only appID's own volumes, alphabetically by name.
+func TestListVolumesOrderedByNameAndIsolatedPerApp(t *testing.T) {
+	s := open(t)
+	app1, err := s.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app2, err := s.CreateApp("cache", "redis:7", 6379)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UpsertVolume(app1.ID, "logs", "/var/log"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertVolume(app1.ID, "data", "/var/lib/postgresql/data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertVolume(app2.ID, "data", "/data"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListVolumes(app1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Name != "data" || got[1].Name != "logs" {
+		t.Fatalf("ListVolumes(app1) = %+v, want [data, logs] in that order", got)
+	}
+	for _, v := range got {
+		if v.AppID != app1.ID {
+			t.Fatalf("ListVolumes(app1) returned a volume belonging to a different app: %+v", v)
+		}
+	}
+}
+
+// TestVolumeCascadeDeleteOnAppDelete proves the volumes TABLE ROW is
+// removed when its owning app is deleted (ON DELETE CASCADE, migration
+// 00008) — this is bookkeeping-row cleanup only, distinct from (and not a
+// contradiction of) the "app delete keeps volumes" product rule, which is
+// about the underlying libpod volume never being removed. That half lives
+// in internal/api's handleDeleteApp (it calls ListVolumes BEFORE
+// DeleteApp specifically to still be able to log the surviving libpod
+// volume names afterward) and is covered by that package's own tests, not
+// here — this test only proves the store-level cascade.
+func TestVolumeCascadeDeleteOnAppDelete(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertVolume(app.ID, "data", "/var/lib/postgresql/data"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteApp(app.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListVolumes(app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("volumes row(s) survived app delete: %+v", got)
+	}
+}
+
+// TestUpsertVolumeUniquePerAppAllowsSameNameOnDifferentApps proves the
+// UNIQUE(app_id, name) constraint is scoped per-app, not global — two
+// different apps can each declare a volume named "data".
+func TestUpsertVolumeUniquePerAppAllowsSameNameOnDifferentApps(t *testing.T) {
+	s := open(t)
+	app1, err := s.CreateApp("db", "postgres:16", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app2, err := s.CreateApp("cache", "redis:7", 6379)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UpsertVolume(app1.ID, "data", "/var/lib/postgresql/data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertVolume(app2.ID, "data", "/data"); err != nil {
+		t.Fatalf("expected same-name volume on a different app to succeed, got: %v", err)
+	}
+}
+
+// TestMigrationVolumesStrategyDefaultsAppliesToExistingApp mirrors
+// TestMigrationDefaultsApplyToExistingApp / …AliasSchemeDefaults…: an app
+// row inserted on a pre-migration-8 data dir (before migration 00008 ever
+// ran, which had no deploy_strategy column and no volumes table at all)
+// must come out the other side of an upgrade with DeployStrategy
+// "zero-downtime" — never NULL, never a migration failure — and the
+// volumes table must be usable immediately afterward. Bypasses Store.Open
+// (which always migrates straight to latest) to reproduce that exact
+// sequence: migrate up to version 6 only (before either of the two
+// concurrent v0.5 migrations, 00007 and 00008, ran), insert a row the way
+// that schema would have, then migrate the rest of the way and read it
+// back through the normal Store API.
+func TestMigrationVolumesStrategyDefaultsAppliesToExistingApp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, "migrations", 6); err != nil {
+		t.Fatalf("migrate to version 6: %v", err)
+	}
+
+	// Insert exactly as version-6 schema's apps table would have accepted
+	// — no deploy_strategy column exists yet at this point.
+	if _, err := db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, "preexisting", "nginx:alpine", 80); err != nil {
+		t.Fatalf("insert pre-migration-8 row: %v", err)
+	}
+
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	got, err := s.AppBySlug("preexisting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeployStrategy != DeployStrategyZeroDowntime {
+		t.Fatalf("pre-existing row's DeployStrategy = %q, want %q", got.DeployStrategy, DeployStrategyZeroDowntime)
+	}
+
+	// The volumes table must be immediately usable for a pre-existing app.
+	if _, err := s.UpsertVolume(got.ID, "data", "/data"); err != nil {
+		t.Fatalf("UpsertVolume against a migrated-in-place app: %v", err)
+	}
+	vols, err := s.ListVolumes(got.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vols) != 1 || vols[0].Name != "data" {
+		t.Fatalf("ListVolumes after migration = %+v", vols)
 	}
 }

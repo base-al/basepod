@@ -24,6 +24,13 @@ type Runtime interface {
 	// "<repoPrefix>:*" — used by pruneBuiltImages to enumerate an app's
 	// built tags.
 	ListImageTags(ctx context.Context, repoPrefix string) ([]string, error)
+	// EnsureVolume makes sure a named volume exists (creating it, labeled,
+	// if it doesn't) — used by runRollout to pre-create/label an app's
+	// declared volumes (basepod.managed/basepod.app) before referencing
+	// them in a CreateContainer spec, since libpod's own auto-create on
+	// first reference leaves a volume unlabeled (see
+	// podman.Client.EnsureVolume's doc comment).
+	EnsureVolume(ctx context.Context, name string, labels map[string]string) error
 	CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string, timeoutSec int) error
