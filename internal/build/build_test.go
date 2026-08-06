@@ -433,6 +433,167 @@ func TestBuildCapsLogOutput(t *testing.T) {
 	}
 }
 
+// TestBuildManifestAtRootIsParsed proves a basepod.yaml present at the
+// build context's root is detected, parsed, and returned on Result.
+func TestBuildManifestAtRootIsParsed(t *testing.T) {
+	dataDir := t.TempDir()
+	rt := &fakeRuntime{}
+	b := New(rt, dataDir, 2)
+
+	gz := gzipTar(t, []tarEntry{
+		{name: "Containerfile", body: "FROM alpine\n"},
+		{name: "basepod.yaml", body: "name: blog\nport: 8080\n"},
+	})
+
+	res, err := b.BuildManifest(context.Background(), "blog", 1, gz)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if res.Manifest == nil {
+		t.Fatal("Manifest = nil, want a parsed manifest")
+	}
+	if res.Manifest.Name != "blog" || res.Manifest.Port != 8080 {
+		t.Fatalf("Manifest = %+v, want Name=blog Port=8080", res.Manifest)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("Warnings = %v, want none", res.Warnings)
+	}
+}
+
+// TestBuildManifestAbsentIsFine proves a build context with no
+// basepod.yaml at all builds normally with a nil Manifest and no
+// warnings — the manifest is entirely optional.
+func TestBuildManifestAbsentIsFine(t *testing.T) {
+	dataDir := t.TempDir()
+	rt := &fakeRuntime{}
+	b := New(rt, dataDir, 2)
+
+	gz := gzipTar(t, []tarEntry{{name: "Containerfile", body: "FROM alpine\n"}})
+
+	res, err := b.BuildManifest(context.Background(), "blog", 1, gz)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if res.Manifest != nil {
+		t.Fatalf("Manifest = %+v, want nil", res.Manifest)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("Warnings = %v, want none", res.Warnings)
+	}
+}
+
+// TestBuildManifestInSubdirIsIgnored proves a basepod.yaml that isn't at
+// the build context's root is left alone entirely — same "root only"
+// rule as Containerfile/Dockerfile detection.
+func TestBuildManifestInSubdirIsIgnored(t *testing.T) {
+	dataDir := t.TempDir()
+	rt := &fakeRuntime{}
+	b := New(rt, dataDir, 2)
+
+	gz := gzipTar(t, []tarEntry{
+		{name: "Containerfile", body: "FROM alpine\n"},
+		{name: "config/basepod.yaml", body: "name: blog\nport: 8080\n"},
+	})
+
+	res, err := b.BuildManifest(context.Background(), "blog", 1, gz)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if res.Manifest != nil {
+		t.Fatalf("Manifest = %+v, want nil (a nested basepod.yaml must be ignored)", res.Manifest)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("Warnings = %v, want none", res.Warnings)
+	}
+}
+
+// TestBuildManifestYAMLPreferredOverYML proves basepod.yaml wins when
+// both basepod.yaml and basepod.yml are present at the root, mirroring
+// the Containerfile-over-Dockerfile preference rule.
+func TestBuildManifestYAMLPreferredOverYML(t *testing.T) {
+	dataDir := t.TempDir()
+	rt := &fakeRuntime{}
+	b := New(rt, dataDir, 2)
+
+	gz := gzipTar(t, []tarEntry{
+		{name: "Containerfile", body: "FROM alpine\n"},
+		{name: "basepod.yml", body: "name: from-yml\n"},
+		{name: "basepod.yaml", body: "name: from-yaml\n"},
+	})
+
+	res, err := b.BuildManifest(context.Background(), "blog", 1, gz)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if res.Manifest == nil || res.Manifest.Name != "from-yaml" {
+		t.Fatalf("Manifest = %+v, want Name=from-yaml", res.Manifest)
+	}
+}
+
+// TestBuildManifestUnknownKeysWarnAndSurfaceInLog proves an unknown key
+// in basepod.yaml produces a warning (not a build failure) that also
+// gets written into the build log itself — the log being the first
+// feedback channel a zero-config deploy has.
+func TestBuildManifestUnknownKeysWarnAndSurfaceInLog(t *testing.T) {
+	dataDir := t.TempDir()
+	rt := &fakeRuntime{}
+	b := New(rt, dataDir, 2)
+
+	gz := gzipTar(t, []tarEntry{
+		{name: "Containerfile", body: "FROM alpine\n"},
+		{name: "basepod.yaml", body: "name: blog\nnonsense: true\n"},
+	})
+
+	res, err := b.BuildManifest(context.Background(), "blog", 1, gz)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if res.Manifest == nil || res.Manifest.Name != "blog" {
+		t.Fatalf("Manifest = %+v, want Name=blog despite the unknown key", res.Manifest)
+	}
+	if len(res.Warnings) != 1 || res.Warnings[0] != "basepod.yaml: unknown field: nonsense" {
+		t.Fatalf("Warnings = %v, want [\"basepod.yaml: unknown field: nonsense\"]", res.Warnings)
+	}
+
+	data, rerr := os.ReadFile(res.LogPath)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !strings.Contains(string(data), "unknown field: nonsense") {
+		t.Fatalf("log = %q, want it to mention the manifest warning", data)
+	}
+}
+
+// TestBuildManifestInvalidIsWarningNotFailure proves a basepod.yaml with
+// a fatal parse error (per manifest.Parse) does not fail the build —
+// zero-config deploys must keep working even with a broken manifest —
+// it's downgraded to a build-log warning and the build proceeds without
+// manifest defaults.
+func TestBuildManifestInvalidIsWarningNotFailure(t *testing.T) {
+	dataDir := t.TempDir()
+	rt := &fakeRuntime{}
+	b := New(rt, dataDir, 2)
+
+	gz := gzipTar(t, []tarEntry{
+		{name: "Containerfile", body: "FROM alpine\n"},
+		{name: "basepod.yaml", body: "port: not-a-number\n"},
+	})
+
+	res, err := b.BuildManifest(context.Background(), "blog", 1, gz)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v (an invalid manifest must not fail the build)", err)
+	}
+	if res.Manifest != nil {
+		t.Fatalf("Manifest = %+v, want nil (parse failed)", res.Manifest)
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "basepod.yaml") {
+		t.Fatalf("Warnings = %v, want one mentioning basepod.yaml", res.Warnings)
+	}
+	if rt.callCount() != 1 {
+		t.Fatalf("BuildImage should still have been called despite the bad manifest")
+	}
+}
+
 func fatalIfErrNotContains(t *testing.T, err error, substr string) {
 	t.Helper()
 	if err == nil || !strings.Contains(err.Error(), substr) {

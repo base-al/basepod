@@ -6,12 +6,15 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+
+	"github.com/base-al/basepod/internal/manifest"
 )
 
 // sizeWarnThreshold is the packed (gzipped) build-context size past which
@@ -30,6 +33,7 @@ func Commands() []*cobra.Command {
 		newLogoutCmd(),
 		newContextCmd(),
 		newAppsCmd(),
+		newInitCmd(),
 		newDeployCmd(),
 		newLogsCmd(),
 		newEnvCmd(),
@@ -324,8 +328,16 @@ func newDeployCmd() *cobra.Command {
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			path := deployPathArg(args)
 			if appSlug == "" {
-				return fmt.Errorf("--app/-a is required")
+				slug, mErr := appSlugFromManifest(path)
+				if mErr != nil {
+					return mErr
+				}
+				appSlug = slug
+			}
+			if appSlug == "" {
+				return fmt.Errorf("--app/-a is required (or add a `name:` to basepod.yaml in %s)", path)
 			}
 			client, err := resolveClient(cmd)
 			if err != nil {
@@ -345,10 +357,10 @@ func newDeployCmd() *cobra.Command {
 				return nil
 			}
 
-			return deployFromSource(cmd, client, appSlug, deployPathArg(args))
+			return deployFromSource(cmd, client, appSlug, path)
 		},
 	}
-	cmd.Flags().StringVarP(&appSlug, "app", "a", "", "app slug to deploy (required)")
+	cmd.Flags().StringVarP(&appSlug, "app", "a", "", "app slug to deploy (default: the `name` in basepod.yaml, if present)")
 	cmd.Flags().StringVar(&image, "image", "", "deploy this image reference instead of building from source")
 	addContextFlag(cmd)
 	return cmd
@@ -359,6 +371,40 @@ func deployPathArg(args []string) string {
 		return args[0]
 	}
 	return "."
+}
+
+// appSlugFromManifest reads dir/basepod.yaml (or basepod.yml) if present
+// and returns its `name` field, so `basepod deploy` can default --app
+// for a project that already has one — the whole point of zero-config:
+// a fresh directory needs no flags once `basepod init` (or a
+// hand-written manifest) has set a name.
+//
+// slug == "" && err == nil means no manifest file exists at all — not
+// an error, deploy just falls back to requiring --app. A manifest that
+// exists but fails to parse, or parses without a name, IS reported as
+// an error rather than silently falling through to "--app is required":
+// the file is clearly meant to configure the app, so a broken or
+// incomplete one deserves a message naming the actual problem.
+func appSlugFromManifest(dir string) (slug string, err error) {
+	for _, name := range []string{"basepod.yaml", "basepod.yml"} {
+		f, openErr := os.Open(filepath.Join(dir, name))
+		if openErr != nil {
+			if os.IsNotExist(openErr) {
+				continue
+			}
+			return "", fmt.Errorf("read %s: %w", name, openErr)
+		}
+		mf, _, parseErr := manifest.Parse(f)
+		f.Close()
+		if parseErr != nil {
+			return "", fmt.Errorf("%s: %w", name, parseErr)
+		}
+		if mf.Name == "" {
+			return "", fmt.Errorf("%s has no `name` field; pass --app explicitly", name)
+		}
+		return mf.Name, nil
+	}
+	return "", nil
 }
 
 // deployFromSource implements the tarball half of `basepod deploy`: pack

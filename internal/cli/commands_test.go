@@ -308,6 +308,93 @@ func TestDeployRequiresApp(t *testing.T) {
 	}
 }
 
+// TestDeployDefaultsAppFromManifest proves `basepod deploy` (with
+// --image, so no Containerfile/tarball is needed) infers --app from a
+// basepod.yaml's `name` field in the deploy path when --app/-a is
+// omitted — the zero-config target: "basepod init && basepod deploy" in
+// a fresh directory, no flags.
+func TestDeployDefaultsAppFromManifest(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		writeJSONResponse(w, http.StatusOK, Deployment{
+			Number: 1, Image: "myimage:v1", Status: "healthy",
+			Source: "image", Trigger: "api",
+		})
+	}))
+	defer srv.Close()
+	saveTestContext(t, path, srv.URL, "tok")
+
+	dir := t.TempDir()
+	writeFile(t, dir, "basepod.yaml", "name: blog\nport: 8080\n")
+
+	out, _, err := runCLI(t, "", "deploy", "--image", "myimage:v1", dir)
+	if err != nil {
+		t.Fatalf("deploy: %v (out=%s)", err, out)
+	}
+	if gotPath != "/api/v1/apps/blog/deploy" {
+		t.Fatalf("request path = %q, want the app slug from basepod.yaml (blog)", gotPath)
+	}
+}
+
+// TestDeployExplicitAppFlagWinsOverManifest proves --app/-a still takes
+// priority over a basepod.yaml `name` when both are present.
+func TestDeployExplicitAppFlagWinsOverManifest(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		writeJSONResponse(w, http.StatusOK, Deployment{
+			Number: 1, Image: "myimage:v1", Status: "healthy",
+			Source: "image", Trigger: "api",
+		})
+	}))
+	defer srv.Close()
+	saveTestContext(t, path, srv.URL, "tok")
+
+	dir := t.TempDir()
+	writeFile(t, dir, "basepod.yaml", "name: from-manifest\n")
+
+	out, _, err := runCLI(t, "", "deploy", "-a", "from-flag", "--image", "myimage:v1", dir)
+	if err != nil {
+		t.Fatalf("deploy: %v (out=%s)", err, out)
+	}
+	if gotPath != "/api/v1/apps/from-flag/deploy" {
+		t.Fatalf("request path = %q, want --app to win over the manifest", gotPath)
+	}
+}
+
+// TestDeployManifestWithoutNameStillRequiresApp proves a basepod.yaml
+// that exists but doesn't set `name` surfaces a clear error rather than
+// silently falling back to the generic "--app is required" message.
+func TestDeployManifestWithoutNameStillRequiresApp(t *testing.T) {
+	setTestConfigPath(t)
+	dir := t.TempDir()
+	writeFile(t, dir, "basepod.yaml", "port: 8080\n")
+
+	_, _, err := runCLI(t, "", "deploy", "--image", "x", dir)
+	if err == nil || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("err = %v, want an error naming the missing `name` field", err)
+	}
+}
+
+// TestDeployBadManifestSurfacesParseError proves a basepod.yaml with a
+// fatal parse error (not just a missing name) is reported clearly rather
+// than silently ignored.
+func TestDeployBadManifestSurfacesParseError(t *testing.T) {
+	setTestConfigPath(t)
+	dir := t.TempDir()
+	writeFile(t, dir, "basepod.yaml", "port: not-a-number\n")
+
+	_, _, err := runCLI(t, "", "deploy", "--image", "x", dir)
+	if err == nil || !strings.Contains(err.Error(), "basepod.yaml") {
+		t.Fatalf("err = %v, want an error mentioning basepod.yaml", err)
+	}
+}
+
 func TestDeployFromSourceRequiresContainerfile(t *testing.T) {
 	path := setTestConfigPath(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
