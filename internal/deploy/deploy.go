@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	osexec "os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -395,6 +396,7 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 	// pruneBuiltImages's doc comment for why that matters.
 	if dep.Source != "image" {
 		e.pruneBuiltImages(ctx, app.Slug, imageRef)
+		e.pruneBuildLogs(dep)
 	}
 
 	if err := e.st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
@@ -570,6 +572,98 @@ func (e *Engine) pruneBuiltImages(ctx context.Context, slug, currentImageRef str
 		}
 		if err := e.rt.RemoveImage(cleanupCtx, nt.tag, false); err != nil {
 			fmt.Fprintf(e.log, "deploy: retention: remove image %s: %v\n", nt.tag, err)
+		}
+	}
+}
+
+// retainBuildLogs mirrors retainBuiltImages: how many of an app's build
+// logs (<dataDir>/apps/<slug>/builds/<n>.log — see
+// internal/build.Builder.LogPath) pruneBuildLogs keeps, newest-numbered
+// first, after a successful rollout that ran a build. Kept equal to
+// retainBuiltImages deliberately — a separate constant would just invite
+// the two retention windows to drift apart for no real benefit, since
+// every retained image tag has a corresponding log.
+const retainBuildLogs = retainBuiltImages
+
+// pruneBuildLogs removes build logs from dep's app's log directory whose
+// deployment number falls outside the retainBuildLogs highest-numbered
+// ones, mirroring pruneBuiltImages's own retention shape but for
+// on-disk log files rather than local image tags.
+//
+// It derives the log directory from dep.BuildLogPath (set by DeployBuild
+// via internal/build.Builder.LogPath — see its doc comment) rather than
+// needing its own copy of the data directory or a *build.Builder
+// reference: the directory containing any one deployment's log path is
+// exactly the app's shared builds/ directory. A dep with no BuildLogPath
+// (a registry-image deploy, or a rollback that reused an existing image
+// without running a new build) never wrote a log file, so this is a
+// no-op for it.
+//
+// dep.Number — the deployment that just finished, or is still in flight
+// while its own log file is open for writing — is always protected from
+// removal, regardless of where it ranks numerically, exactly like
+// pruneBuiltImages's currentImageRef protection: this runs from
+// runRollout only after dep's own build already completed, so "in
+// flight" only matters in the sense that this must never be the call
+// that deletes the log of the deployment it was invoked for.
+//
+// Every failure (listing the directory, removing one file) is logged and
+// skipped rather than aborting, matching every other post-deploy cleanup
+// step in this file: by the time this runs, the deploy has already
+// succeeded, so a stray old log is a disk-space nuisance, not a
+// correctness problem. A missing builds/ directory (e.g. a test fixture,
+// or a log that was already cleaned up by an app deletion racing this
+// call) is treated as "nothing to prune", not an error.
+func (e *Engine) pruneBuildLogs(dep *store.Deployment) {
+	if dep.BuildLogPath == "" {
+		return
+	}
+	dir := filepath.Dir(dep.BuildLogPath)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(e.log, "deploy: retention: list build logs in %s: %v\n", dir, err)
+		}
+		return
+	}
+
+	type numberedLog struct {
+		number int
+		path   string
+	}
+	var numbered []numberedLog
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		suffix, ok := strings.CutSuffix(entry.Name(), ".log")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(suffix)
+		if err != nil {
+			continue // non-numeric log file name — never touched
+		}
+		numbered = append(numbered, numberedLog{number: n, path: filepath.Join(dir, entry.Name())})
+	}
+	if len(numbered) <= retainBuildLogs {
+		return
+	}
+
+	sort.Slice(numbered, func(i, j int) bool { return numbered[i].number > numbered[j].number })
+
+	protected := map[int]bool{dep.Number: true}
+	for _, nl := range numbered[:retainBuildLogs] {
+		protected[nl.number] = true
+	}
+
+	for _, nl := range numbered[retainBuildLogs:] {
+		if protected[nl.number] {
+			continue
+		}
+		if err := os.Remove(nl.path); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(e.log, "deploy: retention: remove build log %s: %v\n", nl.path, err)
 		}
 	}
 }

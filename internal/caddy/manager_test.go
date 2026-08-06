@@ -158,8 +158,8 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	if spec.Name != ContainerName {
 		t.Errorf("spec.Name = %q, want %q", spec.Name, ContainerName)
 	}
-	if spec.Image != Image {
-		t.Errorf("spec.Image = %q, want %q", spec.Image, Image)
+	if spec.Image != PinnedImage {
+		t.Errorf("spec.Image = %q, want %q", spec.Image, PinnedImage)
 	}
 	if spec.RestartPolicy != "always" {
 		t.Errorf("spec.RestartPolicy = %q, want %q", spec.RestartPolicy, "always")
@@ -235,7 +235,7 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 
 // matchingPorts is the {80,443} -> {8080,8443} port set every drift test
 // in this file builds its Manager against (NewManager(..., 8080, 8443)),
-// so a fakeRuntime.inspectInfo carrying these plus Image: Image
+// so a fakeRuntime.inspectInfo carrying these plus Image: PinnedImage
 // represents an existing container with no drift.
 var matchingPorts = []podman.PortMapping{
 	{ContainerPort: 80, HostPort: 8080},
@@ -283,7 +283,7 @@ func TestEnsureStartsWhenStopped(t *testing.T) {
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "exited",
-		Image: Image, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
+		Image: PinnedImage, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
 	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -304,7 +304,7 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "running",
-		Image: Image, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
+		Image: PinnedImage, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
 	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -341,7 +341,7 @@ func TestEnsureRecreatesWhenStateCreated(t *testing.T) {
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "created",
-		Image: Image, Ports: matchingPorts,
+		Image: PinnedImage, Ports: matchingPorts,
 	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -358,8 +358,8 @@ func TestEnsureRecreatesWhenStateCreated(t *testing.T) {
 }
 
 // TestEnsureRecreatesOnImageMismatch proves a running container whose
-// image no longer matches the pinned Image const (e.g. after a basepod
-// upgrade bumps the Caddy version) is recreated rather than left running
+// image no longer matches PinnedImage (e.g. after a basepod upgrade bumps
+// the Caddy version, or its digest) is recreated rather than left running
 // the stale image.
 func TestEnsureRecreatesOnImageMismatch(t *testing.T) {
 	tmp := t.TempDir()
@@ -391,7 +391,7 @@ func TestEnsureRecreatesOnPortMismatch(t *testing.T) {
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "running",
-		Image: Image,
+		Image: PinnedImage,
 		Ports: []podman.PortMapping{
 			{ContainerPort: 80, HostPort: 9090}, // stale: mgr wants 8080
 			{ContainerPort: 443, HostPort: 8443},
@@ -430,7 +430,7 @@ func TestEnsureNoopWhenAllMatch(t *testing.T) {
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "running",
-		Image: Image,
+		Image: PinnedImage,
 		// Deliberately reversed order vs. desiredPorts() to prove the
 		// comparison is set-based, not positional.
 		Ports: []podman.PortMapping{
@@ -463,7 +463,7 @@ func TestEnsureRecreatesOnMountMismatch(t *testing.T) {
 
 	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
 		ID: "abc123", Name: ContainerName, State: "running",
-		Image: Image, Ports: matchingPorts,
+		Image: PinnedImage, Ports: matchingPorts,
 		// No caddy-sock mount at all — as an old (pre-dashboard) bp-caddy
 		// container would report.
 		Mounts: []podman.BindMount{
@@ -501,7 +501,7 @@ func TestEnsureDriftRecreatePullFailureLeavesOldContainer(t *testing.T) {
 	fr := &fakeRuntime{
 		inspectInfo: &podman.ContainerInfo{
 			ID: "abc123", Name: ContainerName, State: "created",
-			Image: Image, Ports: matchingPorts,
+			Image: PinnedImage, Ports: matchingPorts,
 		},
 		pullErr: pullErr,
 	}
@@ -540,7 +540,7 @@ func TestEnsureDriftRecreateAlwaysPulls(t *testing.T) {
 	fr := &fakeRuntime{
 		inspectInfo: &podman.ContainerInfo{
 			ID: "abc123", Name: ContainerName, State: "created",
-			Image: Image, Ports: matchingPorts,
+			Image: PinnedImage, Ports: matchingPorts,
 		},
 	}
 	fe := &fakeExecer{}
@@ -590,7 +590,7 @@ func TestEnsureDriftRecreateArchMismatchLeavesOldContainer(t *testing.T) {
 	fr := &fakeRuntime{
 		inspectInfo: &podman.ContainerInfo{
 			ID: "abc123", Name: ContainerName, State: "created",
-			Image: Image, Ports: matchingPorts,
+			Image: PinnedImage, Ports: matchingPorts,
 		},
 		archResult: "amd64",
 	}

@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -523,6 +526,17 @@ func writeDeployBuildError(w http.ResponseWriter, err error) {
 // and then removes its store row. If teardown fails, the app row is left
 // in place (matching the store's foreign-key ownership of deployments)
 // so a retry has something to act on.
+//
+// Once both the containers and the store row are gone, it also best-effort
+// removes the app's on-disk data directory (build spool artifacts and
+// build logs — see internal/build.Builder) via appDataDir + os.RemoveAll:
+// nothing about the app's on-disk footprint should survive a delete
+// forever (see H3 in the v0.3 security audit — an app that's built and
+// redeployed many times before being deleted otherwise leaves its build
+// logs on disk permanently). A failure here is logged, not surfaced as an
+// error response: the app is already gone from the API's/store's
+// perspective by this point, so there's nothing left for the caller to
+// retry.
 func (a *api) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	app, ok := a.appBySlugOrNotFound(w, r)
 	if !ok {
@@ -539,5 +553,40 @@ func (a *api) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if a.builder != nil {
+		if dir, ok := appDataDir(a.builder.DataDir(), app.Slug); ok {
+			if err := os.RemoveAll(dir); err != nil {
+				log.Printf("api: delete app %s: remove data dir %s: %v", app.Slug, dir, err)
+			}
+		} else {
+			// Should be unreachable — slugPattern (see handleCreateApp)
+			// already forbids anything but [a-z][a-z0-9-]{0,31}, which can
+			// never produce a path-traversal segment. Logged rather than
+			// silently skipped so a future change to slug validation that
+			// broke this invariant would actually be noticed.
+			log.Printf("api: delete app %s: slug does not resolve inside the data directory — refusing to remove anything", app.Slug)
+		}
+	}
+
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// appDataDir returns the data-directory path for slug's app files
+// (<dataDir>/apps/<slug> — see internal/build.Builder's LogPath doc
+// comment for the layout underneath it), or ("", false) if slug would
+// resolve outside <dataDir>/apps once cleaned. Defense in depth for
+// handleDeleteApp's os.RemoveAll: slugPattern already forbids a slug
+// containing "/" or ".." at creation time (see handleCreateApp), but this
+// still verifies the join can never escape the intended directory before
+// a delete request is allowed to recursively remove anything from disk.
+func appDataDir(dataDir, slug string) (string, bool) {
+	base := filepath.Clean(filepath.Join(dataDir, "apps"))
+	dir := filepath.Clean(filepath.Join(base, slug))
+	// dir must be a strict descendant of base: this also rejects an empty
+	// (or "."/".." -only) slug, which would otherwise resolve to base
+	// itself — never a valid single app's directory to recursively remove.
+	if !strings.HasPrefix(dir, base+string(filepath.Separator)) {
+		return "", false
+	}
+	return dir, true
 }

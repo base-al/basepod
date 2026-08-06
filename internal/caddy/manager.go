@@ -16,8 +16,48 @@ import (
 	"github.com/base-al/basepod/internal/podman"
 )
 
-// Image is the Caddy image the manager pulls and runs.
-const Image = "docker.io/library/caddy:2.10-alpine"
+// caddyRepo is the Caddy image repository, shared by Image (the
+// human-readable, tag-qualified form used in logs/errors) and PinnedImage
+// (the digest-qualified form the manager actually pulls and runs).
+const caddyRepo = "docker.io/library/caddy"
+
+// Image is the Caddy image tag the manager tracks — kept purely as a
+// readable identity for logs and error messages: what actually gets
+// pulled/created is PinnedImage, below.
+const Image = caddyRepo + ":2.10-alpine"
+
+// CaddyImageDigest pins Image to a specific manifest-list digest, so a
+// compromised or force-moved registry tag can never silently swap the
+// image BasePod runs as its reverse proxy: PullImage/CreateContainer
+// reference PinnedImage (Image's repo + this digest), not the mutable
+// tag, so what's pulled and run is exactly the bytes verified below,
+// every time.
+//
+// Verified against the live registry on 2026-08-06 via the Docker
+// Registry HTTP API v2 (no skopeo/docker available in that environment):
+//
+//	TOKEN=$(curl -s 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/caddy:pull' | jq -r .token)
+//	curl -sI -H "Authorization: Bearer $TOKEN" \
+//	  -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+//	  https://registry-1.docker.io/v2/library/caddy/manifests/2.10-alpine | grep -i docker-content-digest
+//
+// which returned the docker-content-digest header below for the
+// "2.10-alpine" tag's manifest INDEX (not a single-platform manifest) —
+// confirmed multi-arch (amd64, arm/v6, arm/v7, arm64/v8, ppc64le,
+// riscv64, s390x), matching pullImage's own per-arch verification, so
+// pinning it preserves normal multi-arch resolution rather than locking
+// every host to one platform's manifest.
+//
+// Bump procedure: when Image's tag changes, re-run the command above
+// against the new tag, update Image and CaddyImageDigest together in the
+// same commit, and refresh this comment's date/digest.
+const CaddyImageDigest = "sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d"
+
+// PinnedImage is the digest-qualified image reference ("<repo>@<digest>")
+// pullImage actually pulls and create actually runs — see
+// CaddyImageDigest's doc comment for why this, not Image, is what's used
+// at runtime.
+const PinnedImage = caddyRepo + "@" + CaddyImageDigest
 
 // ContainerName is the name of the Caddy container the manager manages.
 const ContainerName = "bp-caddy"
@@ -86,8 +126,8 @@ type Manager struct {
 	httpPort  int
 	httpsPort int
 
-	// expectedArch is the architecture pullImage requires the Image ref to
-	// resolve to after pulling — defaults to runtime.GOARCH (see
+	// expectedArch is the architecture pullImage requires the PinnedImage
+	// ref to resolve to after pulling — defaults to runtime.GOARCH (see
 	// NewManager) and is only ever overridden by tests. runtime.GOARCH is
 	// correct here even under podman machine on macOS: BasePod itself runs
 	// on the host (darwin/arm64 on Apple Silicon) while containers run
@@ -301,8 +341,8 @@ func driftReason(info *podman.ContainerInfo, desiredPorts []podman.PortMapping, 
 	switch {
 	case info.State == "created":
 		return "state=created (previous boot never started it successfully)"
-	case info.Image != Image:
-		return fmt.Sprintf("image %s != desired %s", info.Image, Image)
+	case info.Image != PinnedImage:
+		return fmt.Sprintf("image %s != desired %s", info.Image, PinnedImage)
 	case !portsEqual(info.Ports, desiredPorts):
 		return fmt.Sprintf("ports %v != desired %v", info.Ports, desiredPorts)
 	case !mountsEqual(info.Mounts, desiredMounts):
@@ -356,7 +396,8 @@ func portsEqual(a, b []podman.PortMapping) bool {
 	return true
 }
 
-// pullImage unconditionally pulls Image and verifies the result's
+// pullImage unconditionally pulls PinnedImage (Image's repo pinned to
+// CaddyImageDigest — see its doc comment) and verifies the result's
 // architecture matches expectedArch, returning an actionable error on
 // mismatch. Called by create() (so both first install and the end of
 // Ensure's drift-recreate branch always pull) and, before that, by
@@ -364,6 +405,13 @@ func portsEqual(a, b []podman.PortMapping) bool {
 // failure there is caught before the old container is torn down — see
 // Ensure's doc comment for why this must never be gated on an existence
 // check).
+//
+// Pulling by digest rather than by Image's mutable tag is what makes the
+// pin meaningful: podman's default "pull if missing" policy means a
+// CreateContainer referencing the tag would otherwise silently re-resolve
+// it (and could pull something other than what was digest-verified here)
+// the moment the tag isn't already cached locally under that exact name —
+// see create(), which also uses PinnedImage for exactly this reason.
 //
 // The arch check is a defensive backstop, not the primary fix: `podman
 // pull` itself re-resolves the image manifest for the host architecture,
@@ -378,15 +426,15 @@ func portsEqual(a, b []podman.PortMapping) bool {
 // reports success, or a future libpod/registry combination that doesn't
 // re-resolve on every call).
 func (m *Manager) pullImage(ctx context.Context) error {
-	if err := m.rt.PullImage(ctx, Image); err != nil {
-		return fmt.Errorf("caddy: pull %s: %w", Image, err)
+	if err := m.rt.PullImage(ctx, PinnedImage); err != nil {
+		return fmt.Errorf("caddy: pull %s: %w", PinnedImage, err)
 	}
-	arch, err := m.rt.ImageArchitecture(ctx, Image)
+	arch, err := m.rt.ImageArchitecture(ctx, PinnedImage)
 	if err != nil {
-		return fmt.Errorf("caddy: check architecture of %s: %w", Image, err)
+		return fmt.Errorf("caddy: check architecture of %s: %w", PinnedImage, err)
 	}
 	if arch != m.expectedArch {
-		return fmt.Errorf("caddy: %s resolved to architecture %q, but this host needs %q — likely a stale cached image (e.g. pulled earlier as a build's base layer under a different --platform); fix with `podman pull --arch %s %s`, or remove the cached image and retry", Image, arch, m.expectedArch, m.expectedArch, Image)
+		return fmt.Errorf("caddy: %s resolved to architecture %q, but this host needs %q — likely a stale cached image (e.g. pulled earlier as a build's base layer under a different --platform); fix with `podman pull --arch %s %s`, or remove the cached image and retry", PinnedImage, arch, m.expectedArch, m.expectedArch, PinnedImage)
 	}
 	return nil
 }
@@ -424,7 +472,7 @@ func (m *Manager) create(ctx context.Context) error {
 
 	spec := podman.CreateSpec{
 		Name:   ContainerName,
-		Image:  Image,
+		Image:  PinnedImage,
 		Labels: map[string]string{"basepod.managed": "true"},
 		// The image doesn't ship /var/run/caddy, the parent directory
 		// AdminSocket's unix socket binds into, and Caddy can't create
