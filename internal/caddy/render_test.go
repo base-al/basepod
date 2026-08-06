@@ -8,8 +8,8 @@ import (
 
 func TestRenderTwoAppsGolden(t *testing.T) {
 	got, err := Render([]AppRoute{
-		{Slug: "wiki", Hostnames: []string{"wiki.apps.example.com", "wiki.custom.com"}, Upstream: "bp-wiki:3000"},
-		{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"},
+		{Slug: "wiki", Hostnames: []string{"wiki.apps.example.com", "wiki.custom.com"}, Upstream: "app-wiki:3000"},
+		{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "app-blog:8080"},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -32,8 +32,8 @@ func TestRenderTwoAppsGolden(t *testing.T) {
 // DashboardSockMountDest) can ever reach it.
 func TestRenderTwoAppsWithDashboardGolden(t *testing.T) {
 	got, err := Render([]AppRoute{
-		{Slug: "wiki", Hostnames: []string{"wiki.apps.example.com", "wiki.custom.com"}, Upstream: "bp-wiki:3000"},
-		{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"},
+		{Slug: "wiki", Hostnames: []string{"wiki.apps.example.com", "wiki.custom.com"}, Upstream: "app-wiki:3000"},
+		{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "app-blog:8080"},
 	}, &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: DashboardSockDial()})
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +60,7 @@ func TestRenderEmptyIsValidJSON(t *testing.T) {
 // renders byte-identical output to the no-dashboard-arg call, i.e.
 // omitting the dashboard route entirely rather than emitting an empty one.
 func TestRenderNilDashboardMatchesNoDashboardGolden(t *testing.T) {
-	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
+	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "app-blog:8080"}}
 	withoutArg, err := Render(routes, nil)
 	if err != nil {
 		t.Fatal(err)

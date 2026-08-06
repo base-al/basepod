@@ -670,6 +670,42 @@ func TestEnvKeyValidation(t *testing.T) {
 	}
 }
 
+// TestCreateAppRejectsReservedSlugs proves handleCreateApp rejects the two
+// exact reserved slugs ("caddy", the managed proxy's own container name;
+// "basepod", the control plane itself) and any slug beginning with either
+// generated-name prefix ("bp-", the container-name prefix; "app-", the
+// network-alias prefix — audit finding M1) with a 422 validation error
+// naming the rule, before ever reaching CreateApp — and that a
+// non-reserved slug is unaffected.
+func TestCreateAppRejectsReservedSlugs(t *testing.T) {
+	st := newTestStore(t)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+	token := session.Token
+
+	for _, name := range []string{"Caddy", "Basepod", "bp-anything", "app-anything", "bp-", "app-"} {
+		var errBody errorResponse
+		resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+			createAppRequest{Name: name, Image: "nginx:alpine", Port: 80}, &errBody)
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("name %q: got status %d, want 422", name, resp.StatusCode)
+		}
+		if errBody.Error.Code != "validation" {
+			t.Fatalf("name %q: unexpected error code %+v", name, errBody)
+		}
+		if !strings.Contains(errBody.Error.Message, "reserved") {
+			t.Fatalf("name %q: expected message to explain the slug is reserved, got %+v", name, errBody)
+		}
+	}
+
+	// A non-reserved slug still succeeds.
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "My Blog", Image: "nginx:alpine", Port: 80}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("non-reserved slug: got status %d, want 201", resp.StatusCode)
+	}
+}
+
 func TestDomainsLifecycle(t *testing.T) {
 	srv, _, token, _, routes := setupEnvDomainsTest(t)
 
@@ -825,7 +861,11 @@ func TestCreateAppDashboardCollision(t *testing.T) {
 	if err := st.SetSetting("root_domain", "example.com"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetSetting("dashboard_domain", "basepod.example.com"); err != nil {
+	// Deliberately not "basepod.example.com": "basepod" is itself a
+	// reserved slug (see reservedSlugs), which would trip that check
+	// first and leave this test not actually exercising the
+	// dashboard-domain-collision path it's named for.
+	if err := st.SetSetting("dashboard_domain", "control.example.com"); err != nil {
 		t.Fatal(err)
 	}
 	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
@@ -834,7 +874,7 @@ func TestCreateAppDashboardCollision(t *testing.T) {
 
 	var errBody errorResponse
 	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
-		createAppRequest{Name: "Basepod", Image: "nginx:alpine", Port: 80}, &errBody)
+		createAppRequest{Name: "Control", Image: "nginx:alpine", Port: 80}, &errBody)
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("collision with dashboard domain: got status %d, want 422", resp.StatusCode)
 	}

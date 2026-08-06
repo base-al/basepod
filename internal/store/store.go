@@ -39,6 +39,17 @@ type User struct {
 // New apps get the schema defaults (512 MiB / 1.0 cores / 512 pids, see
 // migration 00004_resource_limits.sql), which also apply retroactively to
 // every app that existed before that migration ran.
+//
+// AliasScheme records which network-alias namespace this app's current
+// (or most recent) container generation actually carries — "legacy" for
+// the pre-fix "bp-<slug>" alias, or "v2" for the collision-safe
+// "app-<slug>" alias (audit finding M1; see migration
+// 00005_alias_scheme.sql and internal/deploy's Routes()/runRollout). It
+// starts "legacy" (the schema default) for every app, including brand-new
+// ones, and is flipped to "v2" only once a rollout has actually created a
+// container with the new alias — Routes() must render whichever alias the
+// app's currently-running container really has, not whichever scheme is
+// "newest".
 type App struct {
 	ID            int64
 	Slug          string
@@ -48,7 +59,15 @@ type App struct {
 	MemoryLimitMB int64
 	CPULimit      float64
 	PidsLimit     int64
+	AliasScheme   string
 }
+
+// AliasSchemeLegacy and AliasSchemeV2 are the two values App.AliasScheme
+// (and the apps.alias_scheme column) can hold — see App's doc comment.
+const (
+	AliasSchemeLegacy = "legacy"
+	AliasSchemeV2     = "v2"
+)
 
 // Deployment is a single deploy attempt for an App. StartedAt is always
 // set (RFC3339 UTC); FinishedAt is "" until the deployment reaches a
@@ -318,10 +337,13 @@ const (
 
 // appColumns is the column list (in scan order) shared by CreateApp's
 // implicit row shape, scanApp, and ListApps.
-const appColumns = `id, slug, image_ref, port, status, memory_limit_mb, cpu_limit, pids_limit`
+const appColumns = `id, slug, image_ref, port, status, memory_limit_mb, cpu_limit, pids_limit, alias_scheme`
 
-// CreateApp inserts a new app with status "created" and the schema's
-// default resource limits (see defaultMemoryLimitMB etc.), and returns it.
+// CreateApp inserts a new app with status "created", the schema's default
+// resource limits (see defaultMemoryLimitMB etc.), and the schema's
+// default alias_scheme ("legacy" — see App.AliasScheme's doc comment: it
+// only becomes "v2" once a rollout actually creates a container with the
+// new alias), and returns it.
 func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	res, err := s.db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, slug, imageRef, port)
 	if err != nil {
@@ -334,12 +356,13 @@ func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	return &App{
 		ID: id, Slug: slug, ImageRef: imageRef, Port: port, Status: "created",
 		MemoryLimitMB: DefaultMemoryLimitMB, CPULimit: DefaultCPULimit, PidsLimit: DefaultPidsLimit,
+		AliasScheme: AliasSchemeLegacy,
 	}, nil
 }
 
 func scanApp(row *sql.Row) (*App, error) {
 	var a App
-	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit)
+	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -366,12 +389,24 @@ func (s *Store) ListApps() ([]App, error) {
 	var apps []App
 	for rows.Next() {
 		var a App
-		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit); err != nil {
+		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme); err != nil {
 			return nil, err
 		}
 		apps = append(apps, a)
 	}
 	return apps, rows.Err()
+}
+
+// UpdateAppAliasScheme sets an app's alias_scheme (see App.AliasScheme's
+// doc comment) and bumps updated_at. Called by internal/deploy's
+// runRollout immediately after a rollout creates a container with the
+// new "app-<slug>" alias, so the very next Routes() computation (run
+// before that same rollout's cutover — see runRollout) already renders
+// the new upstream for this app.
+func (s *Store) UpdateAppAliasScheme(id int64, scheme string) error {
+	_, err := s.db.Exec(`UPDATE apps SET alias_scheme = ?, updated_at = ? WHERE id = ?`,
+		scheme, time.Now().UTC().Format(timeFormat), id)
+	return err
 }
 
 // UpdateAppLimits sets an app's container resource limits (see the App
