@@ -92,15 +92,22 @@ func VolumeName(slug, name string) string {
 
 // volumeLabels returns the fixed label set every BasePod-managed named
 // volume carries (see EnsureVolume calls in runRollout) — mirrors the
-// basepod.managed/basepod.app pair every app container also carries (see
-// runRollout's spec.Labels), so volumes are discoverable/attributable the
-// same way containers already are. Deliberately NOT basepod.deployment:
-// unlike a container, a volume outlives any single deployment generation
-// (and the app row itself — see store.DeleteApp's doc comment).
-func volumeLabels(slug string) map[string]string {
+// basepod.managed/basepod.app/basepod.instance triple every app container
+// also carries (see runRollout's spec.Labels), so volumes are
+// discoverable/attributable the same way containers already are.
+// Deliberately NOT basepod.deployment: unlike a container, a volume
+// outlives any single deployment generation (and the app row itself — see
+// store.DeleteApp's doc comment). instanceID is this instance's stable id
+// (issue #10, see internal/instanceid.LoadOrCreate) — included for the
+// same forensic-visibility reason podman.Client.EnsureNetwork stamps it
+// onto the shared network: nothing in this codebase GCs or adopts volumes
+// by instance today, so unlike app containers and bp-caddy, this label is
+// informational only here.
+func volumeLabels(slug, instanceID string) map[string]string {
 	return map[string]string{
-		"basepod.managed": "true",
-		"basepod.app":     slug,
+		"basepod.managed":  "true",
+		"basepod.app":      slug,
+		"basepod.instance": instanceID,
 	}
 }
 
@@ -112,6 +119,18 @@ type Engine struct {
 	router     Router
 	probe      Prober
 	rootDomain string
+
+	// instanceID is this BasePod instance's stable id (see
+	// internal/instanceid.LoadOrCreate) — issue #10. Stamped as
+	// basepod.instance=<id> on every app container this Engine creates
+	// (see runRollout), and used by CleanupOrphans (and every other
+	// "clean up what's mine" container-listing path below) to tell "my
+	// container" apart from a different BasePod instance's, which happens
+	// to share the same Podman socket. An unlabeled container (no
+	// basepod.instance at all — the shape every pre-v0.5 container has) is
+	// adopted rather than treated as foreign: see CleanupOrphans's doc
+	// comment for the exact adoption rule.
+	instanceID string
 
 	// dashboard is the route (if any) BasePod's own web dashboard is
 	// reachable through Caddy on — resolved once at boot (see
@@ -188,8 +207,10 @@ type Engine struct {
 // `env` defaults (see the encrypt field's doc comment); pass nil to skip
 // applying them. dashboard is the dashboard route (or nil to disable it)
 // every router.Apply call made through this Engine carries alongside the
-// app route set — see the dashboard field's doc comment.
-func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(appID int64, key, sealed string) (string, error), encrypt func(appID int64, key, plaintext string) (string, error), dashboard *caddy.DashboardRoute) *Engine {
+// app route set — see the dashboard field's doc comment. instanceID is
+// this BasePod instance's stable id (see internal/instanceid.LoadOrCreate)
+// — see the Engine.instanceID field's doc comment for what it's used for.
+func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(appID int64, key, sealed string) (string, error), encrypt func(appID int64, key, plaintext string) (string, error), dashboard *caddy.DashboardRoute, instanceID string) *Engine {
 	return &Engine{
 		st:            st,
 		rt:            rt,
@@ -198,6 +219,7 @@ func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain st
 		rootDomain:    rootDomain,
 		decrypt:       decrypt,
 		encrypt:       encrypt,
+		instanceID:    instanceID,
 		dashboard:     dashboard,
 		probeInterval: time.Second,
 		probeAttempts: 30,
@@ -847,7 +869,7 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 	}
 	var namedVolumes []podman.NamedVolume
 	if len(volumes) > 0 {
-		labels := volumeLabels(app.Slug)
+		labels := volumeLabels(app.Slug, e.instanceID)
 		for _, v := range volumes {
 			volName := VolumeName(app.Slug, v.Name)
 			// Pre-create/label the volume rather than letting libpod
@@ -895,6 +917,12 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 			"basepod.managed":    "true",
 			"basepod.app":        app.Slug,
 			"basepod.deployment": strconv.Itoa(dep.Number),
+			// basepod.instance (issue #10): stamped so CleanupOrphans (and
+			// every other "clean up what's mine" path below) can tell this
+			// container apart from a different BasePod instance's,
+			// sharing the same Podman socket, rather than relying on
+			// basepod.managed=true alone — identical across every install.
+			"basepod.instance": e.instanceID,
 		},
 		NetworkName: caddy.NetworkName,
 		// audit finding M1: the alias namespace ("app-<slug>") is
@@ -1055,6 +1083,13 @@ func (e *Engine) fail(ctx context.Context, app *store.App, dep *store.Deployment
 	} else {
 		keep := strconv.Itoa(dep.Number)
 		for _, c := range containers {
+			// issue #10: a container matching this app's slug purely by
+			// coincidence, but carrying a DIFFERENT BasePod instance's id,
+			// must never influence THIS instance's notion of app.Slug's
+			// status — see isForeignInstance's doc comment.
+			if e.isForeignInstance(c) {
+				continue
+			}
 			if c.Labels["basepod.deployment"] != keep {
 				status = "running"
 				break
@@ -1089,6 +1124,12 @@ func (e *Engine) removeOldContainers(ctx context.Context, slug string, keepNumbe
 	}
 	keep := strconv.Itoa(keepNumber)
 	for _, c := range containers {
+		// issue #10: never stop/remove a container that happens to share
+		// this app's slug but belongs to a different BasePod instance —
+		// see isForeignInstance's doc comment.
+		if e.isForeignInstance(c) {
+			continue
+		}
 		if c.Labels["basepod.deployment"] == keep {
 			continue
 		}
@@ -1339,6 +1380,12 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancel()
 	for _, c := range containers {
+		// issue #10: never stop/remove a container that happens to share
+		// this app's slug but belongs to a different BasePod instance —
+		// see isForeignInstance's doc comment.
+		if e.isForeignInstance(c) {
+			continue
+		}
 		if err := e.rt.StopContainer(cleanupCtx, c.ID, 10); err != nil {
 			fmt.Fprintf(e.log, "deploy: stop container %s: %v\n", c.Name, err)
 		}
@@ -1485,6 +1532,12 @@ func (e *Engine) AppLogs(ctx context.Context, slug string, follow bool, tail int
 
 	var id string
 	for _, c := range containers {
+		// issue #10: never stream logs from a container that happens to
+		// share this app's slug but belongs to a different BasePod
+		// instance — see isForeignInstance's doc comment.
+		if e.isForeignInstance(c) {
+			continue
+		}
 		if c.State == "running" {
 			id = c.ID
 			break
@@ -1522,6 +1575,12 @@ func (e *Engine) AppStats(ctx context.Context, slug string) (io.ReadCloser, erro
 
 	var id string
 	for _, c := range containers {
+		// issue #10: never stream stats from a container that happens to
+		// share this app's slug but belongs to a different BasePod
+		// instance — see isForeignInstance's doc comment.
+		if e.isForeignInstance(c) {
+			continue
+		}
 		if c.State == "running" {
 			id = c.ID
 			break
@@ -1544,18 +1603,57 @@ func (e *Engine) AppStats(ctx context.Context, slug string) (io.ReadCloser, erro
 // signal must not abandon a container mid-removal).
 const orphanCleanupTimeout = 60 * time.Second
 
+// isForeignInstance reports whether c carries a basepod.instance label
+// naming an instance OTHER than this one — i.e. it belongs to a different
+// BasePod daemon that happens to share this Podman socket (issue #10). A
+// container with NO basepod.instance label at all (every container any
+// BasePod build before this fix ever created) is never "foreign" by this
+// check alone — see CleanupOrphans's doc comment for the fuller adoption
+// rule that applies to unlabeled containers specifically.
+func (e *Engine) isForeignInstance(c podman.ContainerInfo) bool {
+	id, labeled := c.Labels["basepod.instance"]
+	return labeled && id != e.instanceID
+}
+
 // CleanupOrphans removes containers left behind by a previous crash or
-// interrupted deploy: a basepod.managed=true container whose
-// basepod.app slug no longer has a matching app in the store (the app
-// was deleted while its container survived), or whose
-// basepod.deployment generation isn't the app's latest *healthy*
-// deployment (a stale or never-finished generation from a cutover that
-// never completed). bp-caddy is always skipped by name — it's labeled
-// basepod.managed=true but has no basepod.app label and is a distinct
-// lifecycle from app containers. Containers with basepod.managed=true
-// but no basepod.app label are left alone with a warning: GC has no
-// record of what they belong to, so removing them isn't safe to do
-// automatically.
+// interrupted deploy, scoped to THIS BasePod instance (issue #10): a
+// basepod.managed=true container whose basepod.app slug no longer has a
+// matching app in the store (the app was deleted while its container
+// survived), or whose basepod.deployment generation isn't the app's latest
+// *healthy* deployment (a stale or never-finished generation from a
+// cutover that never completed). bp-caddy is always skipped by name — it's
+// labeled basepod.managed=true but has no basepod.app label and is a
+// distinct lifecycle from app containers (see caddy.Manager.Ensure for its
+// own, separately instance-scoped reconciliation).
+//
+// Ownership is decided in three tiers, checked in this order for every
+// basepod.managed container GC considers:
+//
+//  1. Labeled with a DIFFERENT instance's id: never touched, not even
+//     logged at more than a glance — this is another BasePod daemon's
+//     container, full stop. Its slug is deliberately never even looked up
+//     in this instance's database: matching by slug alone is exactly the
+//     bug issue #10 reports (a slug this instance has never heard of, or
+//     even one that coincidentally matches one of its own apps, tells you
+//     nothing about ownership once two instances are on the same host).
+//  2. Labeled with THIS instance's id, or unlabeled AND its slug IS known
+//     to this instance's database: treated as mine. An unlabeled-but-known
+//     container is exactly the upgrade case — a container created by a
+//     pre-v0.5 BasePod (no instance labeling existed yet) whose app this
+//     instance's own database already tracks — adopted here rather than
+//     destroyed, and picks up this instance's label the next time it's
+//     actually redeployed (runRollout's spec.Labels), not by mutating a
+//     running container in place. Once adopted, it gets the exact same
+//     unknown-app/stale-generation treatment as an already-labeled
+//     container.
+//  3. Unlabeled AND its slug is NOT known to this instance's database:
+//     left strictly alone and logged loudly — this is very likely another
+//     (still pre-instance-labeling, or otherwise unlabeled) BasePod
+//     instance's container. Guessing wrong here is exactly how the
+//     original incident happened (a second instance's boot-time GC deleted
+//     a running container — and then a proxy — that belonged to a
+//     different, live instance), so an unlabeled container is NEVER
+//     removed on the strength of "I don't recognize it".
 //
 // Called once at boot (see server.Run), after the engine is constructed
 // and before Caddy's route config is reconciled — an orphan surviving
@@ -1571,6 +1669,11 @@ func (e *Engine) CleanupOrphans(ctx context.Context) (int, error) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orphanCleanupTimeout)
 	defer cancel()
 
+	// Deliberately not filtered by basepod.instance here: GC needs to SEE
+	// every basepod.managed container (including other instances' and
+	// unlabeled ones) to correctly classify each one below — filtering
+	// server-side to "mine" would make tier 1 and tier 3 above impossible
+	// to distinguish.
 	containers, err := e.rt.ListContainers(cleanupCtx, map[string]string{"basepod.managed": "true"})
 	if err != nil {
 		return 0, fmt.Errorf("deploy: orphan gc: list containers: %w", err)
@@ -1587,12 +1690,44 @@ func (e *Engine) CleanupOrphans(ctx context.Context) (int, error) {
 			continue
 		}
 
+		// Tier 1: a different instance's container. Never touched, and
+		// its slug is never looked up — see this function's doc comment
+		// for why matching by slug alone would defeat the whole fix.
+		if e.isForeignInstance(c) {
+			continue
+		}
+
 		app, err := e.st.AppBySlug(slug)
-		if err != nil {
-			if !errors.Is(err, store.ErrNotFound) {
-				fmt.Fprintf(e.log, "deploy: orphan gc: look up app %q: %v\n", slug, err)
+		appErr := err
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			fmt.Fprintf(e.log, "deploy: orphan gc: look up app %q: %v\n", slug, err)
+			continue
+		}
+		appExists := appErr == nil
+
+		if _, labeled := c.Labels["basepod.instance"]; !labeled {
+			// Tier 2 vs. tier 3: an unlabeled container is adopted only
+			// when its slug is already known to THIS instance's
+			// database — the upgrade path (issue #10). Otherwise it's
+			// very likely another, still-unlabeled instance's container,
+			// and must never be removed on a guess.
+			if !appExists {
+				fmt.Fprintf(e.log, "deploy: orphan gc: %s is unlabeled and app %q is unknown to this instance's database — possibly another instance's, not touching\n", c.Name, slug)
 				continue
 			}
+			// Adopted: falls through to the normal mine-now handling
+			// below, exactly as if it already carried this instance's
+			// label. It is NOT relabeled here — only a future redeploy
+			// (runRollout) stamps basepod.instance on it, since mutating
+			// labels on a running container isn't something libpod
+			// supports without recreating it, and recreating a perfectly
+			// healthy adopted container just to relabel it would be its
+			// own outage risk.
+		}
+
+		// From here on, c is unambiguously mine (tier 2): either already
+		// labeled with my instance id, or unlabeled-and-adopted above.
+		if !appExists {
 			fmt.Fprintf(e.log, "deploy: orphan gc: removing %s (app %q no longer exists)\n", c.Name, slug)
 			e.removeOrphanContainer(cleanupCtx, c)
 			removed++
@@ -1690,6 +1825,13 @@ func (e *Engine) SweepStuckDeployments(ctx context.Context) (int, error) {
 		}
 		running := false
 		for _, c := range containers {
+			// issue #10: a container matching this app's slug+deployment
+			// number purely by coincidence, but belonging to a different
+			// BasePod instance, must never be read as "my deployment is
+			// still running".
+			if e.isForeignInstance(c) {
+				continue
+			}
 			if c.State == "running" {
 				running = true
 				break
@@ -1715,6 +1857,9 @@ func (e *Engine) SweepStuckDeployments(ctx context.Context) (int, error) {
 			fmt.Fprintf(e.log, "deploy: sweep stuck deployments: list containers for %s: %v\n", app.Slug, err)
 		} else {
 			for _, c := range appContainers {
+				if e.isForeignInstance(c) {
+					continue
+				}
 				if c.State == "running" {
 					status = "running"
 					break

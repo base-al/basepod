@@ -582,14 +582,28 @@ func (c *Client) ListImageTags(ctx context.Context, repoPrefix string) ([]string
 }
 
 // EnsureNetwork makes sure a network named name exists, creating it
-// (labeled basepod.managed=true) if it doesn't. If it already exists, it
-// self-heals a DNS-disabled network (see selfHealNetworkDNS) — a state
-// that leaves every app container unable to resolve another by name/alias
-// ("bp-<slug>"), and has been observed to arise from an out-of-band
-// `podman network create basepod` (whose CLI default differs from the raw
-// API's, see networkCreate) or a partially-applied config from an older
-// basepod version.
-func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
+// (labeled basepod.managed=true, plus basepod.instance=instanceID if
+// instanceID is non-empty — issue #10: every resource BasePod creates
+// carries the creating instance's id, so two BasePod instances sharing one
+// Podman socket can eventually be told apart) if it doesn't. If it already
+// exists, it self-heals a DNS-disabled network (see selfHealNetworkDNS) —
+// a state that leaves every app container unable to resolve another by
+// name/alias ("bp-<slug>"), and has been observed to arise from an
+// out-of-band `podman network create basepod` (whose CLI default differs
+// from the raw API's, see networkCreate) or a partially-applied config
+// from an older basepod version.
+//
+// Unlike orphan GC and the Caddy manager (internal/deploy.CleanupOrphans,
+// internal/caddy.Manager.Ensure), an already-existing network is never
+// recreated or refused over an instance-id mismatch: the "basepod" network
+// name is a single shared constant, so by design every BasePod instance on
+// a host already shares one network, and recreating it out from under
+// whichever instance created it first would break every container
+// currently attached — there is nothing to reconcile here beyond the DNS
+// self-heal this already did before instance ids existed. The label is
+// stamped only for forensic/audit visibility (`podman network inspect`
+// shows which instance created it), not enforced against.
+func (c *Client) EnsureNetwork(ctx context.Context, name, instanceID string) error {
 	status, data, err := c.request(ctx, http.MethodGet, "/networks/"+url.PathEscape(name)+"/exists", nil)
 	if err != nil {
 		return fmt.Errorf("podman: checking network %q: %w", name, err)
@@ -601,9 +615,13 @@ func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
 		return apiError(status, data)
 	}
 
+	labels := map[string]string{"basepod.managed": "true"}
+	if instanceID != "" {
+		labels["basepod.instance"] = instanceID
+	}
 	body := networkCreate{
 		Name:       name,
-		Labels:     map[string]string{"basepod.managed": "true"},
+		Labels:     labels,
 		DNSEnabled: true,
 	}
 	status, data, err = c.request(ctx, http.MethodPost, "/networks/create", body)

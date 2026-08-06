@@ -24,6 +24,7 @@ import (
 	"github.com/base-al/basepod/internal/crypto"
 	"github.com/base-al/basepod/internal/deploy"
 	"github.com/base-al/basepod/internal/gitsource"
+	"github.com/base-al/basepod/internal/instanceid"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
 	"github.com/base-al/basepod/web"
@@ -165,7 +166,26 @@ func Run(ctx context.Context, cfgPath string) error {
 	}
 	gitCloner := gitsource.New(gitBin, gitsource.DefaultOptions())
 
-	mgr := caddy.NewManager(pc, caddy.PodmanExec, filepath.Join(cfg.DataDir, "caddy"), cfg.HTTPPort, cfg.HTTPSPort)
+	// This instance's stable identity (issue #10): a random id persisted
+	// in the data dir, next to secret.key, on first boot and never
+	// regenerated — see instanceid.LoadOrCreate's doc comment. Every
+	// resource BasePod creates from here on (bp-caddy, the "basepod"
+	// network, every app container) is stamped basepod.instance=<id>, and
+	// every "clean up what's mine" path (orphan GC in
+	// engine.CleanupOrphans below, Caddy's own drift/recreate in
+	// mgr.Ensure) filters on it — so a second BasePod instance sharing
+	// this same Podman socket can never again mistake this instance's live
+	// containers for its own orphans (the exact incident this fix exists
+	// for). Resolved before mgr is built, since mgr.Ensure itself needs it
+	// to decide whether an existing bp-caddy is this instance's own,
+	// adoptable (unlabeled, pre-upgrade), or a different instance's
+	// (refuse — see caddy.Manager.Ensure's doc comment).
+	instID, err := instanceid.LoadOrCreate(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("server: load/create instance id: %w", err)
+	}
+
+	mgr := caddy.NewManager(pc, caddy.PodmanExec, filepath.Join(cfg.DataDir, "caddy"), cfg.HTTPPort, cfg.HTTPSPort, instID)
 	if err := mgr.Ensure(ctx); err != nil {
 		return fmt.Errorf("server: ensure caddy: %w", err)
 	}
@@ -254,7 +274,7 @@ func Run(ctx context.Context, cfgPath string) error {
 		return crypto.SealAAD(encKey, plaintext, crypto.AAD(appID, key))
 	}
 
-	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt, encrypt, dashboardRoute)
+	engine := deploy.New(st, pc, mgr, deploy.CaddyProber(caddy.PodmanExec), rootDomain, decrypt, encrypt, dashboardRoute, instID)
 	builder := build.New(pc, cfg.DataDir, maxConcurrentBuilds)
 
 	// Orphan GC: remove containers left behind by a previous crash or

@@ -432,6 +432,12 @@ func (f *fakeProber) probe(ctx context.Context, upstream string) error {
 	return nil
 }
 
+// testInstanceID is the instance id newTestEngine (and every test that
+// calls New directly) builds its Engine against, unless a test
+// specifically needs a different one (see the instance-scoped orphan GC
+// tests below) — arbitrary, just needs to be stable and non-empty.
+const testInstanceID = "test-instance-aaa"
+
 func openStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -450,7 +456,7 @@ func newTestEngine(t *testing.T, st *store.Store) (*Engine, *fakeRuntime, *fakeR
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, nil)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, nil, testInstanceID)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	return eng, rt, router, prober, ops
@@ -688,7 +694,7 @@ func TestDeployInjectsDecryptedEnv(t *testing.T) {
 	decrypt := func(appID int64, key, s string) (string, error) {
 		return fmt.Sprintf("plain-%d-%s-%s", appID, key, s), nil
 	}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil, nil)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil, nil, testInstanceID)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -840,7 +846,7 @@ func TestDeployFailsOnDecryptError(t *testing.T) {
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
 	decrypt := func(appID int64, key, s string) (string, error) { return "", errors.New("bad key") }
-	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil, nil)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", decrypt, nil, nil, testInstanceID)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -910,7 +916,7 @@ func TestDeployFailsWhenEnvInjectionDisabled(t *testing.T) {
 	rt := newFakeRuntime(ops)
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, nil) // decrypt disabled
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, nil, testInstanceID) // decrypt disabled
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 5
 	ctx := context.Background()
@@ -1159,7 +1165,7 @@ func TestApplyRoutesPassesDashboardToRouter(t *testing.T) {
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
 	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: caddy.DashboardSockDial()}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, dashboard)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, dashboard, testInstanceID)
 	ctx := context.Background()
 
 	if err := eng.ApplyRoutes(ctx); err != nil {
@@ -1182,7 +1188,7 @@ func TestRemoveAppPassesDashboardToRouter(t *testing.T) {
 	router := &fakeRouter{ops: ops}
 	prober := &fakeProber{ops: ops}
 	dashboard := &caddy.DashboardRoute{Hostname: "basepod.apps.localhost", Upstream: caddy.DashboardSockDial()}
-	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, dashboard)
+	eng := New(st, rt, router, prober.probe, "apps.localhost", nil, nil, dashboard, testInstanceID)
 	ctx := context.Background()
 
 	app, err := st.CreateApp("blog", "nginx:v1", 80)
@@ -1388,7 +1394,7 @@ func TestFailDetachesCleanupFromCancelledContext(t *testing.T) {
 		return pctx.Err()
 	}
 
-	eng := New(st, rt, router, probe, "apps.localhost", nil, nil, nil)
+	eng := New(st, rt, router, probe, "apps.localhost", nil, nil, nil, testInstanceID)
 	eng.probeInterval = time.Millisecond
 	eng.probeAttempts = 1
 
@@ -1495,9 +1501,47 @@ func TestCaddyProber(t *testing.T) {
 }
 
 // TestCleanupOrphansRemovesUnknownSlug proves a basepod.managed container
-// whose basepod.app slug has no matching row in the store (the app was
-// deleted while its container somehow survived) is stopped and removed.
+// carrying THIS instance's own id, whose basepod.app slug has no matching
+// row in the store (the app was deleted while its container somehow
+// survived), is stopped and removed — issue #10's tier 2 (see
+// CleanupOrphans's doc comment): a container unambiguously mine, by label,
+// is still cleaned up exactly as before instance ids existed.
 func TestCleanupOrphansRemovesUnknownSlug(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID:    "c1",
+		Name:  "bp-ghost-1",
+		State: "running",
+		Labels: map[string]string{
+			"basepod.managed": "true", "basepod.app": "ghost", "basepod.deployment": "1",
+			"basepod.instance": testInstanceID,
+		},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1", removed)
+	}
+	if _, stillThere := rt.containers["c1"]; stillThere {
+		t.Error("bp-ghost-1 should have been removed (my own instance, unknown app slug)")
+	}
+}
+
+// TestCleanupOrphansLeavesUnlabeledUnknownSlugAlone proves the core of
+// issue #10's adoption rule: an UNLABELED basepod.managed container (no
+// basepod.instance at all — the shape every pre-v0.5 container has) whose
+// slug is NOT known to this instance's database is left completely
+// untouched, not removed. This is deliberately the same shape as
+// TestCleanupOrphansRemovesUnknownSlug above minus the instance label —
+// proving the label (or the adoption fallback below), not just "unknown
+// slug", is what actually gates removal.
+func TestCleanupOrphansLeavesUnlabeledUnknownSlugAlone(t *testing.T) {
 	st := openStore(t)
 	eng, rt, _, _, _ := newTestEngine(t, st)
 	ctx := context.Background()
@@ -1511,11 +1555,165 @@ func TestCleanupOrphansRemovesUnknownSlug(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CleanupOrphans: %v", err)
 	}
-	if removed != 1 {
-		t.Errorf("removed = %d, want 1", removed)
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0 (unlabeled + unknown slug must never be removed)", removed)
 	}
-	if _, stillThere := rt.containers["c1"]; stillThere {
-		t.Error("bp-ghost-1 should have been removed (unknown app slug)")
+	if _, stillThere := rt.containers["c1"]; !stillThere {
+		t.Error("bp-ghost-1 (unlabeled, unknown slug) should have been left alone — it may belong to another instance")
+	}
+}
+
+// TestCleanupOrphansSkipsForeignInstanceContainerEvenWithUnknownSlug proves
+// issue #10's tier 1: a container explicitly labeled with a DIFFERENT
+// instance's id is never touched, even for a slug this instance's database
+// has never heard of — the exact shape a second BasePod instance's boot-time
+// GC must never remove (it belongs to a live, different BasePod daemon
+// sharing this Podman socket).
+func TestCleanupOrphansSkipsForeignInstanceContainerEvenWithUnknownSlug(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	rt.containers["c1"] = podman.ContainerInfo{
+		ID: "c1", Name: "bp-hello-1", State: "running",
+		Labels: map[string]string{
+			"basepod.managed": "true", "basepod.app": "hello", "basepod.deployment": "1",
+			"basepod.instance": "some-other-instance",
+		},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+	if _, stillThere := rt.containers["c1"]; !stillThere {
+		t.Error("bp-hello-1 (a different instance's container) should never be touched")
+	}
+}
+
+// TestCleanupOrphansAdoptsUnlabeledContainerWithKnownSlug proves issue
+// #10's adoption path fully: an unlabeled container whose slug IS known to
+// this instance's database is not just left alone (that would be
+// indistinguishable from "maybe another instance's" — the whole bug) but
+// actively adopted, meaning it gets the SAME stale-generation GC treatment
+// an already-labeled container would: still running the app's current
+// healthy generation, it stays; a stale prior generation still gets
+// removed.
+func TestCleanupOrphansAdoptsUnlabeledContainerWithKnownSlug(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:v2", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep1, err := st.CreateDeployment(app.ID, "nginx:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep1.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+	dep2, err := st.CreateDeployment(app.ID, "nginx:v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishDeployment(dep2.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unlabeled current generation (2): adopted, and kept.
+	rt.containers["c-current"] = podman.ContainerInfo{
+		ID: "c-current", Name: "bp-blog-2", State: "running",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "2"},
+	}
+	// Unlabeled stale generation (1): adopted, and removed exactly like a
+	// labeled stale generation would be.
+	rt.containers["c-stale"] = podman.ContainerInfo{
+		ID: "c-stale", Name: "bp-blog-1", State: "exited",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "1"},
+	}
+
+	removed, err := eng.CleanupOrphans(ctx)
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1 (only the stale generation)", removed)
+	}
+	if _, stillThere := rt.containers["c-current"]; !stillThere {
+		t.Error("bp-blog-2 (adopted, current healthy generation) should not have been removed")
+	}
+	if _, stillThere := rt.containers["c-stale"]; stillThere {
+		t.Error("bp-blog-1 (adopted, stale generation) should have been removed")
+	}
+}
+
+// TestCleanupOrphansRegressionTwoInstancesSharePodmanHost is a direct
+// regression test for issue #10's real, observed incident: an agent
+// started a throwaway BasePod against an empty temp data dir on a machine
+// that already had a running instance, and its boot-time orphan GC
+// immediately removed a RUNNING container belonging to the other, live
+// instance ("deploy: orphan gc: removing bp-hello-1 (app "hello" no
+// longer exists)") before any user command ran.
+//
+// Reproduced here exactly: instance A's database knows app "hello", with a
+// running, correctly-labeled container. Instance B boots against a
+// completely empty database (it has never heard of "hello") on the SAME
+// underlying runtime — one shared fakeRuntime standing in for one shared
+// Podman socket, exactly as the incident's two instances shared one real
+// Podman socket. Instance B's CleanupOrphans must remove nothing: not
+// instance A's container, not anything else.
+func TestCleanupOrphansRegressionTwoInstancesSharePodmanHost(t *testing.T) {
+	ops := &[]string{}
+	sharedRuntime := newFakeRuntime(ops)
+
+	// --- Instance A: has "hello" in its database, with a running,
+	// correctly-labeled (post-fix) container for it. ---
+	stA := openStore(t)
+	appA, err := stA.CreateApp("hello", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	depA, err := stA.CreateDeployment(appA.ID, "nginx:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stA.FinishDeployment(depA.ID, "healthy", ""); err != nil {
+		t.Fatal(err)
+	}
+	const instanceA = "instance-A-prod"
+	sharedRuntime.containers["c-hello"] = podman.ContainerInfo{
+		ID: "c-hello", Name: "bp-hello-1", State: "running",
+		Labels: map[string]string{
+			"basepod.managed": "true", "basepod.app": "hello", "basepod.deployment": "1",
+			"basepod.instance": instanceA,
+		},
+	}
+
+	// --- Instance B: a throwaway instance against a fresh, empty data
+	// dir/database — it has never heard of "hello" — booting against the
+	// SAME runtime instance A's container lives on. ---
+	stB := openStore(t)
+	const instanceB = "instance-B-throwaway"
+	engB := New(stB, sharedRuntime, &fakeRouter{ops: ops}, (&fakeProber{ops: ops}).probe, "apps.localhost", nil, nil, nil, instanceB)
+
+	removed, err := engB.CleanupOrphans(context.Background())
+	if err != nil {
+		t.Fatalf("instance B CleanupOrphans: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("instance B removed %d container(s), want 0 — must never remove another live instance's container", removed)
+	}
+	if _, stillThere := sharedRuntime.containers["c-hello"]; !stillThere {
+		t.Fatal("bp-hello-1 (instance A's running container) was removed by instance B's orphan GC — this is the exact issue #10 incident")
+	}
+	if state := sharedRuntime.containers["c-hello"].State; state != "running" {
+		t.Errorf("bp-hello-1 state = %q, want still running", state)
 	}
 }
 
