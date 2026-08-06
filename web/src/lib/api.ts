@@ -62,6 +62,15 @@ export interface App {
    * an app has none). */
   deploy_strategy: DeployStrategy
   volumes: Volume[]
+  /** v0.5 Task 8 additions (internal/api/apps.go's appResponse) — "" / ""
+   * / false for a hand-created app; set for one created by
+   * POST /api/v1/compose/up. compose_project/compose_service key the app
+   * to its compose project + service name (Apps.vue groups by the
+   * former); internal is true for a service with no `expose:` in the
+   * compose file — no Caddy route, no public URL. */
+  compose_project: string
+  compose_service: string
+  internal: boolean
 }
 
 /** Body for PATCH /apps/{slug} (internal/api/apps.go's patchAppRequest):
@@ -89,13 +98,19 @@ export interface Deployment {
    * DeploymentList.vue only shows a relative "Started" column for now;
    * this is here for a future deploy-duration display. */
   finished_at: string
-  /** "image" (registry pull) or "tarball" (build-from-upload). */
+  /** "image" (registry pull), "tarball" (build-from-upload), or "git"
+   * (build from a cloned repo — v0.5 Task 4/5). */
   source: string
-  /** What initiated this deploy: "api" or "rollback". */
+  /** What initiated this deploy: "api", "rollback", "webhook", or
+   * "compose". */
   trigger: string
   /** Whether a build log is available for GET .../deployments/{number}/log
-   * (true for tarball-sourced deployments only). */
+   * (true for tarball- and git-sourced deployments only). */
   has_build_log: boolean
+  /** The resolved commit a "git"-sourced deployment built — "" for every
+   * other source (v0.5 Task 4/5; internal/api/apps.go's
+   * deploymentResponse.GitSha). */
+  git_sha: string
 }
 
 export interface AppDetail extends App {
@@ -132,6 +147,104 @@ export interface SystemInfo {
   version: string
   podman: string
   apps: number
+}
+
+/** An app's connected git repo config, in the exact wire shape
+ * internal/api/git.go's gitSourceResponse returns from both PUT and GET
+ * .../apps/{slug}/git. `secret` IS the plaintext webhook secret — a
+ * deliberate deviation from strict write-only (see git.go's doc comment
+ * on gitSourceResponse): the operator must be able to paste it into a
+ * forge's webhook settings, possibly more than once, so the server
+ * returns it every time this is fetched, not just on first connect.
+ * `token` is masked to "set"/"" like a secret env value and never
+ * round-trips — see PutGitSourceRequest. */
+export interface GitSource {
+  url: string
+  branch: string
+  provider: string
+  hook_id: string
+  secret: string
+  token: string
+  webhook_url: string
+  warnings?: string[]
+}
+
+/** Body for PUT /apps/{slug}/git (internal/api/git.go's
+ * putGitSourceRequest). `token` write-only: omit or send "" to leave an
+ * already-stored token untouched (mirrors env var PUT's keep-on-empty-
+ * secret semantics) — never used to clear a token; DELETE disconnects
+ * entirely instead. `rotate_secret: true` forces a fresh hook_id AND
+ * secret even on a re-PUT of an already-connected repo; a plain re-PUT
+ * keeps both stable so editing just the branch/token doesn't invalidate
+ * a webhook already configured on the forge side. */
+export interface PutGitSourceRequest {
+  url: string
+  branch: string
+  token?: string
+  rotate_secret?: boolean
+}
+
+/** One webhook delivery outcome (see migration 00007_git_sources.sql's
+ * git_deliveries.status and internal/api/webhook.go's handleGitWebhook)
+ * — every reason a push did or didn't trigger a deploy. */
+export type GitDeliveryStatus =
+  | 'deployed'
+  | 'ignored_branch'
+  | 'ignored_event'
+  | 'invalid_signature'
+  | 'rate_limited'
+  | 'coalesced'
+  | 'error'
+
+/** One row of GET /apps/{slug}/git/deliveries, in the exact wire shape
+ * internal/api/git.go's gitDeliveryResponse returns, newest first.
+ * deployment_number is present only for a delivery that actually
+ * triggered a deploy whose deployment row still exists. */
+export interface GitDelivery {
+  id: number
+  received_at: string
+  provider: string
+  event: string
+  ref: string
+  commit_sha: string
+  status: GitDeliveryStatus
+  detail: string
+  deployment_number?: number
+}
+
+/** One service's entry in a ComposePlan (dry-run preview or real apply
+ * response), in the exact wire shape internal/api/compose.go's
+ * composeServiceResponse returns. deployment_number is 0/omitted for a
+ * dry-run entry (nothing was created yet). deploy_strategy is set (with a
+ * warning explaining why in `warnings`) only when the plan force-applies
+ * "replace" for a volume-bearing service — see internal/compose's
+ * ServicePlan.RecommendedStrategy. */
+export interface ComposeService {
+  name: string
+  slug: string
+  action: 'create' | 'update'
+  internal: boolean
+  port: number
+  alias: string
+  deploy_strategy?: DeployStrategy | ''
+  deployment_number?: number
+  warnings?: string[]
+}
+
+/** Response of POST /api/v1/compose/up, for both a dry run (200, nothing
+ * changed) and a real apply (202, per-service deployments queued in
+ * dependency order) — see internal/api/compose.go's composePlanResponse.
+ * orphans lists slugs of apps that belong to this project from a prior
+ * apply but have no corresponding service in the file just applied —
+ * still running, never auto-deleted (see compose.go's package doc
+ * comment). warnings is top-level (parser/plan warnings not tied to one
+ * service); each service also carries its own in `warnings`. */
+export interface ComposePlan {
+  project: string
+  dry_run: boolean
+  services: ComposeService[]
+  orphans?: string[]
+  warnings?: string[]
 }
 
 /** One live session, in the exact wire shape internal/api/auth.go's
@@ -360,6 +473,78 @@ function uploadTarball(slug: string, file: Blob, onProgress?: (fraction: number)
   })
 }
 
+/** Uploads a gzipped tar (compose.yaml plus any per-service build
+ * contexts) via POST /api/v1/compose/up?project=&dry_run= (see
+ * internal/api/compose.go's handleComposeUp). Mirrors uploadTarball's
+ * XMLHttpRequest-based approach (upload-progress events, auth header,
+ * 401 interception, error-envelope parsing) — see that function's doc
+ * comment for why fetch isn't used here either.
+ *
+ * A dry run (dryRun: true) returns 200 with the full plan and changes
+ * nothing server-side; a real apply returns 202 with per-service
+ * deployment numbers already queued. Either way the response body is a
+ * ComposePlan — callers branch on `dry_run` if they need to, though in
+ * practice NewApp.vue's compose flow already knows which it asked for.
+ */
+function uploadCompose(
+  project: string,
+  file: Blob,
+  dryRun: boolean,
+  onProgress?: (fraction: number) => void,
+): Promise<ComposePlan> {
+  const auth = useAuthStore()
+
+  const params = new URLSearchParams({ project, dry_run: dryRun ? '1' : '0' })
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${BASE_URL}/compose/up?${params.toString()}`)
+    if (auth.token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${auth.token}`)
+    }
+    xhr.setRequestHeader('Content-Type', 'application/gzip')
+
+    xhr.upload.onprogress = (evt) => {
+      if (onProgress && evt.lengthComputable) {
+        onProgress(evt.loaded / evt.total)
+      }
+    }
+
+    xhr.onload = () => {
+      let body: unknown
+      try {
+        body = JSON.parse(xhr.responseText) as unknown
+      } catch {
+        body = undefined
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as ComposePlan)
+        return
+      }
+
+      const envelope = body as ErrorEnvelope | undefined
+      const code = envelope?.error?.code ?? 'unknown'
+      const message = envelope?.error?.message ?? xhr.statusText ?? 'request failed'
+
+      if (xhr.status === 401) {
+        auth.clearSession()
+        if (router.currentRoute.value.name !== 'login') {
+          void router.push({ name: 'login' })
+        }
+      }
+
+      reject(new ApiError(xhr.status, code, message))
+    }
+
+    xhr.onerror = () => {
+      reject(new ApiError(0, 'network_error', 'Network error during upload'))
+    }
+
+    xhr.send(file)
+  })
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<LoginResponse>('/auth/login', {
@@ -512,4 +697,38 @@ export const api = {
   },
 
   uploadTarball,
+
+  /** Fetches an app's connected git repo config. Throws ApiError with
+   * code "git_not_connected" (404) if no repo is connected — GitPanel.vue
+   * treats that as the steady "not connected" state, not a load error.
+   * See internal/api/git.go's handleGetGitSource. */
+  getGitSource: (slug: string) => request<GitSource>(`/apps/${slug}/git`),
+
+  /** Connects (first PUT) or updates (re-PUT) an app's git repo config —
+   * see PutGitSourceRequest's doc comment for the token/rotate_secret
+   * semantics. internal/api/git.go's handlePutGitSource. */
+  putGitSource: (slug: string, payload: PutGitSourceRequest) =>
+    request<GitSource>(`/apps/${slug}/git`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+
+  /** Disconnects an app's git repo config. Not an error if none was
+   * connected. internal/api/git.go's handleDeleteGitSource. */
+  deleteGitSource: (slug: string) => request<void>(`/apps/${slug}/git`, { method: 'DELETE' }),
+
+  /** Lists an app's most recent webhook deliveries, newest first
+   * (default limit 20 server-side). internal/api/git.go's
+   * handleListGitDeliveries. */
+  listGitDeliveries: (slug: string) => request<GitDelivery[]>(`/apps/${slug}/git/deliveries`),
+
+  /** Manual "Deploy now": clones the connected repo's configured branch
+   * and hands it to the same async build pipeline a tarball deploy uses
+   * (202 + deployment JSON — the build log then streams via
+   * BuildLogPanel exactly like any other in-flight deployment).
+   * internal/api/git.go's handleDeployGit. 422 "git_not_connected" if no
+   * repo is connected; 502/503 for a clone failure or unavailable git. */
+  deployGit: (slug: string) => request<Deployment>(`/apps/${slug}/deploy/git`, { method: 'POST' }),
+
+  uploadCompose,
 }

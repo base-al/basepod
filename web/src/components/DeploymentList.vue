@@ -5,6 +5,7 @@ import { useToast } from '@nuxt/ui/composables'
 import type { TableColumn } from '@nuxt/ui'
 
 import { api, ApiError, type Deployment } from '../lib/api'
+import { shortSha } from '../lib/gitFormat'
 import { relativeTime } from '../lib/relativeTime'
 import StatusBadge from './StatusBadge.vue'
 import BuildLogPanel from './BuildLogPanel.vue'
@@ -159,7 +160,12 @@ function confirmRollback(number: number) {
     <template #image-cell="{ row }">
       <div class="flex flex-col gap-0.5">
         <span class="font-mono text-xs text-slate-300">{{ row.original.image }}</span>
-        <span class="text-[11px] text-slate-500">{{ row.original.source }} · {{ row.original.trigger }}</span>
+        <span class="text-[11px] text-slate-500">
+          {{ row.original.source }} · {{ row.original.trigger }}
+          <template v-if="row.original.source === 'git' && row.original.git_sha">
+            · <span class="font-mono">{{ shortSha(row.original.git_sha) }}</span>
+          </template>
+        </span>
       </div>
     </template>
 
