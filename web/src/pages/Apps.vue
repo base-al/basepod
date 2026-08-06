@@ -87,6 +87,8 @@ async function handleLogout() {
             @click="toggle"
           />
 
+          <UButton to="/settings" color="neutral" variant="ghost" square size="sm" icon="i-lucide-settings" aria-label="Settings" />
+
           <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-log-out" @click="handleLogout">
             Logout
           </UButton>

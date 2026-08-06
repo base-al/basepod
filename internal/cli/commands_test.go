@@ -138,6 +138,91 @@ func TestLoginPromptsForMissingCredentials(t *testing.T) {
 	}
 }
 
+// TestLogoutClearsOnlyToken proves `basepod logout` revokes the session
+// server-side and clears the current context's token, while leaving the
+// context entry itself (URL, name, current-ness) in place — a subsequent
+// `basepod login` against the same server should still land in the same
+// named context, not have it evaporate.
+func TestLogoutClearsOnlyToken(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	logoutCalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/auth/logout" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		requireBearer(t, r, "tok-logout")
+		logoutCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	saveTestContext(t, path, srv.URL, "tok-logout")
+
+	out, _, err := runCLI(t, "", "logout")
+	if err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	if !logoutCalled {
+		t.Fatal("expected POST /auth/logout to be called")
+	}
+	if !strings.Contains(out, `Logged out of context "t"`) {
+		t.Fatalf("output = %q", out)
+	}
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Current != "t" {
+		t.Fatalf("Current = %q, want the context to still be current", cfg.Current)
+	}
+	got, ok := cfg.Contexts["t"]
+	if !ok {
+		t.Fatal("expected the context entry to still exist")
+	}
+	if got.URL != srv.URL {
+		t.Fatalf("URL = %q, want %q (unchanged)", got.URL, srv.URL)
+	}
+	if got.Token != "" {
+		t.Fatalf("Token = %q, want empty after logout", got.Token)
+	}
+}
+
+// TestLogoutClearsTokenEvenIfServerRevokeFails proves the CLI still clears
+// the local token when the server-side revoke fails (e.g. the session had
+// already expired) — the whole point of logout is to leave no usable
+// credential lying around locally, and an unreachable/already-dead session
+// server-side is not a reason to keep one on disk.
+func TestLogoutClearsTokenEvenIfServerRevokeFails(t *testing.T) {
+	path := setTestConfigPath(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, http.StatusUnauthorized, map[string]any{
+			"error": map[string]string{"code": "unauthorized", "message": "invalid or expired session"},
+		})
+	}))
+	defer srv.Close()
+
+	saveTestContext(t, path, srv.URL, "already-dead")
+
+	_, stderr, err := runCLI(t, "", "logout")
+	if err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	if !strings.Contains(stderr, "warning") {
+		t.Fatalf("stderr = %q, want a warning about the failed server-side revoke", stderr)
+	}
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Contexts["t"].Token != "" {
+		t.Fatalf("Token = %q, want empty even though the server-side revoke failed", cfg.Contexts["t"].Token)
+	}
+}
+
 func TestAppsRendersTable(t *testing.T) {
 	path := setTestConfigPath(t)
 
