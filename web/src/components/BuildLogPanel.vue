@@ -62,14 +62,18 @@ function buildStreamURL() {
 
 function startStream() {
   phase.value = 'ready'
-  connection = connect(buildStreamURL(), {
-    events: ['log'],
-    retry: false,
-    onEvent: (_name, data) => pushLine(data),
-    onStateChange: (state) => {
-      connectionState.value = state
+  connection = connect(
+    buildStreamURL(),
+    { scope: 'build_log', slug: props.slug, deployment_number: props.deployment.number },
+    {
+      events: ['log'],
+      retry: false,
+      onEvent: (_name, data) => pushLine(data),
+      onStateChange: (state) => {
+        connectionState.value = state
+      },
     },
-  })
+  )
 }
 
 function stopStream() {

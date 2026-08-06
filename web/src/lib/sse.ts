@@ -4,23 +4,38 @@
 // (no state callback) and — critically — cannot set request headers, so
 // it can't carry BasePod's Bearer session token. This module fixes both:
 // it authenticates via ?access_token= (see internal/api/router.go's
-// requireAuthLogs, the one route that accepts it) and drives its own
-// reconnect loop instead of relying on the browser's built-in one, so
-// callers get an observable connection-state machine.
+// requireAuthAppLogs/requireAuthBuildLog, the only two routes that accept
+// it) and drives its own reconnect loop instead of relying on the
+// browser's built-in one, so callers get an observable connection-state
+// machine.
 //
-// The token travels in the URL because that is the only channel a native
-// EventSource has — treat it accordingly: this module never logs the URL
-// or the token, and callers must not either (see LogViewer.vue).
+// The token in that query string is never the caller's session token —
+// audit finding M4: a full-authority, 30-day session token is exactly the
+// kind of credential that must never end up somewhere as leak-prone as a
+// URL (devtools, HAR exports, and one Caddy access-log config change away
+// from disk). Instead, connect() mints a short-lived (5-minute),
+// single-purpose stream token via POST /stream-token (api.mintStreamToken)
+// before every connection attempt — including reconnects, since a
+// long-lived log view will routinely outlive a single token's 5-minute
+// window. A minted token is scoped to exactly the (scope, slug,
+// deployment_number) triple passed to connect(); the server rejects it
+// outright for any other stream.
+//
+// This module never logs the URL or the token, and callers must not
+// either (see LogViewer.vue).
 //
 // One consequence of EventSource hiding HTTP status from JS: if the
-// session token dies (expired/revoked) while a stream is open, every
-// reconnect attempt fails exactly the same way a network blip would —
-// there's no 401 to see, just an endless "reconnecting" chip, while every
-// *other* 401 in the app immediately clears the session and bounces to
-// /login. See maybeProbeSession below for how this module closes that gap.
+// underlying session dies (expired/revoked) while a stream is open, both
+// a mint failure and a subsequent EventSource failure can look identical
+// to a network blip. A mint failure is not actually ambiguous, though —
+// it goes through api.ts's request(), which already intercepts a 401 by
+// clearing the session and redirecting to /login (see requestRaw) — so
+// this module short-circuits straight to 'closed' on that one case
+// instead of retrying. An EventSource-level failure has no such signal
+// (EventSource never exposes a response status), so that path still falls
+// back to the probe-after-N-failures heuristic below (maybeProbeSession).
 
-import { api, ApiError } from './api'
-import { useAuthStore } from '../stores/auth'
+import { api, ApiError, type StreamTokenRequest } from './api'
 
 export type SseState = 'connecting' | 'open' | 'reconnecting' | 'closed'
 
@@ -85,16 +100,13 @@ async function probeSessionIsAlive(): Promise<boolean> {
 }
 
 /**
- * Opens (and, unless `retry` is false, keeps re-opening through backoff)
- * an EventSource against `url`. The current session token is appended as
- * `?access_token=` — the URL passed in should NOT already carry one.
+ * Mints a fresh stream token (via POST /stream-token) and opens
+ * (unless `retry` is false, keeps re-opening through backoff, re-minting
+ * a token each time) an EventSource against `url`. `url` should NOT
+ * already carry an ?access_token= — this module owns that query param
+ * entirely.
  */
-export function connect(url: string, options: SseOptions): SseConnection {
-  const auth = useAuthStore()
-  const token = auth.token ?? ''
-  const separator = url.includes('?') ? '&' : '?'
-  const fullURL = `${url}${separator}access_token=${encodeURIComponent(token)}`
-
+export function connect(url: string, tokenParams: StreamTokenRequest, options: SseOptions): SseConnection {
   const shouldRetry = options.retry ?? true
 
   let source: EventSource | null = null
@@ -123,15 +135,58 @@ export function connect(url: string, options: SseOptions): SseConnection {
     options.onStateChange('reconnecting')
     const delay = reconnectDelay
     reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY_MS)
-    reconnectTimer = setTimeout(open, delay)
+    reconnectTimer = setTimeout(attemptOpen, delay)
   }
 
-  function open() {
-    if (closed) return
+  /**
+   * Shared failure path for both a mint failure that isn't a definitive
+   * 401 (network blip, 5xx, etc.) and an EventSource-level error (whose
+   * cause is never visible to JS at all) — see this module's top-of-file
+   * comment for why the two are handled identically past this point.
+   */
+  function handleConnectionFailure() {
+    if (closed || probing) return
 
-    options.onStateChange('connecting')
+    if (!shouldRetry) {
+      options.onStateChange('closed')
+      return
+    }
 
-    const es = new EventSource(fullURL)
+    consecutiveFailures += 1
+
+    if (consecutiveFailures < FAILURE_PROBE_THRESHOLD) {
+      scheduleReconnect()
+      return
+    }
+
+    // Three-plus failures in a row with no successful open between them
+    // — indistinguishable from a dead session by EventSource alone.
+    // Pause the backoff loop and ask an endpoint that *can* see a 401.
+    probing = true
+    options.onStateChange('reconnecting')
+    void probeSessionIsAlive().then((alive) => {
+      probing = false
+      if (closed) return
+
+      if (!alive) {
+        // The session is confirmed gone (and api.me() already cleared it
+        // / redirected to /login) — retrying this stream can never
+        // succeed, so stop for good instead of spinning forever.
+        permanentlyClose()
+        return
+      }
+
+      // Session's still good — this was a real network blip, not a dead
+      // token. Reset the streak so the next probe only fires after
+      // another run of failures, and keep going.
+      consecutiveFailures = 0
+      scheduleReconnect()
+    })
+  }
+
+  function openEventSource(token: string) {
+    const separator = url.includes('?') ? '&' : '?'
+    const es = new EventSource(`${url}${separator}access_token=${encodeURIComponent(token)}`)
     source = es
 
     es.onopen = () => {
@@ -154,51 +209,50 @@ export function connect(url: string, options: SseOptions): SseConnection {
       // Always close the native source ourselves rather than letting it
       // retry on its own: that's what lets us own backoff timing (and,
       // via `retry`, opt out of reconnecting at all) instead of racing
-      // the browser's independent default retry loop.
+      // the browser's independent default retry loop — and, now, what
+      // lets every reconnect mint a fresh token rather than the browser
+      // silently reopening the same (soon-to-expire) URL.
       es.close()
       if (source === es) source = null
-
-      if (closed || probing) return
-
-      if (!shouldRetry) {
-        options.onStateChange('closed')
-        return
-      }
-
-      consecutiveFailures += 1
-
-      if (consecutiveFailures < FAILURE_PROBE_THRESHOLD) {
-        scheduleReconnect()
-        return
-      }
-
-      // Three-plus failures in a row with no successful open between them
-      // — indistinguishable from a dead session by EventSource alone.
-      // Pause the backoff loop and ask an endpoint that *can* see a 401.
-      probing = true
-      options.onStateChange('reconnecting')
-      void probeSessionIsAlive().then((alive) => {
-        probing = false
-        if (closed) return
-
-        if (!alive) {
-          // The session is confirmed gone (and api.me() already cleared
-          // it / redirected to /login) — retrying this stream can never
-          // succeed, so stop for good instead of spinning forever.
-          permanentlyClose()
-          return
-        }
-
-        // Session's still good — this was a real network blip, not a
-        // dead token. Reset the streak so the next probe only fires
-        // after another run of failures, and keep going.
-        consecutiveFailures = 0
-        scheduleReconnect()
-      })
+      handleConnectionFailure()
     }
   }
 
-  open()
+  /**
+   * One connection attempt: mint a fresh stream token, then open an
+   * EventSource with it. Called for the very first connect and for every
+   * reconnect — never reuses a previously-minted token, since stream
+   * tokens expire in 5 minutes and a log view routinely stays open far
+   * longer than that.
+   */
+  async function attemptOpen() {
+    if (closed) return
+
+    options.onStateChange('connecting')
+
+    let token: string
+    try {
+      token = (await api.mintStreamToken(tokenParams)).token
+    } catch (err) {
+      if (closed) return
+      if (err instanceof ApiError && err.status === 401) {
+        // request()'s 401 interception already cleared the session and
+        // redirected to /login by the time this rejects — unlike an
+        // EventSource error, this is a definitive "the session is dead",
+        // not a maybe-network-blip, so skip straight past the
+        // probe-after-N-failures heuristic.
+        permanentlyClose()
+        return
+      }
+      handleConnectionFailure()
+      return
+    }
+
+    if (closed) return
+    openEventSource(token)
+  }
+
+  void attemptOpen()
 
   return {
     close() {

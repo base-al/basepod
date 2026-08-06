@@ -178,6 +178,16 @@ func (s *Store) UserByEmail(email string) (*User, error) {
 	return scanUser(row)
 }
 
+// UserByID looks up a user by primary key. Returns ErrNotFound if none
+// exists. Used by stream-token validation (see StreamTokenByHash and
+// internal/api/stream_token.go) to resolve a stream token's owning user,
+// the way UserBySessionTokenHash resolves a session's in one query — a
+// stream token row only carries user_id, not the joined user columns.
+func (s *Store) UserByID(id int64) (*User, error) {
+	row := s.db.QueryRow(`SELECT id, email, name, password_hash, is_superadmin FROM users WHERE id = ?`, id)
+	return scanUser(row)
+}
+
 // CountUsers returns the total number of users in the database.
 func (s *Store) CountUsers() (int, error) {
 	var count int
@@ -218,6 +228,104 @@ func (s *Store) PruneExpiredSessions() (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// StreamToken is a short-lived, single-purpose token minted via
+// POST /api/v1/stream-token (see internal/api/stream_token.go) so a
+// browser EventSource — which cannot set an Authorization header — never
+// has to carry the caller's full-authority session token in a URL query
+// string the way the pre-v0.4 SSE routes required (audit finding M4).
+// Unlike a session, a stream token authenticates exactly one (Scope,
+// Slug, DeploymentNumber) triple: a token minted for one app's
+// container-log stream cannot open a different app's, or a build-log
+// stream, even before it expires — see requireAuthAppLogs/
+// requireAuthBuildLog in internal/api/stream_token.go, which check the
+// token's triple against the route actually being requested.
+// DeploymentNumber is nil for Scope "app_logs" (which streams by slug
+// alone) and non-nil for "build_log" (one specific deployment's build
+// log).
+type StreamToken struct {
+	ID               int64
+	UserID           int64
+	Scope            string
+	Slug             string
+	DeploymentNumber *int64
+	ExpiresAt        string
+}
+
+// CreateStreamToken inserts a new stream token row for userID, scoped to
+// (scope, slug, deploymentNumber) and expiring at expires. The caller
+// (internal/api's handleCreateStreamToken) owns validating scope and the
+// slug/deploymentNumber combination before calling this — the store
+// applies them as given.
+func (s *Store) CreateStreamToken(userID int64, tokenHash, scope, slug string, deploymentNumber *int64, expires time.Time) error {
+	_, err := s.db.Exec(`INSERT INTO stream_tokens(token_hash, user_id, scope, slug, deployment_number, expires_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		tokenHash, userID, scope, slug, nullableInt64(deploymentNumber), expires.UTC().Format(timeFormat))
+	return err
+}
+
+// StreamTokenByHash looks up a non-expired stream token by its hash.
+// Returns ErrNotFound if the token is missing or expired.
+//
+// It also opportunistically deletes every expired stream token row (not
+// just the one being looked up) before the lookup — see
+// PruneExpiredStreamTokens. Stream tokens are not pruned by
+// internal/server's hourly session-prune ticker: that ticker lives
+// outside this milestone's file-ownership split (internal/api,
+// internal/store, internal/auth, web/src/lib/sse.ts — see the v0.4 plan's
+// Task 5 self-review note), so wiring a second call into it isn't safe to
+// do from here. Pruning lazily here instead is an acceptable substitute:
+// every stream token is looked up at least once (the SSE route it
+// authenticates) within its 5-minute lifetime in the common case, and in
+// the worst case (a minted-but-never-used token) it is still bounded
+// garbage — 5 minutes' worth of rows, not 30 days' — until the next
+// lookup or store restart sweeps it.
+func (s *Store) StreamTokenByHash(hash string) (*StreamToken, error) {
+	if _, err := s.PruneExpiredStreamTokens(); err != nil {
+		return nil, err
+	}
+
+	var st StreamToken
+	var deploymentNumber sql.NullInt64
+	row := s.db.QueryRow(`SELECT user_id, scope, slug, deployment_number, expires_at
+		FROM stream_tokens WHERE token_hash = ?`, hash)
+	err := row.Scan(&st.UserID, &st.Scope, &st.Slug, &deploymentNumber, &st.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	// ID is intentionally left zero: no caller needs the row's primary
+	// key, only the (Scope, Slug, DeploymentNumber) triple below, so it's
+	// not part of this SELECT.
+	if deploymentNumber.Valid {
+		n := deploymentNumber.Int64
+		st.DeploymentNumber = &n
+	}
+	return &st, nil
+}
+
+// PruneExpiredStreamTokens deletes every stream token whose expiry has
+// passed and returns the number of rows removed. Mirrors
+// PruneExpiredSessions; see StreamTokenByHash's doc comment for why this
+// is invoked lazily from there rather than from internal/server's hourly
+// ticker.
+func (s *Store) PruneExpiredStreamTokens() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM stream_tokens WHERE expires_at <= ?`, time.Now().UTC().Format(timeFormat))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// nullableInt64 converts v into a driver value suitable for a nullable
+// INTEGER column: nil becomes SQL NULL, otherwise the pointed-to value.
+func nullableInt64(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 // Session is one saved login session, as returned by ListSessions. TokenHash
