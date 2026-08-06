@@ -467,6 +467,39 @@ func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 	return false, apiError(status, data)
 }
 
+// imageInspectResponse is the subset of libpod's GET /images/{ref}/json
+// response ImageArchitecture needs.
+type imageInspectResponse struct {
+	Architecture string `json:"Architecture"`
+}
+
+// ImageArchitecture returns the architecture (e.g. "arm64", "amd64") recorded
+// in ref's image manifest/config, via libpod's GET /images/{ref}/json.
+// Distinct from ImageExists: existence says nothing about which
+// architecture's manifest a multi-arch (or accidentally single-arch, e.g.
+// pulled once under `podman build --platform linux/amd64`) image ref
+// resolved to when it landed in the local store, which is exactly the gap
+// caddy.Manager uses this to close (see its Ensure doc comment). ref is
+// url.PathEscape'd for the same reason as ImageExists (see its doc
+// comment).
+func (c *Client) ImageArchitecture(ctx context.Context, ref string) (string, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil)
+	if err != nil {
+		return "", fmt.Errorf("podman: inspecting image %q: %w", ref, err)
+	}
+	if status == http.StatusNotFound {
+		return "", ErrNotFound
+	}
+	if status >= 300 {
+		return "", apiError(status, data)
+	}
+	var raw imageInspectResponse
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "", fmt.Errorf("podman: decoding image inspect response for %q: %w", ref, err)
+	}
+	return raw.Architecture, nil
+}
+
 // RemoveImage removes an image by reference. force also removes an image
 // referenced by a stopped container. Removing an already-gone image (404)
 // is treated as success, mirroring RemoveContainer. ref is

@@ -1,6 +1,6 @@
 name: ci
 on:
-  push: {branches: [main, "feat/**"]}
+  push: {branches: [main, "feat/**", "fix/**", "docs/**"]}
   pull_request:
 jobs:
   test:
