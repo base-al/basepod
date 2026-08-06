@@ -33,6 +33,10 @@ var _ RoutesApplier = (*deploy.Engine)(nil)
 // LogSource func type this package defines and consumes.
 var _ LogSource = (*deploy.Engine)(nil).AppLogs
 
+// Compile-time assertion that (*deploy.Engine).AppStats satisfies the
+// StatsSource func type this package defines and consumes.
+var _ StatsSource = (*deploy.Engine)(nil).AppStats
+
 const testPassword = "correct-password"
 
 // testKey is a fixed 32-byte encryption key used by testSeal/testOpen so
@@ -387,10 +391,19 @@ func newTestServerWithBuilder(t *testing.T, st *store.Store, dep Deployer, route
 }
 
 // newTestServerWithGit is newTestServerWithBuilder with an explicit
-// GitFetcher, for git.go/webhook.go tests.
+// GitFetcher, for git.go/webhook.go tests. Passes unusedStatsSource
+// through to New — tests that exercise GET .../stats use
+// newTestServerWithStats instead.
 func newTestServerWithGit(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder, gitFetcher))
+	return newTestServerWithStats(t, st, dep, routes, logs, builder, gitFetcher, unusedStatsSource)
+}
+
+// newTestServerWithStats is the fullest-control constructor, for
+// stats_test.go's tests that need to script GET .../apps/{slug}/stats.
+func newTestServerWithStats(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder, gitFetcher, stats))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -400,6 +413,12 @@ func newTestServerWithGit(t *testing.T, st *store.Store, dep Deployer, routes Ro
 // returning an empty stream that would silently hide the mistake.
 func unusedLogSource(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error) {
 	return nil, errors.New("unusedLogSource: this test's LogSource was not expected to be called")
+}
+
+// unusedStatsSource is unusedLogSource's twin for tests that don't
+// exercise GET .../stats.
+func unusedStatsSource(ctx context.Context, slug string) (io.ReadCloser, error) {
+	return nil, errors.New("unusedStatsSource: this test's StatsSource was not expected to be called")
 }
 
 // decodeInto JSON-decodes resp's body into out, failing the test on a

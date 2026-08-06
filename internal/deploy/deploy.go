@@ -1501,6 +1501,43 @@ func (e *Engine) AppLogs(ctx context.Context, slug string, follow bool, tail int
 	return rc, nil
 }
 
+// AppStats streams a running app's raw container resource-usage stats.
+// Resolves the app/container exactly like AppLogs (see its doc comment for
+// the full lookup contract): ErrNotFound passes through unchanged from the
+// store lookup, and ErrNotRunning is returned if no container is currently
+// running. The returned ReadCloser is the raw, still-wire-format stream
+// straight from the runtime (see podman.StreamStats for decoding it into
+// BasePod's own stable sample shape) — the caller owns closing it, which
+// is what ends the underlying stats stream.
+func (e *Engine) AppStats(ctx context.Context, slug string) (io.ReadCloser, error) {
+	app, err := e.st.AppBySlug(slug)
+	if err != nil {
+		return nil, err
+	}
+
+	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true", "basepod.app": app.Slug})
+	if err != nil {
+		return nil, fmt.Errorf("deploy: list containers for %s: %w", app.Slug, err)
+	}
+
+	var id string
+	for _, c := range containers {
+		if c.State == "running" {
+			id = c.ID
+			break
+		}
+	}
+	if id == "" {
+		return nil, ErrNotRunning
+	}
+
+	rc, err := e.rt.ContainerStats(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: stats for %s: %w", app.Slug, err)
+	}
+	return rc, nil
+}
+
 // orphanCleanupTimeout bounds CleanupOrphans's stop/remove work — it runs
 // once at boot (see server.Run), detached from the caller's ctx like
 // fail's/removeOldContainers's cleanupCtx (a slow boot racing a shutdown
