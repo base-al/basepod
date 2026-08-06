@@ -43,16 +43,26 @@ type App struct {
 
 // Deployment is a single deploy attempt for an App. StartedAt is always
 // set (RFC3339 UTC); FinishedAt is "" until the deployment reaches a
-// terminal status (see FinishDeployment).
+// terminal status (see FinishDeployment). Source is "image" (a registry
+// pull, the original v0.1 path) or "tarball" (Task 6's build-from-upload
+// path). BuildLogPath is "" for image-sourced deployments, and the path
+// to a build log file on disk for tarball-sourced ones (see
+// SetDeploymentBuildLog). TriggerKind records what initiated the deploy
+// ("api" today; named trigger_kind in the schema because "trigger" is a
+// SQLite keyword) — reserved for a future non-API trigger (e.g. a cron
+// redeploy).
 type Deployment struct {
-	ID         int64
-	AppID      int64
-	Number     int
-	ImageRef   string
-	Status     string
-	Error      string
-	StartedAt  string
-	FinishedAt string
+	ID           int64
+	AppID        int64
+	Number       int
+	ImageRef     string
+	Status       string
+	Error        string
+	StartedAt    string
+	FinishedAt   string
+	Source       string
+	BuildLogPath string
+	TriggerKind  string
 }
 
 // EnvVar is an environment variable for an App.
@@ -183,6 +193,24 @@ func (s *Store) UserBySessionTokenHash(hash string) (*User, error) {
 	return scanUser(row)
 }
 
+// DeleteSessionByTokenHash removes the session with the given token hash, if
+// any. It is a no-op success (nil error) if no session matches — logout is
+// idempotent, not a lookup that must find something.
+func (s *Store) DeleteSessionByTokenHash(tokenHash string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
+	return err
+}
+
+// PruneExpiredSessions deletes every session whose expiry has passed and
+// returns the number of rows removed.
+func (s *Store) PruneExpiredSessions() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, time.Now().UTC().Format(timeFormat))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // CreateApp inserts a new app with status "created" and returns it.
 func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	res, err := s.db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, slug, imageRef, port)
@@ -253,19 +281,30 @@ func (s *Store) DeleteApp(id int64) error {
 	return err
 }
 
-// CreateDeployment inserts a new deployment for appID. The Number is
-// per-app max+1 (starting at 1), and Status starts "deploying".
-// started_at is set explicitly (rather than left to the column's SQL
-// default) so the returned Deployment's StartedAt matches exactly what
-// was persisted.
+// CreateDeployment inserts a new deployment for appID with source "image"
+// and trigger_kind "api" — the original v0.1 registry-pull path. It
+// delegates to CreateDeploymentFull; see that doc comment for details.
 func (s *Store) CreateDeployment(appID int64, imageRef string) (*Deployment, error) {
+	return s.CreateDeploymentFull(appID, imageRef, "image", "api")
+}
+
+// CreateDeploymentFull inserts a new deployment for appID with an
+// explicit source ("image" or "tarball") and triggerKind (what initiated
+// the deploy; "api" today). The Number is per-app max+1 (starting at 1),
+// and Status starts "deploying". started_at is set explicitly (rather
+// than left to the column's SQL default) so the returned Deployment's
+// StartedAt matches exactly what was persisted. imageRef may be ""
+// (Task 6's tarball path: the row is created before the image tag exists,
+// so the deployment number is addressable for the build log path; see
+// SetDeploymentImage).
+func (s *Store) CreateDeploymentFull(appID int64, imageRef, source, triggerKind string) (*Deployment, error) {
 	var n int
 	if err := s.db.QueryRow(`SELECT COALESCE(MAX(number), 0) + 1 FROM deployments WHERE app_id = ?`, appID).Scan(&n); err != nil {
 		return nil, err
 	}
 	startedAt := time.Now().UTC().Format(timeFormat)
-	res, err := s.db.Exec(`INSERT INTO deployments(app_id, number, image_ref, started_at) VALUES(?, ?, ?, ?)`,
-		appID, n, imageRef, startedAt)
+	res, err := s.db.Exec(`INSERT INTO deployments(app_id, number, image_ref, started_at, source, trigger_kind) VALUES(?, ?, ?, ?, ?, ?)`,
+		appID, n, imageRef, startedAt, source, triggerKind)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +312,10 @@ func (s *Store) CreateDeployment(appID int64, imageRef string) (*Deployment, err
 	if err != nil {
 		return nil, err
 	}
-	return &Deployment{ID: id, AppID: appID, Number: n, ImageRef: imageRef, Status: "deploying", StartedAt: startedAt}, nil
+	return &Deployment{
+		ID: id, AppID: appID, Number: n, ImageRef: imageRef, Status: "deploying", StartedAt: startedAt,
+		Source: source, TriggerKind: triggerKind,
+	}, nil
 }
 
 // FinishDeployment sets a deployment's terminal status and error message,
@@ -284,9 +326,45 @@ func (s *Store) FinishDeployment(id int64, status, errMsg string) error {
 	return err
 }
 
+// SetDeploymentImage sets a deployment's image_ref — used by the tarball
+// build path (Task 6) once the local build produces an image tag, since
+// CreateDeploymentFull creates the row with imageRef "" before the build
+// even starts (see DeployBuild).
+func (s *Store) SetDeploymentImage(id int64, imageRef string) error {
+	_, err := s.db.Exec(`UPDATE deployments SET image_ref = ? WHERE id = ?`, imageRef, id)
+	return err
+}
+
+// SetDeploymentBuildLog sets a deployment's build_log_path — used by the
+// tarball build path (Task 6) to record where its build log was written,
+// as soon as that path is known (before the build even finishes), so a
+// failed build's log is still addressable.
+func (s *Store) SetDeploymentBuildLog(id int64, path string) error {
+	_, err := s.db.Exec(`UPDATE deployments SET build_log_path = ? WHERE id = ?`, path, id)
+	return err
+}
+
+// scanDeploymentRows scans the common deployment column set (id, app_id,
+// number, image_ref, status, error, started_at, finished_at, source,
+// build_log_path, trigger_kind — in that order) shared by ListDeployments
+// and DeploymentByNumber.
+func scanDeploymentRow(scan func(...any) error) (Deployment, error) {
+	var d Deployment
+	var finishedAt sql.NullString
+	err := scan(&d.ID, &d.AppID, &d.Number, &d.ImageRef, &d.Status, &d.Error, &d.StartedAt, &finishedAt,
+		&d.Source, &d.BuildLogPath, &d.TriggerKind)
+	if err != nil {
+		return Deployment{}, err
+	}
+	d.FinishedAt = finishedAt.String
+	return d, nil
+}
+
+const deploymentColumns = `id, app_id, number, image_ref, status, error, started_at, finished_at, source, build_log_path, trigger_kind`
+
 // ListDeployments returns all deployments for appID, newest first.
 func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
-	rows, err := s.db.Query(`SELECT id, app_id, number, image_ref, status, error, started_at, finished_at
+	rows, err := s.db.Query(`SELECT `+deploymentColumns+`
 		FROM deployments WHERE app_id = ? ORDER BY number DESC`, appID)
 	if err != nil {
 		return nil, err
@@ -295,15 +373,28 @@ func (s *Store) ListDeployments(appID int64) ([]Deployment, error) {
 
 	var deployments []Deployment
 	for rows.Next() {
-		var d Deployment
-		var finishedAt sql.NullString
-		if err := rows.Scan(&d.ID, &d.AppID, &d.Number, &d.ImageRef, &d.Status, &d.Error, &d.StartedAt, &finishedAt); err != nil {
+		d, err := scanDeploymentRow(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		d.FinishedAt = finishedAt.String
 		deployments = append(deployments, d)
 	}
 	return deployments, rows.Err()
+}
+
+// DeploymentByNumber looks up a single deployment by appID and its
+// per-app Number. Returns ErrNotFound if none exists.
+func (s *Store) DeploymentByNumber(appID int64, number int) (*Deployment, error) {
+	row := s.db.QueryRow(`SELECT `+deploymentColumns+`
+		FROM deployments WHERE app_id = ? AND number = ?`, appID, number)
+	d, err := scanDeploymentRow(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 // UpsertEnvVar inserts or updates an environment variable for appID.

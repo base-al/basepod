@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/caddy"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
@@ -29,6 +30,36 @@ import (
 // or its last deploy failed before any container reached "running").
 var ErrNotRunning = errors.New("deploy: app has no running container")
 
+// Rollback's typed failure modes — the API layer (see
+// internal/api/apps.go's writeRollbackError) maps each to its own HTTP
+// status/error code, so these must stay distinguishable via errors.Is
+// rather than collapsed into a single generic error.
+var (
+	// ErrRollbackTargetNotFound is returned when the requested deployment
+	// number doesn't exist for the app.
+	ErrRollbackTargetNotFound = errors.New("deploy: rollback target not found")
+	// ErrRollbackTargetUnhealthy is returned when the requested deployment
+	// exists but its Status isn't "healthy" (e.g. it failed, or never
+	// finished) — there is nothing known-good to roll back to.
+	ErrRollbackTargetUnhealthy = errors.New("deploy: rollback target is not healthy")
+	// ErrRollbackImageMissing is returned when the target deployment's
+	// image is a local build tag ("localhost/basepod/<slug>:<n>") that is
+	// no longer present in the local image store (e.g. pruned by
+	// retention, or removed out-of-band) — unlike a registry ref, it can
+	// never be re-fetched by a pull.
+	ErrRollbackImageMissing = errors.New("deploy: rollback image is no longer available locally")
+)
+
+// localImagePrefix marks an image ref as a BasePod-built local tag (see
+// internal/build.Builder) rather than a registry reference: it can never
+// be pulled, so both Rollback and pruneBuiltImages treat it specially.
+const localImagePrefix = "localhost/"
+
+// retainBuiltImages is how many of an app's built image tags
+// (localhost/basepod/<slug>:<n>) pruneBuiltImages keeps, newest-numbered
+// first, after every successful rollout.
+const retainBuiltImages = 5
+
 // Engine drives app deployments: pull, create, start, probe, cut traffic
 // over, and tear down the previous container generation.
 type Engine struct {
@@ -37,6 +68,15 @@ type Engine struct {
 	router     Router
 	probe      Prober
 	rootDomain string
+
+	// dashboard is the route (if any) BasePod's own web dashboard is
+	// reachable through Caddy on — resolved once at boot (see
+	// internal/server.Run) from the dashboard_domain setting and the
+	// "basepod" network's gateway address, and passed straight through
+	// into every router.Apply call alongside the app route set. It is nil
+	// when the dashboard route is disabled (setting "off", or the gateway
+	// listener failed to bind — see server.Run).
+	dashboard *caddy.DashboardRoute
 
 	// routesMu serializes every route render+apply critical section: the
 	// Routes() DB read paired with the router.Apply call that renders it,
@@ -78,8 +118,10 @@ type Engine struct {
 // its hostname (e.g. rootDomain "apps.example.com" -> "blog.apps.example.com").
 // decrypt turns a stored EnvVar's encrypted value into plaintext; pass nil
 // to disable env injection (Deploy then fails rather than silently
-// omitting configured env vars).
-func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(string) (string, error)) *Engine {
+// omitting configured env vars). dashboard is the dashboard route (or nil
+// to disable it) every router.Apply call made through this Engine carries
+// alongside the app route set — see the dashboard field's doc comment.
+func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain string, decrypt func(string) (string, error), dashboard *caddy.DashboardRoute) *Engine {
 	return &Engine{
 		st:            st,
 		rt:            rt,
@@ -87,6 +129,7 @@ func New(st *store.Store, rt Runtime, router Router, probe Prober, rootDomain st
 		probe:         probe,
 		rootDomain:    rootDomain,
 		decrypt:       decrypt,
+		dashboard:     dashboard,
 		probeInterval: time.Second,
 		probeAttempts: 30,
 		log:           os.Stderr,
@@ -111,6 +154,155 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: pull %s: %w", imageRef, err))
 	}
 
+	return e.runRollout(ctx, app, dep, imageRef)
+}
+
+// DeployBuild runs one tarball-sourced deploy of app: it creates the
+// deployment row up front (source "tarball", with no image_ref yet — see
+// store.CreateDeploymentFull) so the deployment number exists for the
+// build log's path, records that path on the deployment immediately
+// (builder.LogPath is a pure computation from slug+number, so this needs
+// no I/O and can happen before the build even starts — see its doc
+// comment for why: it's what makes GET .../deployments/{n}/log able to
+// live-tail the log for the build's entire duration, not just after it
+// finishes), marks the app "deploying", then hands gzTar off to
+// builder.Build to decompress, validate, and build it into a local image
+// tag.
+//
+// On a build failure, this goes through the same fail() path Deploy uses
+// for every other failure: the deployment is marked failed and the app's
+// status is restored (to "running" if other containers are still up for
+// it, "error" otherwise) — no container was ever created for a build
+// failure, so fail() is called with an empty newContainerID.
+//
+// On a successful build, the image tag is recorded on the deployment and
+// rollout proceeds via the same runRollout Deploy uses — but, critically,
+// skipping Deploy's PullImage step: builder.Build produces a local
+// "localhost/basepod/..." tag, and pulling a localhost/ tag from a
+// registry would either fail outright or (worse) silently pull the wrong
+// thing.
+//
+// If the build succeeds but the rollout that follows it fails (a failed
+// probe, a container that won't start, ...), the freshly-built tag never
+// becomes a running deployment's image and is removed as an orphan (see
+// removeOrphanBuildImage) — runRollout's own retention (pruneBuiltImages)
+// only prunes on a *successful* rollout, so without this a string of
+// repeated failed builds would leave one dead tag behind per attempt,
+// forever.
+func (e *Engine) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
+	dep, err := e.st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		return nil, fmt.Errorf("deploy: create deployment: %w", err)
+	}
+
+	logPath := builder.LogPath(app.Slug, dep.Number)
+	if err := e.st.SetDeploymentBuildLog(dep.ID, logPath); err != nil {
+		fmt.Fprintf(e.log, "deploy: set build log path for deployment %d: %v\n", dep.ID, err)
+	}
+	dep.BuildLogPath = logPath
+
+	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: mark deploying: %w", err))
+	}
+
+	tag, _, buildErr := builder.Build(ctx, app.Slug, dep.Number, gzTar)
+	if buildErr != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: build: %w", buildErr))
+	}
+
+	if err := e.st.SetDeploymentImage(dep.ID, tag); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: set deployment image: %w", err))
+	}
+	dep.ImageRef = tag
+
+	result, rollErr := e.runRollout(ctx, app, dep, tag)
+	if rollErr != nil {
+		e.removeOrphanBuildImage(ctx, tag)
+	}
+	return result, rollErr
+}
+
+// removeOrphanBuildImage best-effort removes a freshly-built local image
+// tag whose rollout failed before it ever became a running deployment's
+// image — called by DeployBuild only when runRollout returns an error
+// (see its doc comment). Logged and skipped on failure, like every other
+// post-deploy cleanup step in this file: a stray failed-build tag is a
+// disk-space nuisance, not a correctness problem. Runs on a context
+// detached from ctx's cancellation, matching fail's/pruneBuiltImages's own
+// cleanupCtx pattern, since this cleanup must happen even if the caller's
+// request context is about to expire.
+func (e *Engine) removeOrphanBuildImage(ctx context.Context, tag string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+	if err := e.rt.RemoveImage(cleanupCtx, tag, false); err != nil {
+		fmt.Fprintf(e.log, "deploy: cleanup orphaned build image %s: %v\n", tag, err)
+	}
+}
+
+// Rollback redeploys app to an earlier deployment's exact image:
+// targetNumber must name an existing deployment (ErrRollbackTargetNotFound
+// otherwise) whose Status is "healthy" (ErrRollbackTargetUnhealthy
+// otherwise) — there is nothing else safe to roll back to.
+//
+// The target's image is resolved by reference (target.ImageRef), which
+// works uniformly for both a locally-built tag
+// ("localhost/basepod/<slug>:<n>") and a registry ref: if it's no longer
+// present in the local image store, a registry ref is re-pulled (mirroring
+// Deploy's own pull-then-rollout shape) but a local build tag fails
+// outright with ErrRollbackImageMissing, since a "localhost/..." tag can
+// never be fetched from anywhere else.
+//
+// On success this creates a new deployment row (source: the target's own
+// Source, trigger_kind "rollback") and runs the normal rollout pipeline
+// against it — so a rollback shows up in history as its own numbered
+// deployment, not a mutation of the one it targets.
+func (e *Engine) Rollback(ctx context.Context, app *store.App, targetNumber int) (*store.Deployment, error) {
+	target, err := e.st.DeploymentByNumber(app.ID, targetNumber)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, ErrRollbackTargetNotFound
+		}
+		return nil, fmt.Errorf("deploy: rollback: look up deployment %d: %w", targetNumber, err)
+	}
+	if target.Status != "healthy" {
+		return nil, ErrRollbackTargetUnhealthy
+	}
+
+	image := target.ImageRef
+	isLocalBuildTag := strings.HasPrefix(image, localImagePrefix)
+
+	exists, err := e.rt.ImageExists(ctx, image)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: rollback: checking image %s: %w", image, err)
+	}
+	if !exists {
+		if isLocalBuildTag {
+			return nil, ErrRollbackImageMissing
+		}
+		if err := e.rt.PullImage(ctx, image); err != nil {
+			return nil, fmt.Errorf("deploy: rollback: pull %s: %w", image, err)
+		}
+	}
+
+	dep, err := e.st.CreateDeploymentFull(app.ID, image, target.Source, "rollback")
+	if err != nil {
+		return nil, fmt.Errorf("deploy: rollback: create deployment: %w", err)
+	}
+	if err := e.st.UpdateAppStatus(app.ID, "deploying"); err != nil {
+		return e.fail(ctx, app, dep, "", fmt.Errorf("deploy: rollback: mark deploying: %w", err))
+	}
+
+	return e.runRollout(ctx, app, dep, image)
+}
+
+// runRollout is the shared back half of a deploy — create+start a new
+// container, probe it, cut traffic over, and remove the previous
+// container generation — used by both Deploy (after a successful pull)
+// and DeployBuild (after a successful local build). It deliberately never
+// pulls imageRef itself: Deploy pulls before calling this, and
+// DeployBuild must not (see its doc comment) — a built image is already
+// local.
+func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Deployment, imageRef string) (*store.Deployment, error) {
 	name := fmt.Sprintf("bp-%s-%d", app.Slug, dep.Number)
 	spec := podman.CreateSpec{
 		Name:  name,
@@ -181,6 +373,17 @@ func (e *Engine) Deploy(ctx context.Context, app *store.App, imageRef string) (*
 	// Traffic is now on the new container's alias; only past this point
 	// is it safe to tear down the previous generation.
 	e.removeOldContainers(ctx, app.Slug, dep.Number)
+
+	// Every successful rollout is a good point to prune old built images —
+	// except when this deployment is registry-sourced ("image"): it can
+	// never have produced a "localhost/basepod/<slug>:<n>" tag, so there's
+	// nothing to prune and it's not worth the ListImageTags round trip.
+	// imageRef (the image this rollout just cut traffic over to) is
+	// threaded through as the protected "currently running" image — see
+	// pruneBuiltImages's doc comment for why that matters.
+	if dep.Source != "image" {
+		e.pruneBuiltImages(ctx, app.Slug, imageRef)
+	}
 
 	if err := e.st.FinishDeployment(dep.ID, "healthy", ""); err != nil {
 		fmt.Fprintf(e.log, "deploy: finish deployment %d: %v\n", dep.ID, err)
@@ -266,6 +469,95 @@ func (e *Engine) removeOldContainers(ctx context.Context, slug string, keepNumbe
 		}
 		if err := e.rt.RemoveContainer(cleanupCtx, c.ID, false); err != nil {
 			fmt.Fprintf(e.log, "deploy: remove old container %s: %v\n", c.Name, err)
+		}
+	}
+}
+
+// builtImageRepo returns the local image repository BasePod's build
+// pipeline tags slug's built images under (see internal/build.Builder),
+// without the ":<n>" tag suffix — the prefix pruneBuiltImages and
+// Rollback's local-tag check both key off.
+func builtImageRepo(slug string) string {
+	return "localhost/basepod/" + slug
+}
+
+// pruneBuiltImages keeps the retainBuiltImages highest-numbered
+// "localhost/basepod/<slug>:<n>" image tags and removes the rest, via
+// e.rt.ListImageTags + RemoveImage. It's the back half of built-image
+// retention, called after every successful rollout (see runRollout) so a
+// long-lived app that redeploys frequently from tarball uploads doesn't
+// accumulate an unbounded number of local image layers.
+//
+// currentImageRef — the image the app is actually running right now (the
+// imageRef runRollout just cut traffic over to) — is always protected from
+// removal, regardless of where it ranks numerically. This matters because
+// a rollback can make an OLD, low-numbered tag the currently-running
+// image: ranking purely by tag number would then treat that live image as
+// one of the oldest and hand it straight to RemoveImage, deleting the
+// image a running container still references. The protected set is
+// therefore {currentImageRef} ∪ {the retainBuiltImages highest-numbered
+// tags}, which can hold up to retainBuiltImages+1 entries when
+// currentImageRef itself falls outside the numeric top N.
+//
+// Only tags whose suffix parses as a plain non-negative integer are
+// considered "numbered" and eligible for this ordering; anything else
+// (e.g. a stray "latest" tag) is left alone entirely — pruneBuiltImages
+// has no way to know if it's still wanted, so removing it isn't safe to do
+// automatically. A RemoveImage failure for one tag is logged and skipped
+// rather than aborting the rest, mirroring removeOldContainers's
+// best-effort teardown: by the time this runs, the deploy has already
+// succeeded, so a stray old image is a disk-space nuisance, not a
+// correctness problem.
+//
+// Runs on a context detached from ctx's cancellation (like
+// removeOldContainers's cleanupCtx), since it happens after the deploy has
+// already succeeded and must not be skipped just because the caller's
+// request context is about to expire.
+func (e *Engine) pruneBuiltImages(ctx context.Context, slug, currentImageRef string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+
+	repo := builtImageRepo(slug)
+	tags, err := e.rt.ListImageTags(cleanupCtx, repo)
+	if err != nil {
+		fmt.Fprintf(e.log, "deploy: retention: list image tags for %s: %v\n", repo, err)
+		return
+	}
+
+	type numberedTag struct {
+		number int
+		tag    string
+	}
+	prefix := repo + ":"
+	var numbered []numberedTag
+	for _, tag := range tags {
+		suffix, ok := strings.CutPrefix(tag, prefix)
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(suffix)
+		if err != nil {
+			continue // non-numeric tag (e.g. "latest") — never touched
+		}
+		numbered = append(numbered, numberedTag{number: n, tag: tag})
+	}
+	if len(numbered) <= retainBuiltImages {
+		return
+	}
+
+	sort.Slice(numbered, func(i, j int) bool { return numbered[i].number > numbered[j].number })
+
+	protected := map[string]bool{currentImageRef: true}
+	for _, nt := range numbered[:retainBuiltImages] {
+		protected[nt.tag] = true
+	}
+
+	for _, nt := range numbered[retainBuiltImages:] {
+		if protected[nt.tag] {
+			continue
+		}
+		if err := e.rt.RemoveImage(cleanupCtx, nt.tag, false); err != nil {
+			fmt.Fprintf(e.log, "deploy: retention: remove image %s: %v\n", nt.tag, err)
 		}
 	}
 }
@@ -360,7 +652,7 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 		}
 		filtered = append(filtered, r)
 	}
-	if err := e.router.Apply(ctx, filtered); err != nil {
+	if err := e.router.Apply(ctx, filtered, e.dashboard); err != nil {
 		return fmt.Errorf("deploy: apply routes: %w", err)
 	}
 	return nil
@@ -421,7 +713,7 @@ func (e *Engine) ApplyRoutes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("deploy: compute routes: %w", err)
 	}
-	if err := e.router.Apply(ctx, routes); err != nil {
+	if err := e.router.Apply(ctx, routes, e.dashboard); err != nil {
 		return fmt.Errorf("deploy: apply routes: %w", err)
 	}
 	return nil
@@ -466,6 +758,120 @@ func (e *Engine) AppLogs(ctx context.Context, slug string, follow bool, tail int
 		return nil, fmt.Errorf("deploy: logs for %s: %w", app.Slug, err)
 	}
 	return rc, nil
+}
+
+// orphanCleanupTimeout bounds CleanupOrphans's stop/remove work — it runs
+// once at boot (see server.Run), detached from the caller's ctx like
+// fail's/removeOldContainers's cleanupCtx (a slow boot racing a shutdown
+// signal must not abandon a container mid-removal).
+const orphanCleanupTimeout = 60 * time.Second
+
+// CleanupOrphans removes containers left behind by a previous crash or
+// interrupted deploy: a basepod.managed=true container whose
+// basepod.app slug no longer has a matching app in the store (the app
+// was deleted while its container survived), or whose
+// basepod.deployment generation isn't the app's latest *healthy*
+// deployment (a stale or never-finished generation from a cutover that
+// never completed). bp-caddy is always skipped by name — it's labeled
+// basepod.managed=true but has no basepod.app label and is a distinct
+// lifecycle from app containers. Containers with basepod.managed=true
+// but no basepod.app label are left alone with a warning: GC has no
+// record of what they belong to, so removing them isn't safe to do
+// automatically.
+//
+// Called once at boot (see server.Run), after the engine is constructed
+// and before Caddy's route config is reconciled — an orphan surviving
+// from a previous crash must never keep answering on a hostname (or
+// port, via the container's DNS alias) a fresh deploy is about to reuse.
+// Every failure along the way (listing containers, looking up an app,
+// listing its deployments, stopping/removing a container) is logged via
+// e.log and the loop continues rather than aborting: a partially-failing
+// GC pass must never stop basepod from finishing boot. Only a failure to
+// list containers in the first place (a precondition nothing else here
+// can work around) is returned as an error.
+func (e *Engine) CleanupOrphans(ctx context.Context) (int, error) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), orphanCleanupTimeout)
+	defer cancel()
+
+	containers, err := e.rt.ListContainers(cleanupCtx, map[string]string{"basepod.managed": "true"})
+	if err != nil {
+		return 0, fmt.Errorf("deploy: orphan gc: list containers: %w", err)
+	}
+
+	removed := 0
+	for _, c := range containers {
+		if c.Name == caddy.ContainerName {
+			continue
+		}
+		slug, ok := c.Labels["basepod.app"]
+		if !ok {
+			fmt.Fprintf(e.log, "deploy: orphan gc: %s is basepod.managed but has no basepod.app label — leaving it alone\n", c.Name)
+			continue
+		}
+
+		app, err := e.st.AppBySlug(slug)
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				fmt.Fprintf(e.log, "deploy: orphan gc: look up app %q: %v\n", slug, err)
+				continue
+			}
+			fmt.Fprintf(e.log, "deploy: orphan gc: removing %s (app %q no longer exists)\n", c.Name, slug)
+			e.removeOrphanContainer(cleanupCtx, c)
+			removed++
+			continue
+		}
+
+		latest, err := e.latestHealthyDeploymentNumber(app.ID)
+		if err != nil {
+			fmt.Fprintf(e.log, "deploy: orphan gc: list deployments for %q: %v\n", slug, err)
+			continue
+		}
+		if latest == 0 {
+			// The app exists but has never had a healthy deployment
+			// (e.g. its only deploy is still in flight, or every past
+			// attempt failed before going healthy) — nothing to compare
+			// this container's generation against, so leave it alone.
+			continue
+		}
+		if c.Labels["basepod.deployment"] != strconv.Itoa(latest) {
+			fmt.Fprintf(e.log, "deploy: orphan gc: removing %s (deployment %s, latest healthy for %q is %d)\n",
+				c.Name, c.Labels["basepod.deployment"], slug, latest)
+			e.removeOrphanContainer(cleanupCtx, c)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// removeOrphanContainer stops and force-removes a single orphaned
+// container, logging (not failing on) either step — mirrors
+// removeOldContainers's best-effort teardown, since by the time
+// CleanupOrphans runs at boot there's no live traffic depending on the
+// container staying reachable a moment longer.
+func (e *Engine) removeOrphanContainer(ctx context.Context, c podman.ContainerInfo) {
+	if err := e.rt.StopContainer(ctx, c.ID, 10); err != nil {
+		fmt.Fprintf(e.log, "deploy: orphan gc: stop %s: %v\n", c.Name, err)
+	}
+	if err := e.rt.RemoveContainer(ctx, c.ID, true); err != nil {
+		fmt.Fprintf(e.log, "deploy: orphan gc: remove %s: %v\n", c.Name, err)
+	}
+}
+
+// latestHealthyDeploymentNumber returns the Number of appID's most
+// recent deployment with Status=="healthy". ListDeployments returns
+// deployments newest-first, so this is just the first match; it returns
+// 0 if appID has never had a healthy deployment.
+func (e *Engine) latestHealthyDeploymentNumber(appID int64) (int, error) {
+	deps, err := e.st.ListDeployments(appID)
+	if err != nil {
+		return 0, err
+	}
+	for _, d := range deps {
+		if d.Status == "healthy" {
+			return d.Number, nil
+		}
+	}
+	return 0, nil
 }
 
 // CaddyProber returns a Prober that checks an upstream by running a

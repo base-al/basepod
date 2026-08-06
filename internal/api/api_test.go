@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/base-al/basepod/internal/auth"
+	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/crypto"
 	"github.com/base-al/basepod/internal/deploy"
 	"github.com/base-al/basepod/internal/store"
@@ -78,6 +79,27 @@ type fakeDeployer struct {
 	deployedApp   string
 	deployedImage string
 	removeCalled  bool
+
+	// deployBuildErr, if set, is returned by DeployBuild as-is (after
+	// marking the deployment row it creates "failed") — tests script this
+	// to a *http.MaxBytesError, build.ErrNoContainerfile, or
+	// build.ErrBadPath to exercise handleDeployTarball's error-code
+	// mapping without needing a real build.Builder or an actual
+	// oversized/invalid upload.
+	deployBuildErr error
+
+	deployBuildCalled  bool
+	deployBuildBody    []byte // the full gzTar body read, for tests to assert on
+	deployBuildBuilder *build.Builder
+
+	// rollbackErr, if set, is returned by Rollback as-is (mirroring how
+	// deployErr/deployBuildErr script Deploy/DeployBuild) — tests script
+	// this to deploy's typed rollback errors (or a generic error) to
+	// exercise handleRollback's status/error-code mapping.
+	rollbackErr error
+
+	rollbackCalledApp    string
+	rollbackCalledNumber int
 }
 
 func (f *fakeDeployer) Deploy(ctx context.Context, app *store.App, imageRef string) (*store.Deployment, error) {
@@ -91,6 +113,67 @@ func (f *fakeDeployer) Deploy(ctx context.Context, app *store.App, imageRef stri
 	if f.deployErr != nil {
 		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployErr.Error())
 		return nil, f.deployErr
+	}
+	_ = f.st.FinishDeployment(dep.ID, "healthy", "")
+	dep.Status = "healthy"
+	return dep, nil
+}
+
+// DeployBuild is a lightweight stand-in for deploy.Engine.DeployBuild: it
+// persists a real deployment row (source "tarball") through the store —
+// like Deploy above, and like the real engine — but never actually
+// builds anything; internal/deploy and internal/build already cover the
+// real build pipeline's own behavior with their own fakes, so this only
+// needs to prove the API layer's plumbing (request -> DeployBuild call ->
+// response/error mapping) is wired correctly.
+func (f *fakeDeployer) DeployBuild(ctx context.Context, app *store.App, gzTar io.Reader, builder *build.Builder) (*store.Deployment, error) {
+	f.deployBuildCalled = true
+	f.deployBuildBuilder = builder
+	body, _ := io.ReadAll(gzTar)
+	f.deployBuildBody = body
+
+	dep, err := f.st.CreateDeploymentFull(app.ID, "", "tarball", "api")
+	if err != nil {
+		return nil, err
+	}
+	if f.deployBuildErr != nil {
+		_ = f.st.FinishDeployment(dep.ID, "failed", f.deployBuildErr.Error())
+		return nil, f.deployBuildErr
+	}
+
+	tag := fmt.Sprintf("localhost/basepod/%s:%d", app.Slug, dep.Number)
+	logPath := fmt.Sprintf("/fake/data/apps/%s/builds/%d.log", app.Slug, dep.Number)
+	_ = f.st.SetDeploymentImage(dep.ID, tag)
+	_ = f.st.SetDeploymentBuildLog(dep.ID, logPath)
+	_ = f.st.FinishDeployment(dep.ID, "healthy", "")
+	dep.Status = "healthy"
+	dep.ImageRef = tag
+	dep.BuildLogPath = logPath
+	return dep, nil
+}
+
+// Rollback is a lightweight stand-in for deploy.Engine.Rollback: like
+// DeployBuild above, it persists a real deployment row through the store
+// (copying the target deployment's own image/source, as the real engine
+// does) rather than exercising any rollout logic — internal/deploy already
+// covers Rollback's own behavior (pull-vs-skip, retention, typed errors)
+// with its own fakes, so this only needs to prove the API layer's
+// plumbing (request -> Rollback call -> response/error mapping) is wired
+// correctly.
+func (f *fakeDeployer) Rollback(ctx context.Context, app *store.App, targetNumber int) (*store.Deployment, error) {
+	f.rollbackCalledApp = app.Slug
+	f.rollbackCalledNumber = targetNumber
+	if f.rollbackErr != nil {
+		return nil, f.rollbackErr
+	}
+
+	target, err := f.st.DeploymentByNumber(app.ID, targetNumber)
+	if err != nil {
+		return nil, err
+	}
+	dep, err := f.st.CreateDeploymentFull(app.ID, target.ImageRef, target.Source, "rollback")
+	if err != nil {
+		return nil, err
 	}
 	_ = f.st.FinishDeployment(dep.ID, "healthy", "")
 	dep.Status = "healthy"
@@ -138,10 +221,21 @@ func newTestServer(t *testing.T, st *store.Store, dep Deployer, routes RoutesApp
 }
 
 // newTestServerWithLogs is newTestServer with an explicit LogSource, for
-// tests that need to script the app-logs endpoint.
+// tests that need to script the app-logs endpoint. It passes a nil
+// builder through to New — fine for every test that doesn't specifically
+// assert on the *build.Builder handleDeployTarball forwards to
+// Deployer.DeployBuild (see newTestServerWithBuilder).
 func newTestServerWithLogs(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs))
+	return newTestServerWithBuilder(t, st, dep, routes, logs, nil)
+}
+
+// newTestServerWithBuilder is the fullest-control constructor, for tests
+// (deploy_tarball_test.go) that need to assert the *build.Builder passed
+// to New is exactly what reaches Deployer.DeployBuild.
+func newTestServerWithBuilder(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -151,6 +245,16 @@ func newTestServerWithLogs(t *testing.T, st *store.Store, dep Deployer, routes R
 // returning an empty stream that would silently hide the mistake.
 func unusedLogSource(ctx context.Context, slug string, follow bool, tail int) (io.ReadCloser, error) {
 	return nil, errors.New("unusedLogSource: this test's LogSource was not expected to be called")
+}
+
+// decodeInto JSON-decodes resp's body into out, failing the test on a
+// decode error. Shared by doJSON and tests (e.g. deploy_tarball_test.go)
+// that build their own *http.Request rather than going through doJSON.
+func decodeInto(t *testing.T, resp *http.Response, out any) {
+	t.Helper()
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
 }
 
 // doJSON performs an HTTP request with an optional JSON body and optional
@@ -185,9 +289,7 @@ func doJSON(t *testing.T, method, url, token string, payload, out any) *http.Res
 	t.Cleanup(func() { resp.Body.Close() })
 
 	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			t.Fatalf("decode response body: %v", err)
-		}
+		decodeInto(t, resp, out)
 	}
 	return resp
 }
@@ -228,6 +330,33 @@ func TestLoginAndMe(t *testing.T) {
 	}
 	if me.Email != "admin@example.com" {
 		t.Fatalf("/me returned %+v", me)
+	}
+}
+
+func TestLogout(t *testing.T) {
+	st := newTestStore(t)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+
+	_, body := login(t, srv, testPassword)
+
+	logoutResp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/auth/logout", body.Token, nil, nil)
+	if logoutResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("logout: got status %d, want 204", logoutResp.StatusCode)
+	}
+
+	meResp := doJSON(t, http.MethodGet, srv.URL+"/api/v1/auth/me", body.Token, nil, nil)
+	if meResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("/me after logout: got status %d, want 401", meResp.StatusCode)
+	}
+}
+
+func TestLogoutWithoutTokenUnauthorized(t *testing.T) {
+	st := newTestStore(t)
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/auth/logout", "", nil, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("logout without token: got status %d, want 401", resp.StatusCode)
 	}
 }
 
@@ -634,6 +763,84 @@ func TestDomainGeneratedCollision(t *testing.T) {
 	}
 }
 
+// TestDomainDashboardCollision proves handleAddDomain rejects a custom
+// domain hostname that equals the dashboard_domain setting — the dashboard
+// route is prepended terminal-first in the rendered Caddy config (see
+// caddy.Render), so a custom app domain with the same hostname would never
+// actually reach the app.
+func TestDomainDashboardCollision(t *testing.T) {
+	srv, st, token, _, _ := setupEnvDomainsTest(t)
+	if err := st.SetSetting("dashboard_domain", "basepod.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	var errBody errorResponse
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/my-blog/domains", token,
+		addDomainRequest{Hostname: "basepod.example.com"}, &errBody)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("collision with dashboard domain: got status %d, want 422", resp.StatusCode)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+}
+
+// TestDomainDashboardOffOrUnsetNoCollision proves a dashboard_domain of ""
+// (unset) or the literal "off" never blocks a custom domain add — neither
+// value is actually routed anywhere, so there's nothing to collide with.
+func TestDomainDashboardOffOrUnsetNoCollision(t *testing.T) {
+	for _, dashboardDomain := range []string{"", "off"} {
+		t.Run("dashboard_domain="+dashboardDomain, func(t *testing.T) {
+			srv, st, token, _, _ := setupEnvDomainsTest(t)
+			if dashboardDomain != "" {
+				if err := st.SetSetting("dashboard_domain", dashboardDomain); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/my-blog/domains", token,
+				addDomainRequest{Hostname: "not-a-real-collision.example.com"}, nil)
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("got status %d, want 201", resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestCreateAppDashboardCollision proves handleCreateApp rejects a slug
+// whose generated hostname (slug.rootDomain) equals the dashboard_domain
+// setting.
+func TestCreateAppDashboardCollision(t *testing.T) {
+	st := newTestStore(t)
+	if err := st.SetSetting("root_domain", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSetting("dashboard_domain", "basepod.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestServer(t, st, &fakeDeployer{st: st}, &fakeRoutesApplier{})
+	_, session := login(t, srv, testPassword)
+	token := session.Token
+
+	var errBody errorResponse
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "Basepod", Image: "nginx:alpine", Port: 80}, &errBody)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("collision with dashboard domain: got status %d, want 422", resp.StatusCode)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+
+	// A non-colliding slug still succeeds with the same dashboard_domain
+	// setting in place.
+	resp = doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "My Blog", Image: "nginx:alpine", Port: 80}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("non-colliding slug: got status %d, want 201", resp.StatusCode)
+	}
+}
+
 func TestDomainCrossAppDelete(t *testing.T) {
 	srv, _, token, _, _ := setupEnvDomainsTest(t)
 
@@ -722,5 +929,65 @@ func TestDomainDeleteRollsBackOnRoutesFailure(t *testing.T) {
 	resp = doJSON(t, http.MethodGet, srv.URL+"/api/v1/apps/my-blog/domains", token, nil, &list)
 	if resp.StatusCode != http.StatusOK || len(list.Custom) != 1 || list.Custom[0].Hostname != "keep.example.org" {
 		t.Fatalf("expected the failed delete to be rolled back, got status=%d body=%+v", resp.StatusCode, list)
+	}
+}
+
+// TestCreateAppCustomDomainCollision proves handleCreateApp rejects a slug
+// whose generated hostname collides with an existing custom domain.
+func TestCreateAppCustomDomainCollision(t *testing.T) {
+	srv, _, token, _, _ := setupEnvDomainsTest(t)
+
+	// Create a second app and add a custom domain to it with the name
+	// that will collide with the slug we'll try to create later.
+	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "First App", Image: "nginx:alpine", Port: 80}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create first app: got status %d, want 201", resp.StatusCode)
+	}
+
+	// Add a custom domain "taken.example.com" to the first app.
+	resp = doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps/first-app/domains", token,
+		addDomainRequest{Hostname: "taken.example.com"}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("add domain: got status %d, want 201", resp.StatusCode)
+	}
+
+	// Try to create an app with slug "taken", whose generated hostname
+	// would be "taken.example.com", colliding with the custom domain.
+	var errBody errorResponse
+	resp = doJSON(t, http.MethodPost, srv.URL+"/api/v1/apps", token,
+		createAppRequest{Name: "Taken", Image: "nginx:alpine", Port: 81}, &errBody)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("collision with custom domain: got status %d, want 422", resp.StatusCode)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+}
+
+// TestEnvDuplicateKey proves handlePutEnv rejects a payload containing
+// duplicate keys (case-sensitive exact matches).
+func TestEnvDuplicateKey(t *testing.T) {
+	srv, _, token, _, _ := setupEnvDomainsTest(t)
+
+	// Submit a payload with the same key twice
+	resp := doJSON(t, http.MethodPut, srv.URL+"/api/v1/apps/my-blog/env", token,
+		[]envVarResponse{
+			{Key: "FOO", Value: "first", IsSecret: false},
+			{Key: "FOO", Value: "second", IsSecret: false},
+		}, nil)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("duplicate key: got status %d, want 422", resp.StatusCode)
+	}
+
+	var errBody errorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&errBody); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if errBody.Error.Code != "validation" {
+		t.Fatalf("unexpected error code: %+v", errBody)
+	}
+	if !strings.Contains(errBody.Error.Message, "FOO") {
+		t.Fatalf("expected error message to name the duplicated key, got %+v", errBody)
 	}
 }

@@ -46,6 +46,13 @@ export interface Deployment {
    * DeploymentList.vue only shows a relative "Started" column for now;
    * this is here for a future deploy-duration display. */
   finished_at: string
+  /** "image" (registry pull) or "tarball" (build-from-upload). */
+  source: string
+  /** What initiated this deploy: "api" or "rollback". */
+  trigger: string
+  /** Whether a build log is available for GET .../deployments/{number}/log
+   * (true for tarball-sourced deployments only). */
+  has_build_log: boolean
 }
 
 export interface AppDetail extends App {
@@ -195,6 +202,71 @@ async function logsPreflight(slug: string): Promise<void> {
   await res.body?.cancel()
 }
 
+/** Uploads a gzipped tar build context via POST /apps/{slug}/deploy/tarball
+ * (see internal/api/apps.go's handleDeployTarball / maxTarballBody).
+ * Implemented with XMLHttpRequest rather than fetch, because fetch
+ * exposes no upload-progress events — onProgress (if given) is called
+ * with the fraction (0..1) of the file sent so far as the browser
+ * streams the request body.
+ *
+ * Mirrors requestRaw's auth-header injection, 401 interception, and
+ * {"error":{code,message}} envelope parsing, but can't reuse it directly
+ * since requestRaw is fetch-based. Also note the request body here is
+ * the raw gzip stream itself, not JSON — no Content-Type: application/json
+ * override like requestRaw applies.
+ */
+function uploadTarball(slug: string, file: Blob, onProgress?: (fraction: number) => void): Promise<Deployment> {
+  const auth = useAuthStore()
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${BASE_URL}/apps/${slug}/deploy/tarball`)
+    if (auth.token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${auth.token}`)
+    }
+    xhr.setRequestHeader('Content-Type', 'application/gzip')
+
+    xhr.upload.onprogress = (evt) => {
+      if (onProgress && evt.lengthComputable) {
+        onProgress(evt.loaded / evt.total)
+      }
+    }
+
+    xhr.onload = () => {
+      let body: unknown
+      try {
+        body = JSON.parse(xhr.responseText) as unknown
+      } catch {
+        body = undefined
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as Deployment)
+        return
+      }
+
+      const envelope = body as ErrorEnvelope | undefined
+      const code = envelope?.error?.code ?? 'unknown'
+      const message = envelope?.error?.message ?? xhr.statusText ?? 'request failed'
+
+      if (xhr.status === 401) {
+        auth.clearSession()
+        if (router.currentRoute.value.name !== 'login') {
+          void router.push({ name: 'login' })
+        }
+      }
+
+      reject(new ApiError(xhr.status, code, message))
+    }
+
+    xhr.onerror = () => {
+      reject(new ApiError(0, 'network_error', 'Network error during upload'))
+    }
+
+    xhr.send(file)
+  })
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<LoginResponse>('/auth/login', {
@@ -203,6 +275,11 @@ export const api = {
     }),
 
   me: () => request<User>('/auth/me'),
+
+  /** Revokes the current session server-side. Called best-effort by the
+   * auth store's logout() — local state is cleared regardless of whether
+   * this succeeds. */
+  logout: () => request<void>('/auth/logout', { method: 'POST' }),
 
   listApps: () => request<App[]>('/apps'),
 
@@ -222,6 +299,16 @@ export const api = {
     request<Deployment>(`/apps/${slug}/deploy`, {
       method: 'POST',
       body: JSON.stringify(image ? { image } : {}),
+    }),
+
+  /** Rolls the app back to an earlier deployment's exact image. This call
+   * runs the same synchronous, potentially-minutes-long rollout as
+   * deploy() (see internal/api/apps.go's handleRollback) — no client-side
+   * timeout here either. */
+  rollbackApp: (slug: string, number: number) =>
+    request<Deployment>(`/apps/${slug}/rollback`, {
+      method: 'POST',
+      body: JSON.stringify({ number }),
     }),
 
   deleteApp: (slug: string) => request<void>(`/apps/${slug}`, { method: 'DELETE' }),
@@ -257,4 +344,21 @@ export const api = {
   system: () => request<SystemInfo>('/system'),
 
   logsPreflight,
+
+  /** Fetches a finished deployment's full build log as plain text (see
+   * GET .../deployments/{number}/log in internal/api/logs.go — the
+   * plain-text branch of handleDeploymentLog, which serves once the
+   * deployment is no longer "deploying"). Throws ApiError with code
+   * "no_build_log" (404) if there's nothing to show — either an
+   * image-sourced deployment or a build that failed before ever writing
+   * its log file. For a deployment still "deploying", callers should use
+   * sse.connect() against the same URL instead (see DeploymentList.vue's
+   * BuildLogPanel) — the server streams it live rather than returning
+   * this all at once. */
+  buildLogText: async (slug: string, number: number): Promise<string> => {
+    const res = await requestRaw(`/apps/${slug}/deployments/${number}/log`)
+    return res.text()
+  },
+
+  uploadTarball,
 }

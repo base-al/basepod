@@ -36,7 +36,17 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  function logout() {
+  /** Revokes the session server-side (best-effort — a failed/expired call
+   * is ignored, since the local session is cleared either way) before
+   * clearing local state. */
+  async function logout() {
+    try {
+      await api.logout()
+    } catch {
+      // Best-effort: the local session is cleared regardless of whether
+      // the server-side revoke succeeded (e.g. token already expired, or
+      // a network blip).
+    }
     clearSession()
   }
 

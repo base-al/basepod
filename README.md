@@ -5,7 +5,8 @@ image, a git repo, or a compose file — and get a running app with
 automatic HTTPS. Like CapRover, but rootless, daemonless, and shipped as
 a single Go binary.
 
-> **Status: v0.1 shipped, v0.2 (dashboard) is the current milestone.**
+> **Status: v0.1 and v0.2 shipped; v0.3 (real deploys — tarball builds,
+> rollback, CLI core) is complete on this branch, pending release.**
 > The detailed design lives in [`docs/plan/`](docs/plan/) — start with
 > [01 — Overview & Architecture](docs/plan/01.overview-and-architecture.md).
 
@@ -47,6 +48,20 @@ Caddy container serves apps on ports 80/443 (override with
 `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` if those clash on your
 machine).
 
+> Once an app exists (create it once from the [dashboard](#dashboard) or
+> the [API](#api)), day-to-day shipping is `basepod deploy`: `cd` into
+> your project and run it — see [CLI](#cli) below for the full
+> quick-reference. That's the primary dev flow as of v0.3.
+
+### Backup
+
+Back up **three files together** to preserve your BasePod instance:
+- `basepod.db` (the SQLite database in `<data-dir>`)
+- `secret.key` (env-var encryption key in `<data-dir>`) — **losing this file makes stored environment variables unrecoverable and apps undeployable until re-entered**
+- `<data-dir>/caddy-data` (Caddy's TLS certificates)
+
+Restore by copying all three to the same locations in your new instance.
+
 ### Dashboard
 
 Once the server is running, open **http://localhost:3080** and sign in
@@ -58,6 +73,35 @@ does, without curl.
 > Screenshots are deferred until the UI settles a bit further; see
 > [docs/plan/07 — Web Dashboard](docs/plan/07.dashboard.md) for what's
 > shipped in this milestone versus deferred to later ones.
+
+### Remote access
+
+On a remote box (a VPS, a home server, anything not `localhost`), BasePod
+serves the dashboard itself, automatically, over HTTPS — no SSH tunnel
+required.
+
+At boot, BasePod binds a second internal listener on a unix socket
+(shared with the `bp-caddy` container through its own dedicated bind
+mount — no other container, and nothing else on the network, can reach
+it), then adds a route for it to Caddy at
+**`https://basepod.<root-domain>`** (e.g.
+`https://basepod.apps.example.com`), alongside your deployed apps'
+routes. The hostname comes from the `dashboard_domain` setting: unset by
+default (BasePod computes and stores `basepod.<root-domain>` the first
+time it boots), or set it to any hostname you prefer, or to the literal
+value `off` to disable the dashboard route entirely.
+
+This works out of the box on **Linux** hosts, rootless Podman included.
+On **macOS**, `podman machine`'s virtiofs-shared directories don't carry
+unix sockets across the VM boundary, so BasePod logs a warning and
+disables the dashboard route there — the dashboard is still reachable
+locally at `http://localhost:3080` (see [Dashboard](#dashboard) above),
+or remotely via an SSH tunnel as a fallback:
+
+```bash
+ssh -L 3080:localhost:3080 user@your-server
+# then open http://localhost:3080 locally
+```
 
 ### API
 
@@ -88,13 +132,48 @@ See [`scripts/e2e-local.sh`](scripts/e2e-local.sh) for this whole flow
 (plus env vars, custom domains, and log streaming) scripted end-to-end
 (also run in CI on every push/PR).
 
+### CLI
+
+The `basepod` binary doubles as a client: same executable, run against
+a running server (local or remote) to log in, deploy, and manage apps
+without curl.
+
+```bash
+# Log in once — saves the server URL + session token as a named context
+# in ~/.config/basepod/cli.yaml (override with BASEPOD_CLI_CONFIG).
+./basepod login http://localhost:3080 --email admin@example.com
+
+# Deploy from source: tars the given directory (must have a Containerfile
+# or Dockerfile at its root, default cwd), uploads it, builds it, and
+# rolls it out — the same pipeline POST /deploy/tarball drives above.
+./basepod deploy . -a hello
+
+# ...or deploy an existing image instead of building from source.
+./basepod deploy -a hello --image ghcr.io/user/app:tag
+
+# Tail logs (-f to follow; omit for a fixed --tail window).
+./basepod logs hello -f
+./basepod logs hello --tail 200
+
+# Roll back to an earlier deployment's exact image (see `basepod status`
+# or the dashboard's history tab for deployment numbers).
+./basepod rollback hello 3
+```
+
+Other commands: `basepod apps` (list, `--json` for scripting), `basepod
+env <app> [set KEY=VALUE... | unset KEY...]`, `basepod status` (system +
+every app in one shot), and `basepod context list|use <name>` for
+juggling multiple saved servers. Every server-talking command accepts a
+one-off `--context <name>` flag.
+
 ## Known issues
 
-- If the first `basepod server` boot fails because port 80/443 is
-  already taken, a created-but-never-started `bp-caddy` container with
-  the old port mapping can be left behind. Remedy: `podman rm -f
-  bp-caddy`, then set `BASEPOD_HTTP_PORT`/`BASEPOD_HTTPS_PORT` to free
-  ports and restart.
+- Behind the HTTPS dashboard proxy, the login rate limit is currently
+  shared across all remote clients (10/min total) — a deliberate
+  fail-closed tradeoff for v0.3. Sustained failed logins can temporarily
+  lock out remote login; existing sessions are unaffected and `ssh -L
+  3080:localhost:3080` + http://localhost:3080 always works. Per-client
+  limiting returns in v0.4.
 
 ## Contributing
 

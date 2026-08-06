@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -104,8 +103,7 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req []envVarResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if !readJSON(w, r, &req) {
 		return
 	}
 
@@ -115,6 +113,17 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 				"invalid env var key \""+ev.Key+"\": must match ^[A-Z_][A-Z0-9_]{0,63}$")
 			return
 		}
+	}
+
+	// Check for duplicate keys within the payload (case-sensitive exact matches)
+	seenKeys := make(map[string]bool, len(req))
+	for _, ev := range req {
+		if seenKeys[ev.Key] {
+			writeError(w, http.StatusUnprocessableEntity, "validation",
+				"duplicate env var key \""+ev.Key+"\"")
+			return
+		}
+		seenKeys[ev.Key] = true
 	}
 
 	before, err := a.effectiveEnv(app.ID)

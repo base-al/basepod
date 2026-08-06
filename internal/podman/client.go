@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -261,6 +262,32 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
+// versionResponse is the subset of libpod's GET /version payload Version
+// cares about — the top-level daemon version string (e.g. "4.9.2").
+type versionResponse struct {
+	Version string `json:"Version"`
+}
+
+// Version reports the connected daemon's version string (e.g. "4.9.2"),
+// read from libpod's GET /version endpoint. Callers use this at boot to
+// enforce a minimum podman version (see server.checkPodmanVersion) —
+// BasePod relies on libpod API behavior (e.g. explicit bridge-mode netns,
+// see CreateContainer) that isn't reliably present on older daemons.
+func (c *Client) Version(ctx context.Context) (string, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/version", nil)
+	if err != nil {
+		return "", fmt.Errorf("podman: version: %w", err)
+	}
+	if status != http.StatusOK {
+		return "", apiError(status, data)
+	}
+	var v versionResponse
+	if err := json.Unmarshal(data, &v); err != nil {
+		return "", fmt.Errorf("podman: decoding version response: %w", err)
+	}
+	return v.Version, nil
+}
+
 // pullStreamLine is one line of the newline-delimited JSON stream libpod
 // sends back from POST /images/pull. Errors that occur mid-pull (e.g. a
 // missing manifest) are reported *inside* this stream with a 200 status,
@@ -321,15 +348,206 @@ func (c *Client) PullImage(ctx context.Context, ref string) error {
 	return streamErr
 }
 
+// buildStreamLine is one line of the newline-delimited JSON stream
+// libpod's POST /build sends back — mirrors pullStreamLine, but /build's
+// error shape can additionally carry a nested "errorDetail":{"message":
+// "..."} object instead of (or alongside) the flat "error" string; when
+// both are present ErrorDetail.Message is preferred as the more specific
+// message.
+type buildStreamLine struct {
+	Stream      string `json:"stream,omitempty"`
+	Error       string `json:"error,omitempty"`
+	ErrorDetail *struct {
+		Message string `json:"message"`
+	} `json:"errorDetail,omitempty"`
+}
+
+// BuildImage builds an image tagged tag from contextTar — a raw,
+// *uncompressed* tar stream (the caller decompresses any gzip wrapper
+// first; see internal/build.Builder) — via libpod's POST /build.
+// dockerfile names the in-context path to the Containerfile/Dockerfile to
+// build (libpod's build endpoint accepts either name, but does not try
+// both itself — the caller must pass whichever one its context actually
+// contains); "" defaults to "Containerfile".
+//
+// Like PullImage, build progress and failures both arrive as
+// newline-delimited JSON within an otherwise-200 body: {"stream":"..."}
+// lines are progress text, written verbatim to logSink, while
+// {"error":"..."} (optionally with a more specific nested
+// "errorDetail":{"message":"..."}) reports a failed build. The whole
+// stream is drained before returning an error, mirroring PullImage's
+// reasoning: a stream-reported error is the actionable signal and must
+// not be discarded by a decode failure on a later (or trailing garbage)
+// line.
+func (c *Client) BuildImage(ctx context.Context, tag, dockerfile string, contextTar io.Reader, logSink io.Writer) error {
+	if tag == "" {
+		return fmt.Errorf("podman: BuildImage: tag is required")
+	}
+	if dockerfile == "" {
+		dockerfile = "Containerfile"
+	}
+	q := url.Values{}
+	q.Set("dockerfile", dockerfile)
+	q.Set("t", tag)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/build?"+q.Encode(), contextTar)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("podman: build %s: %w", tag, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return apiError(resp.StatusCode, data)
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	var streamErr error
+	for {
+		var line buildStreamLine
+		if err := dec.Decode(&line); err != nil {
+			if err == io.EOF {
+				break
+			}
+			// See PullImage's identical reasoning: a captured stream error
+			// takes precedence over a decode failure on whatever comes
+			// after it.
+			if streamErr != nil {
+				break
+			}
+			return fmt.Errorf("podman: build %s: reading stream: %w", tag, err)
+		}
+		if line.Stream != "" {
+			io.WriteString(logSink, line.Stream)
+		}
+		if line.Error != "" {
+			msg := line.Error
+			if line.ErrorDetail != nil && line.ErrorDetail.Message != "" {
+				msg = line.ErrorDetail.Message
+			}
+			streamErr = fmt.Errorf("podman: build %s: %s", tag, msg)
+		}
+	}
+	return streamErr
+}
+
+// ImageExists reports whether ref is present in the local image store, via
+// libpod's GET /images/{ref}/exists: a 204 response means yes, a 404 means
+// no (reported as ok=false, not an error — "the image isn't there" is an
+// expected outcome for this call, not a failure).
+//
+// ref is url.PathEscape'd before being spliced into the path — like every
+// other name/ref this file puts into a URL (see CreateContainer,
+// InspectContainer, EnsureNetwork) — because an image ref routinely
+// contains '/' (a registry namespace) and could in principle contain other
+// reserved characters; splicing it in raw would let a literal '?' get
+// parsed as the start of the query string (silently truncating the path,
+// e.g. swallowing the "/exists" suffix into the query instead) and would
+// let unescaped '/'-delimited ".." segments be interpreted as real path
+// segments by anything that cleans/normalizes the path before routing.
+// libpod decodes the escaped path segment back to the real ref value
+// server-side, mirroring how this client already escapes container/network
+// names.
+func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/exists", nil)
+	if err != nil {
+		return false, fmt.Errorf("podman: checking image %q exists: %w", ref, err)
+	}
+	if status == http.StatusNotFound {
+		return false, nil
+	}
+	if status < 300 {
+		return true, nil
+	}
+	return false, apiError(status, data)
+}
+
+// RemoveImage removes an image by reference. force also removes an image
+// referenced by a stopped container. Removing an already-gone image (404)
+// is treated as success, mirroring RemoveContainer. ref is
+// url.PathEscape'd for the same reason as ImageExists (see its doc
+// comment).
+func (c *Client) RemoveImage(ctx context.Context, ref string, force bool) error {
+	path := "/images/" + url.PathEscape(ref)
+	if force {
+		path += "?force=true"
+	}
+	status, data, err := c.request(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return fmt.Errorf("podman: removing image %q: %w", ref, err)
+	}
+	if status == http.StatusNotFound || status < 300 {
+		return nil
+	}
+	return apiError(status, data)
+}
+
+// imageListEntry is one element of libpod's GET /images/json response —
+// only RepoTags is needed by ListImageTags.
+type imageListEntry struct {
+	RepoTags []string `json:"RepoTags"`
+}
+
+// ListImageTags returns every locally-present image tag matching
+// "<repoPrefix>:*" (e.g. "localhost/basepod/blog:*"), used by the deploy
+// engine's built-image retention to enumerate an app's built tags. The
+// query already filters server-side by reference; the RepoTags prefix
+// check below is a belt-and-suspenders filter against any entry the
+// daemon returns whose tags don't actually match (e.g. a shared image ID
+// also tagged under an unrelated repo).
+func (c *Client) ListImageTags(ctx context.Context, repoPrefix string) ([]string, error) {
+	filters, err := json.Marshal(map[string][]string{"reference": {repoPrefix + ":*"}})
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{}
+	q.Set("filters", string(filters))
+
+	status, data, err := c.request(ctx, http.MethodGet, "/images/json?"+q.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("podman: listing images for %q: %w", repoPrefix, err)
+	}
+	if status >= 300 {
+		return nil, apiError(status, data)
+	}
+
+	var raw []imageListEntry
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("podman: decoding image list response: %w", err)
+	}
+
+	prefix := repoPrefix + ":"
+	var tags []string
+	for _, entry := range raw {
+		for _, rt := range entry.RepoTags {
+			if strings.HasPrefix(rt, prefix) {
+				tags = append(tags, rt)
+			}
+		}
+	}
+	return tags, nil
+}
+
 // EnsureNetwork makes sure a network named name exists, creating it
-// (labeled basepod.managed=true) if it doesn't.
+// (labeled basepod.managed=true) if it doesn't. If it already exists, it
+// self-heals a DNS-disabled network (see selfHealNetworkDNS) — a state
+// that leaves every app container unable to resolve another by name/alias
+// ("bp-<slug>"), and has been observed to arise from an out-of-band
+// `podman network create basepod` (whose CLI default differs from the raw
+// API's, see networkCreate) or a partially-applied config from an older
+// basepod version.
 func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
 	status, data, err := c.request(ctx, http.MethodGet, "/networks/"+url.PathEscape(name)+"/exists", nil)
 	if err != nil {
 		return fmt.Errorf("podman: checking network %q: %w", name, err)
 	}
 	if status < 300 {
-		return nil // already exists
+		return c.selfHealNetworkDNS(ctx, name)
 	}
 	if status != http.StatusNotFound {
 		return apiError(status, data)
@@ -348,6 +566,105 @@ func (c *Client) EnsureNetwork(ctx context.Context, name string) error {
 		return apiError(status, data)
 	}
 	return nil
+}
+
+// selfHealNetworkDNS inspects an already-existing network and, if it has
+// DNS resolution disabled, recreates it with DNS enabled — but ONLY when
+// no basepod-managed container is currently attached to it: recreating a
+// network out from under a running container would break its networking
+// outright, so in that case this just logs a loud warning with manual
+// remediation steps instead. Containers are identified broadly (every
+// basepod.managed=true container, not just ones actually attached to
+// name) since v0.3 has exactly one shared network and every managed
+// container joins it.
+func (c *Client) selfHealNetworkDNS(ctx context.Context, name string) error {
+	info, err := c.InspectNetwork(ctx, name)
+	if err != nil {
+		return fmt.Errorf("podman: inspecting network %q: %w", name, err)
+	}
+	if info.DNSEnabled {
+		return nil
+	}
+
+	containers, err := c.ListContainers(ctx, map[string]string{"basepod.managed": "true"})
+	if err != nil {
+		return fmt.Errorf("podman: listing containers to self-heal network %q: %w", name, err)
+	}
+	if len(containers) > 0 {
+		log.Printf(
+			"podman: WARNING: network %q has DNS resolution disabled but %d basepod container(s) are still attached — "+
+				"refusing to recreate it automatically. Containers won't be able to resolve each other by name. "+
+				"Remediation: stop all basepod apps, run `podman network rm %s`, then restart basepod.",
+			name, len(containers), name,
+		)
+		return nil
+	}
+
+	log.Printf("podman: network %q has DNS resolution disabled and no containers are attached — recreating it with DNS enabled", name)
+	if err := c.RemoveNetwork(ctx, name); err != nil {
+		return fmt.Errorf("podman: removing network %q to self-heal DNS: %w", name, err)
+	}
+	body := networkCreate{
+		Name:       name,
+		Labels:     map[string]string{"basepod.managed": "true"},
+		DNSEnabled: true,
+	}
+	status, data, err := c.request(ctx, http.MethodPost, "/networks/create", body)
+	if err != nil {
+		return fmt.Errorf("podman: recreating network %q: %w", name, err)
+	}
+	if status >= 300 {
+		return apiError(status, data)
+	}
+	return nil
+}
+
+// networkInspectResponse is the subset of libpod's network inspect
+// payload InspectNetwork cares about.
+type networkInspectResponse struct {
+	Name       string `json:"name"`
+	DNSEnabled bool   `json:"dns_enabled"`
+	Subnets    []struct {
+		Gateway string `json:"gateway"`
+	} `json:"subnets"`
+}
+
+// InspectNetwork fetches details for a network by name. Returns
+// ErrNotFound if it doesn't exist.
+func (c *Client) InspectNetwork(ctx context.Context, name string) (*NetworkInfo, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/networks/"+url.PathEscape(name)+"/json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("podman: inspecting network %q: %w", name, err)
+	}
+	if status == http.StatusNotFound {
+		return nil, ErrNotFound
+	}
+	if status >= 300 {
+		return nil, apiError(status, data)
+	}
+
+	var raw networkInspectResponse
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("podman: decoding network inspect response for %q: %w", name, err)
+	}
+	gateway := ""
+	if len(raw.Subnets) > 0 {
+		gateway = raw.Subnets[0].Gateway
+	}
+	return &NetworkInfo{Name: raw.Name, DNSEnabled: raw.DNSEnabled, Gateway: gateway}, nil
+}
+
+// RemoveNetwork removes a network by name. Removing an already-gone
+// network (404) is treated as success.
+func (c *Client) RemoveNetwork(ctx context.Context, name string) error {
+	status, data, err := c.request(ctx, http.MethodDelete, "/networks/"+url.PathEscape(name), nil)
+	if err != nil {
+		return fmt.Errorf("podman: removing network %q: %w", name, err)
+	}
+	if status == http.StatusNotFound || status < 300 {
+		return nil
+	}
+	return apiError(status, data)
 }
 
 // CreateContainer creates a container from spec and returns its ID.
@@ -449,16 +766,64 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, force bool) err
 }
 
 // inspectResponse is the subset of libpod's container inspect payload
-// InspectContainer cares about.
+// InspectContainer cares about. ImageName is the human-readable image
+// reference (e.g. "docker.io/library/caddy:2.10-alpine"), as opposed to
+// the top-level "Image" field (an ID digest) — verified against a live
+// libpod 5.7.1 daemon. HostConfig.PortBindings is keyed
+// "<containerPort>/<protocol>" (e.g. "80/tcp"); HostPort arrives as a
+// JSON string, not a number.
 type inspectResponse struct {
-	Id    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	Id        string `json:"Id"`
+	Name      string `json:"Name"`
+	ImageName string `json:"ImageName"`
+	State     struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
+	HostConfig struct {
+		PortBindings map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"PortBindings"`
+	} `json:"HostConfig"`
+	Mounts []mountInspectEntry `json:"Mounts"`
+}
+
+// mountInspectEntry is one element of libpod inspect's top-level "Mounts"
+// array. Only bind mounts (Type == "bind") are meaningful to BasePod —
+// every mount it creates is one (see podman.CreateSpec.Mounts) — so
+// parseBindMounts filters to those and drops everything else (e.g. any
+// mount unrelated to basepod that happens to exist).
+type mountInspectEntry struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+}
+
+// parseBindMounts converts libpod inspect's "Mounts" array into
+// []BindMount, keeping only bind-type entries. Callers (caddy.driftReason)
+// compare mounts only as a set of Source→Destination pairs, so ReadOnly is
+// left at its zero value here rather than parsed from the (unused) "RW"
+// field. Sorted by Destination then Source for a deterministic,
+// comparable order, since libpod's Mounts array has no guaranteed
+// ordering.
+func parseBindMounts(raw []mountInspectEntry) []BindMount {
+	var out []BindMount
+	for _, m := range raw {
+		if m.Type != "bind" {
+			continue
+		}
+		out = append(out, BindMount{Source: m.Source, Dest: m.Destination})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Dest != out[j].Dest {
+			return out[i].Dest < out[j].Dest
+		}
+		return out[i].Source < out[j].Source
+	})
+	return out
 }
 
 // InspectContainer fetches details for a container by name or ID.
@@ -484,7 +849,47 @@ func (c *Client) InspectContainer(ctx context.Context, nameOrID string) (*Contai
 		Name:   strings.TrimPrefix(raw.Name, "/"),
 		State:  raw.State.Status,
 		Labels: raw.Config.Labels,
+		Image:  raw.ImageName,
+		Ports:  parsePortBindings(raw.HostConfig.PortBindings),
+		Mounts: parseBindMounts(raw.Mounts),
 	}, nil
+}
+
+// parsePortBindings converts libpod inspect's HostConfig.PortBindings map
+// into []PortMapping. Only TCP bindings are parsed (v0.3 scope — see
+// PortMapping); any entry with an unparseable port number is skipped
+// rather than failing the whole inspect. The result is sorted by
+// ContainerPort (then HostPort) for a deterministic, comparable order,
+// since PortBindings is a map with no inherent ordering.
+func parsePortBindings(bindings map[string][]struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}) []PortMapping {
+	var out []PortMapping
+	for key, entries := range bindings {
+		port, proto, ok := strings.Cut(key, "/")
+		if !ok || proto != "tcp" {
+			continue
+		}
+		containerPort, err := strconv.Atoi(port)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			hostPort, err := strconv.Atoi(e.HostPort)
+			if err != nil {
+				continue
+			}
+			out = append(out, PortMapping{ContainerPort: uint16(containerPort), HostPort: uint16(hostPort)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ContainerPort != out[j].ContainerPort {
+			return out[i].ContainerPort < out[j].ContainerPort
+		}
+		return out[i].HostPort < out[j].HostPort
+	})
+	return out
 }
 
 // listEntry is one element of the libpod container list response.

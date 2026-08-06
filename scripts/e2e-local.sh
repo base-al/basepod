@@ -10,9 +10,18 @@
 # walking-skeleton exit criteria, plus (added in v0.2) env vars (PUT/GET
 # masking, redeploy-injects-into-container via podman inspect), custom
 # domains (POST/DELETE against the rendered Caddy config), log streaming
-# (finite SSE fetch, query-token auth scoped to the logs route only), and
-# the dashboard's static asset pipeline (hashed asset + immutable
-# Cache-Control). Safe to run repeatedly on a dev machine or in CI
+# (finite SSE fetch, query-token auth scoped to the logs route only), the
+# dashboard's static asset pipeline (hashed asset + immutable
+# Cache-Control), and (added in v0.3) the dashboard being served remotely
+# through Caddy over HTTPS at basepod.<root-domain> (proxied to a unix
+# socket only the bp-caddy container can reach — Linux-first, see README),
+# a tarball build-from-source deploy + its build-log endpoint, rollback
+# (deploy v1, deploy v2, roll back to v1, confirm the content flips back
+# without a rebuild), the basepod CLI binary itself driving that same
+# flow (login/apps/deploy/rollback/env/logs) as a client against the
+# server this script just started, and session logout invalidating its
+# token.
+# Safe to run repeatedly on a dev machine or in CI
 # (GitHub Actions ubuntu-24.04 runner with rootless podman); requires a
 # reachable podman socket (`podman machine start` on macOS,
 # `systemctl --user enable --now podman.socket` on Linux).
@@ -30,6 +39,12 @@ LISTEN_ADDR=127.0.0.1:13080
 API_BASE="http://${LISTEN_ADDR}"
 ROOT_DOMAIN=apps.localhost
 SLUG=hello
+# BUILD_SLUG is a second, independent app used only by the tarball
+# build/rollback/CLI section below — kept separate from SLUG so its
+# deployment numbering starts clean at 1 (the rollback-to-1 assertions
+# depend on that) and so it can be created/torn down without disturbing
+# hello's own generation-counted assertions above.
+BUILD_SLUG=buildtest
 IMAGE=docker.io/traefik/whoami:latest
 ADMIN_EMAIL=e2e@example.com
 ADMIN_PASSWORD=e2e-testing-123
@@ -108,8 +123,14 @@ RESULT=FAIL
 # ---------------------------------------------------------------------------
 # Cleanup trap — runs on any exit (success, failure, or set -e abort).
 # Only ever touches: the server process this script started, podman
-# containers labeled basepod.managed=true whose name matches bp-<SLUG>-* or
-# bp-caddy, the basepod network, and this script's own mktemp dirs.
+# containers labeled basepod.managed=true whose name matches bp-<SLUG>-*,
+# bp-<BUILD_SLUG>-*, or bp-caddy, the basepod network, and this script's
+# own mktemp dirs. BUILD_SLUG's containers are normally already gone by
+# this point (its own section deletes the app via the API before this
+# trap ever runs) — this is a backstop for the case where an assertion
+# for BUILD_SLUG fails partway through and the script aborts before
+# reaching that delete, so a leftover container can't trip the
+# preexisting-containers safety check on the next run.
 # ---------------------------------------------------------------------------
 cleanup() {
 	exit_code=$?
@@ -124,7 +145,7 @@ cleanup() {
 	if [ -n "${managed}" ]; then
 		printf '%s\n' "${managed}" | while IFS= read -r name; do
 			case "${name}" in
-			"bp-${SLUG}-"* | bp-caddy)
+			"bp-${SLUG}-"* | "bp-${BUILD_SLUG}-"* | bp-caddy)
 				podman rm -f "${name}" >/dev/null 2>&1 || true
 				;;
 			esac
@@ -143,7 +164,7 @@ cleanup() {
 		fi
 	fi
 
-	rm -rf "${CFG_DIR}" "${DATA_DIR}" "${BIN_DIR}" 2>/dev/null || true
+	rm -rf "${CFG_DIR}" "${DATA_DIR}" "${BIN_DIR}" "${BUILD_DIR:-}" "${TARBALL:-}" 2>/dev/null || true
 
 	exit "${exit_code}"
 }
@@ -200,6 +221,33 @@ asset_path=$(printf '%s' "${index_html}" | grep -o 'src="/assets/[^"]*"' | head 
 asset_headers=$(curl -s -D - -o /dev/null --max-time 10 "${API_BASE}${asset_path}")
 printf '%s' "${asset_headers}" | grep -qi '^HTTP/[0-9.]* 200' || fail "asset ${asset_path} did not return 200: ${asset_headers}"
 printf '%s' "${asset_headers}" | grep -qi '^Cache-Control:.*immutable' || fail "asset ${asset_path} missing immutable Cache-Control: ${asset_headers}"
+
+# ---------------------------------------------------------------------------
+# Dashboard — served automatically by Caddy at https://basepod.<root-domain>,
+# proxied to a unix socket (data_dir/caddy-sock/api.sock) that only the
+# bp-caddy container can reach — bind-mounted into it alone, at
+# DashboardSockMountDest (see internal/caddy.Manager and
+# internal/server.Run/prepareDashboardListener). This works out of the box
+# on Linux, rootless included (this CI runner: ubuntu-24.04 rootless
+# podman); macOS podman-machine cannot, since its virtiofs bind mounts
+# don't carry unix sockets across the VM boundary — see README's Remote
+# access section for the macOS fallback.
+# ---------------------------------------------------------------------------
+DASHBOARD_DOMAIN="basepod.${ROOT_DOMAIN}"
+CADDY_CONFIG="${DATA_DIR}/caddy/current.json"
+
+log "verifying the dashboard route landed in caddy's config..."
+[ -f "${CADDY_CONFIG}" ] || fail "caddy config not found at ${CADDY_CONFIG}"
+grep -q "${DASHBOARD_DOMAIN}" "${CADDY_CONFIG}" || fail "caddy config does not contain the dashboard hostname ${DASHBOARD_DOMAIN}"
+
+dashboard_up() {
+	curl -sk --max-time 5 \
+		--resolve "${DASHBOARD_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
+		"https://${DASHBOARD_DOMAIN}:${HTTPS_PORT}/" 2>/dev/null | grep -q '<div id="app"'
+}
+if ! wait_for "dashboard reachable over HTTPS at ${DASHBOARD_DOMAIN}" "${MAX_WAIT}" dashboard_up; then
+	fail "dashboard not reachable via HTTPS at ${DASHBOARD_DOMAIN} within ${MAX_WAIT}s"
+fi
 
 # ---------------------------------------------------------------------------
 # Login
@@ -315,9 +363,9 @@ get_secret_value=$(printf '%s' "${env_get_resp}" | jq -r '.[] | select(.key=="E2
 
 # ---------------------------------------------------------------------------
 # Domains — a custom hostname must land in Caddy's rendered config on
-# POST, and disappear from it on DELETE.
+# POST, and disappear from it on DELETE. (CADDY_CONFIG is set above, in the
+# Dashboard section.)
 # ---------------------------------------------------------------------------
-CADDY_CONFIG="${DATA_DIR}/caddy/current.json"
 CUSTOM_DOMAIN=e2e-custom.example.com
 
 log "adding custom domain '${CUSTOM_DOMAIN}'..."
@@ -360,6 +408,210 @@ printf '%s' "${logs_output}" | grep -q '"stream"' || fail "logs stream missing a
 log "verifying query-token auth is rejected outside the logs route..."
 apps_query_token_code=$(http_code "${API_BASE}/api/v1/apps?access_token=${TOKEN}")
 [ "${apps_query_token_code}" = "401" ] || fail "expected /api/v1/apps with ?access_token= to be 401, got ${apps_query_token_code}"
+
+# ---------------------------------------------------------------------------
+# Tarball build deploy — a fresh app (BUILD_SLUG, not SLUG — see its
+# definition above), deployed from an uploaded gzipped tar build context
+# (a Containerfile + one static file) rather than a registry image. This
+# exercises the v0.3 build pipeline end to end: gzip decompress -> tar
+# validate -> podman build -> the same probe-gated rollout every other
+# deploy path in this script already uses.
+# ---------------------------------------------------------------------------
+log "creating app '${BUILD_SLUG}' for tarball/rollback/CLI coverage..."
+build_create_resp=$(auth_curl -X POST "${API_BASE}/api/v1/apps" \
+	-d "{\"name\":\"${BUILD_SLUG}\",\"image\":\"${IMAGE}\",\"port\":80}")
+build_created_slug=$(printf '%s' "${build_create_resp}" | jq -r '.slug // empty')
+[ "${build_created_slug}" = "${BUILD_SLUG}" ] || fail "create app ${BUILD_SLUG} failed: ${build_create_resp}"
+
+BUILD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/basepod-e2e-build.XXXXXX")
+TARBALL="${BUILD_DIR}.tar.gz"
+
+# busybox httpd: -f keeps it in the foreground (required — a daemonizing
+# CMD would exit 0 immediately and the container would never pass its
+# health probe), -v logs each request (so the CLI `logs` assertion further
+# down has a line to read), -p is the listen port (must match the app's
+# port set above, 80), -h is the document root COPY places the fixture
+# under. The health probe (and every "does it serve the right content"
+# assertion below) requests "/" — busybox httpd's directory handler only
+# auto-serves a file named index.html, so the fixture must land at
+# /www/index.html, not /www/index.txt, or every request for "/" 404s and
+# the deploy never reaches "healthy".
+cat >"${BUILD_DIR}/Containerfile" <<'EOF'
+FROM docker.io/library/busybox:latest
+COPY index.txt /www/index.html
+CMD ["httpd", "-f", "-v", "-p", "80", "-h", "/www"]
+EOF
+printf '%s' "e2e-build-v1" >"${BUILD_DIR}/index.txt"
+tar czf "${TARBALL}" -C "${BUILD_DIR}" .
+
+log "deploying '${BUILD_SLUG}' from an uploaded tarball (v1)..."
+build1_resp=$(deploy_curl -X POST -H "Content-Type: application/gzip" \
+	--data-binary @"${TARBALL}" \
+	"${API_BASE}/api/v1/apps/${BUILD_SLUG}/deploy/tarball")
+build1_status=$(printf '%s' "${build1_resp}" | jq -r '.status // empty')
+build1_source=$(printf '%s' "${build1_resp}" | jq -r '.source // empty')
+[ "${build1_status}" = "healthy" ] || fail "tarball deploy (v1) failed: ${build1_resp}"
+[ "${build1_source}" = "tarball" ] || fail "tarball deploy (v1): expected source=tarball, got ${build1_source}: ${build1_resp}"
+
+EXPECTED_CONTENT="e2e-build-v1"
+buildtest_serves() {
+	body=$(curl -sk --max-time 5 \
+		--resolve "${BUILD_SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
+		"https://${BUILD_SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}/" 2>/dev/null || true)
+	printf '%s' "${body}" | grep -q "${EXPECTED_CONTENT}"
+}
+if ! wait_for "built app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
+	fail "built app did not serve ${EXPECTED_CONTENT} via HTTPS within ${MAX_WAIT}s"
+fi
+
+log "fetching the build log for deployment 1..."
+buildlog1_raw=$(auth_curl -w '\n%{http_code}' "${API_BASE}/api/v1/apps/${BUILD_SLUG}/deployments/1/log")
+buildlog1_code=$(printf '%s' "${buildlog1_raw}" | tail -n1)
+buildlog1_body=$(printf '%s' "${buildlog1_raw}" | sed '$d')
+[ "${buildlog1_code}" = "200" ] || fail "build log: expected 200, got ${buildlog1_code}: ${buildlog1_body}"
+[ -n "${buildlog1_body}" ] || fail "build log: unexpectedly empty"
+printf '%s' "${buildlog1_body}" | grep -qE 'COMMIT|busybox' || fail "build log missing expected build output (COMMIT/busybox pull lines): ${buildlog1_body}"
+
+# ---------------------------------------------------------------------------
+# Rollback — a second tarball deploy (v2) must cut traffic over, and
+# rolling back to deployment 1 must bring v1's content back by reusing its
+# already-built local image tag, without rebuilding.
+# ---------------------------------------------------------------------------
+printf '%s' "e2e-build-v2" >"${BUILD_DIR}/index.txt"
+tar czf "${TARBALL}" -C "${BUILD_DIR}" .
+
+log "deploying '${BUILD_SLUG}' from an uploaded tarball (v2)..."
+build2_resp=$(deploy_curl -X POST -H "Content-Type: application/gzip" \
+	--data-binary @"${TARBALL}" \
+	"${API_BASE}/api/v1/apps/${BUILD_SLUG}/deploy/tarball")
+build2_status=$(printf '%s' "${build2_resp}" | jq -r '.status // empty')
+[ "${build2_status}" = "healthy" ] || fail "tarball deploy (v2) failed: ${build2_resp}"
+
+EXPECTED_CONTENT="e2e-build-v2"
+if ! wait_for "built app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
+	fail "built app did not serve ${EXPECTED_CONTENT} via HTTPS within ${MAX_WAIT}s"
+fi
+
+log "rolling back '${BUILD_SLUG}' to deployment 1..."
+rollback1_raw=$(deploy_curl -w '\n%{http_code}' -X POST "${API_BASE}/api/v1/apps/${BUILD_SLUG}/rollback" \
+	-d '{"number":1}')
+rollback1_code=$(printf '%s' "${rollback1_raw}" | tail -n1)
+rollback1_body=$(printf '%s' "${rollback1_raw}" | sed '$d')
+[ "${rollback1_code}" = "200" ] || fail "rollback: expected 200, got ${rollback1_code}: ${rollback1_body}"
+rollback1_trigger=$(printf '%s' "${rollback1_body}" | jq -r '.trigger // empty')
+[ "${rollback1_trigger}" = "rollback" ] || fail "rollback: expected trigger=rollback, got ${rollback1_trigger}: ${rollback1_body}"
+
+EXPECTED_CONTENT="e2e-build-v1"
+if ! wait_for "rolled-back app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
+	fail "app did not serve ${EXPECTED_CONTENT} after rollback within ${MAX_WAIT}s"
+fi
+
+# ---------------------------------------------------------------------------
+# CLI — drives the same running server through the basepod binary's own
+# client commands rather than raw curl, against its own config file
+# (BASEPOD_CLI_CONFIG, separate from any real ~/.config/basepod/cli.yaml
+# on this machine — see internal/cli's configPathEnv).
+# ---------------------------------------------------------------------------
+CLI_CFG="${CFG_DIR}/cli.yaml"
+
+log "cli: logging in..."
+if ! printf '%s\n' "${ADMIN_PASSWORD}" |
+	BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" login "${API_BASE}" --email "${ADMIN_EMAIL}"; then
+	fail "cli login failed"
+fi
+
+log "cli: listing apps..."
+cli_apps_json=$(BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" apps --json)
+printf '%s' "${cli_apps_json}" | grep -q "\"${BUILD_SLUG}\"" || fail "cli apps --json missing ${BUILD_SLUG}: ${cli_apps_json}"
+
+log "cli: deploying '${BUILD_SLUG}' from source (v2 content again)..."
+if ! BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" deploy "${BUILD_DIR}" -a "${BUILD_SLUG}"; then
+	fail "cli deploy failed"
+fi
+EXPECTED_CONTENT="e2e-build-v2"
+if ! wait_for "cli-deployed app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
+	fail "cli deploy: app did not serve ${EXPECTED_CONTENT} within ${MAX_WAIT}s"
+fi
+
+log "cli: rolling back '${BUILD_SLUG}' to deployment 1..."
+if ! BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" rollback "${BUILD_SLUG}" 1; then
+	fail "cli rollback failed"
+fi
+EXPECTED_CONTENT="e2e-build-v1"
+if ! wait_for "cli-rolled-back app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
+	fail "cli rollback: app did not serve ${EXPECTED_CONTENT} within ${MAX_WAIT}s"
+fi
+
+log "cli: setting E2E_CLI env var and redeploying to pick it up..."
+if ! BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" env set "${BUILD_SLUG}" E2E_CLI=1; then
+	fail "cli env set failed"
+fi
+if ! BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" deploy "${BUILD_DIR}" -a "${BUILD_SLUG}"; then
+	fail "cli redeploy (to pick up env) failed"
+fi
+EXPECTED_CONTENT="e2e-build-v2"
+if ! wait_for "cli env-redeployed app serving ${EXPECTED_CONTENT}" "${MAX_WAIT}" buildtest_serves; then
+	fail "cli env redeploy: app did not serve ${EXPECTED_CONTENT} within ${MAX_WAIT}s"
+fi
+
+log "cli: verifying E2E_CLI landed in the new container's env..."
+latest_build_number=$(auth_curl "${API_BASE}/api/v1/apps/${BUILD_SLUG}" | jq -r '.deployments | map(.number) | max')
+build_container_env=$(podman inspect "bp-${BUILD_SLUG}-${latest_build_number}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)
+printf '%s\n' "${build_container_env}" | grep -qxF "E2E_CLI=1" || fail "bp-${BUILD_SLUG}-${latest_build_number} env missing E2E_CLI=1: ${build_container_env}"
+
+log "cli: generating a log line and fetching it via 'basepod logs'..."
+curl -sk --max-time 5 \
+	--resolve "${BUILD_SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
+	"https://${BUILD_SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}/" >/dev/null 2>&1 || true
+cli_logs_out=$(BASEPOD_CLI_CONFIG="${CLI_CFG}" "${BIN_PATH}" logs "${BUILD_SLUG}" --tail 5)
+[ -n "${cli_logs_out}" ] || fail "cli logs: expected at least one line, got none"
+
+# ---------------------------------------------------------------------------
+# Tear down the build/rollback/CLI app now, independently of hello's own
+# delete section below — it must not linger and trip the safety pre-check
+# (or need the cleanup trap's backstop) on the next run.
+# ---------------------------------------------------------------------------
+log "deleting app '${BUILD_SLUG}'..."
+# Uses deploy_curl's generous budget, not http_code's fixed 5s: by this
+# point in the script the runner has just finished six build+rollout
+# cycles back to back, and RemoveApp's container-stop-and-remove plus a
+# route reapply can occasionally run long on a loaded CI runner (observed
+# 30-50s elsewhere in this same run) — a tight timeout here would read as
+# a false failure ("000"), not an actual bug.
+build_delete_raw=$(deploy_curl -w '\n%{http_code}' -X DELETE "${API_BASE}/api/v1/apps/${BUILD_SLUG}" || true)
+build_delete_code=$(printf '%s' "${build_delete_raw}" | tail -n1)
+build_delete_body=$(printf '%s' "${build_delete_raw}" | sed '$d')
+[ "${build_delete_code}" = "204" ] || fail "delete app ${BUILD_SLUG}: expected 204, got ${build_delete_code}: ${build_delete_body}"
+
+buildtest_route_gone() {
+	body=$(curl -sk --max-time 5 \
+		--resolve "${BUILD_SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
+		"https://${BUILD_SLUG}.${ROOT_DOMAIN}:${HTTPS_PORT}/" 2>/dev/null || true)
+	! printf '%s' "${body}" | grep -q "e2e-build-"
+}
+if ! wait_for "route removed from Caddy for ${BUILD_SLUG}" "${MAX_WAIT}" buildtest_route_gone; then
+	fail "${BUILD_SLUG} still reachable via HTTPS after DELETE — route was not dropped"
+fi
+
+# ---------------------------------------------------------------------------
+# Logout — POST /auth/logout must invalidate the session token it's given.
+# Verified against a freshly-issued token (not $TOKEN, still needed below
+# for hello's own delete) so this can run as the very last piece of API
+# work before the final cleanup, per the task brief's own ordering (a
+# logout test that killed $TOKEN any earlier would break every assertion
+# after it).
+# ---------------------------------------------------------------------------
+log "logging in a throwaway session to exercise logout..."
+logout_login_resp=$(curl -s --max-time 10 -X POST "${API_BASE}/api/v1/auth/login" \
+	-d "{\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASSWORD}\"}")
+LOGOUT_TOKEN=$(printf '%s' "${logout_login_resp}" | jq -r '.token // empty')
+[ -n "${LOGOUT_TOKEN}" ] || fail "logout: throwaway login failed: ${logout_login_resp}"
+
+logout_code=$(http_code -X POST -H "Authorization: Bearer ${LOGOUT_TOKEN}" "${API_BASE}/api/v1/auth/logout")
+[ "${logout_code}" = "204" ] || fail "logout: expected 204, got ${logout_code}"
+
+me_after_logout_code=$(http_code -H "Authorization: Bearer ${LOGOUT_TOKEN}" "${API_BASE}/api/v1/auth/me")
+[ "${me_after_logout_code}" = "401" ] || fail "logout: /auth/me expected 401 after logout, got ${me_after_logout_code}"
 
 # ---------------------------------------------------------------------------
 # Delete app — route must be dropped from Caddy

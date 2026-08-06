@@ -33,6 +33,17 @@ type fakeRuntime struct {
 	startErr   error
 	pullErr    error
 	networkErr error
+	stopErr    error
+	removeErr  error
+
+	// imageExists is both ImageExists's canned answer and, once a
+	// PullImage call succeeds, gets set true — mirroring a real registry
+	// pull making a subsequent ImageExists check on the same ref come back
+	// true. That statefulness is what lets a single test prove create()'s
+	// own ImageExists check (see ensureImage) skips PullImage the second
+	// time around after Ensure's drift branch already pulled the image.
+	imageExists    bool
+	imageExistsErr error
 }
 
 func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
@@ -42,7 +53,19 @@ func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
 
 func (f *fakeRuntime) PullImage(ctx context.Context, ref string) error {
 	f.calls = append(f.calls, "PullImage")
-	return f.pullErr
+	if f.pullErr != nil {
+		return f.pullErr
+	}
+	f.imageExists = true
+	return nil
+}
+
+func (f *fakeRuntime) ImageExists(ctx context.Context, ref string) (bool, error) {
+	f.calls = append(f.calls, "ImageExists")
+	if f.imageExistsErr != nil {
+		return false, f.imageExistsErr
+	}
+	return f.imageExists, nil
 }
 
 func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error) {
@@ -71,6 +94,16 @@ func (f *fakeRuntime) InspectContainer(ctx context.Context, nameOrID string) (*p
 	return f.inspectInfo, nil
 }
 
+func (f *fakeRuntime) StopContainer(ctx context.Context, id string, timeoutSec int) error {
+	f.calls = append(f.calls, "StopContainer")
+	return f.stopErr
+}
+
+func (f *fakeRuntime) RemoveContainer(ctx context.Context, id string, force bool) error {
+	f.calls = append(f.calls, "RemoveContainer")
+	return f.removeErr
+}
+
 // fakeExecer is a test double for Execer: it records the argv of every
 // invocation. If errSequence is set, each call pops and returns the next
 // entry (nil entries count as success); once exhausted, err (which may
@@ -92,6 +125,17 @@ func (f *fakeExecer) Exec(ctx context.Context, container string, cmd ...string) 
 	return f.err
 }
 
+// TestDashboardSockDial proves the Caddy dial string built for the
+// dashboard's unix socket follows the same "unix/" + absolute-path
+// pattern as AdminSocket, giving the exact form Caddy's docs (and this
+// package's own admin-socket usage) expect: "unix//run/basepod/api.sock".
+func TestDashboardSockDial(t *testing.T) {
+	want := "unix//run/basepod/api.sock"
+	if got := DashboardSockDial(); got != want {
+		t.Errorf("DashboardSockDial() = %q, want %q", got, want)
+	}
+}
+
 func TestEnsureCreatesWhenMissing(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
@@ -104,7 +148,7 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 
-	wantCalls := []string{"EnsureNetwork", "InspectContainer", "PullImage", "CreateContainer", "StartContainer"}
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage", "CreateContainer", "StartContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v", fr.calls, wantCalls)
 	}
@@ -132,10 +176,11 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	}
 
 	dataDir := filepath.Join(filepath.Dir(configDir), "caddy-data")
+	sockDir := filepath.Join(filepath.Dir(configDir), "caddy-sock")
 	// Mount sources are resolved to their real (symlink-free) path (see
 	// manager.go's create): on macOS, t.TempDir() lives under /var/folders,
 	// itself a symlink to /private/var/folders, so the resolved path
-	// differs from configDir/dataDir as constructed above.
+	// differs from configDir/dataDir/sockDir as constructed above.
 	wantConfigSrc, err := filepath.EvalSymlinks(configDir)
 	if err != nil {
 		t.Fatalf("EvalSymlinks(configDir): %v", err)
@@ -144,9 +189,14 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks(dataDir): %v", err)
 	}
+	wantSockSrc, err := filepath.EvalSymlinks(sockDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(sockDir): %v", err)
+	}
 	wantMounts := []podman.BindMount{
 		{Source: wantConfigSrc, Dest: "/etc/caddy"},
 		{Source: wantDataSrc, Dest: "/data"},
+		{Source: wantSockSrc, Dest: DashboardSockMountDest},
 	}
 	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
 		t.Errorf("spec.Mounts = %+v, want %+v", spec.Mounts, wantMounts)
@@ -163,6 +213,15 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	if fi, err := os.Stat(dataDir); err != nil || !fi.IsDir() {
 		t.Errorf("caddy-data dir not created at %s: %v", dataDir, err)
 	}
+	if fi, err := os.Stat(sockDir); err != nil || !fi.IsDir() {
+		t.Errorf("caddy-sock dir not created at %s: %v", sockDir, err)
+	} else if perm := fi.Mode().Perm(); perm&0o007 != 0 {
+		// The umask in effect may strip bits MkdirAll(0o750) requested, so
+		// this only asserts the property that actually matters (no
+		// "other" access), rather than an exact 0750 match that could be
+		// legitimately narrower under a stricter umask.
+		t.Errorf("caddy-sock dir mode = %o, want no world-accessible bits", perm)
+	}
 
 	got, err := os.ReadFile(filepath.Join(configDir, "current.json"))
 	if err != nil {
@@ -173,11 +232,58 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 	}
 }
 
+// matchingPorts is the {80,443} -> {8080,8443} port set every drift test
+// in this file builds its Manager against (NewManager(..., 8080, 8443)),
+// so a fakeRuntime.inspectInfo carrying these plus Image: Image
+// represents an existing container with no drift.
+var matchingPorts = []podman.PortMapping{
+	{ContainerPort: 80, HostPort: 8080},
+	{ContainerPort: 443, HostPort: 8443},
+}
+
+// wantMounts computes the desired bind-mount set (config, data, and
+// socket dirs, all resolved through EvalSymlinks exactly as
+// manager.go's resolvedMountSources does) for a Manager rooted at
+// configDir, so a "no drift" test can build a fakeRuntime.inspectInfo
+// whose Mounts matches it. It also creates the three directories (via
+// MkdirAll, mirroring resolvedMountSources), since EvalSymlinks requires
+// them to exist.
+func wantMounts(t *testing.T, configDir string) []podman.BindMount {
+	t.Helper()
+	dataDir := filepath.Join(filepath.Dir(configDir), "caddy-data")
+	sockDir := filepath.Join(filepath.Dir(configDir), "caddy-sock")
+	for _, d := range []string{configDir, dataDir, sockDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", d, err)
+		}
+	}
+	configSrc, err := filepath.EvalSymlinks(configDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(configDir): %v", err)
+	}
+	dataSrc, err := filepath.EvalSymlinks(dataDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(dataDir): %v", err)
+	}
+	sockSrc, err := filepath.EvalSymlinks(sockDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(sockDir): %v", err)
+	}
+	return []podman.BindMount{
+		{Source: configSrc, Dest: "/etc/caddy"},
+		{Source: dataSrc, Dest: "/data"},
+		{Source: sockSrc, Dest: DashboardSockMountDest},
+	}
+}
+
 func TestEnsureStartsWhenStopped(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
 
-	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{ID: "abc123", Name: ContainerName, State: "exited"}}
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "exited",
+		Image: Image, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
+	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
@@ -195,7 +301,10 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
 
-	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{ID: "abc123", Name: ContainerName, State: "running"}}
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image, Ports: matchingPorts, Mounts: wantMounts(t, configDir),
+	}}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
@@ -206,6 +315,266 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v", fr.calls, wantCalls)
+	}
+}
+
+// wantRecreateCalls is the call sequence Ensure makes when it decides an
+// existing bp-caddy container has drifted and the image needs pulling
+// (fakeRuntime's default imageExists: false): confirm+pull the image
+// BEFORE touching the old container, then stop+remove it, then the same
+// image-check+create+start sequence as a first-run create() — except
+// create()'s own ImageExists call (second in this list) finds the image
+// already present (the fakeRuntime's PullImage sets imageExists true) and
+// so does not pull it again.
+var wantRecreateCalls = []string{
+	"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage",
+	"StopContainer", "RemoveContainer", "ImageExists", "CreateContainer", "StartContainer",
+}
+
+// TestEnsureRecreatesWhenStateCreated proves a container stuck in the
+// "created" state (made but never started successfully — the known
+// stale-port-mapping issue's original symptom) is stopped, removed, and
+// recreated, even though its image and ports otherwise match exactly.
+func TestEnsureRecreatesWhenStateCreated(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "created",
+		Image: Image, Ports: matchingPorts,
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+	if fr.createSpec.Name != ContainerName {
+		t.Errorf("recreated spec.Name = %q, want %q", fr.createSpec.Name, ContainerName)
+	}
+}
+
+// TestEnsureRecreatesOnImageMismatch proves a running container whose
+// image no longer matches the pinned Image const (e.g. after a basepod
+// upgrade bumps the Caddy version) is recreated rather than left running
+// the stale image.
+func TestEnsureRecreatesOnImageMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: "docker.io/library/caddy:2.9-alpine", Ports: matchingPorts,
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+}
+
+// TestEnsureRecreatesOnPortMismatch proves a running container whose
+// inspected host ports don't match the currently configured
+// httpPort/httpsPort (the known stale-port-mapping issue: e.g. basepod
+// was reconfigured to a new HTTP port but bp-caddy was never recreated)
+// is recreated with the current port mapping.
+func TestEnsureRecreatesOnPortMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image,
+		Ports: []podman.PortMapping{
+			{ContainerPort: 80, HostPort: 9090}, // stale: mgr wants 8080
+			{ContainerPort: 443, HostPort: 8443},
+		},
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+	wantPorts := []podman.PortMapping{
+		{ContainerPort: 80, HostPort: 8080},
+		{ContainerPort: 443, HostPort: 8443},
+	}
+	if !reflect.DeepEqual(fr.createSpec.PortMappings, wantPorts) {
+		t.Errorf("recreated spec.PortMappings = %+v, want %+v", fr.createSpec.PortMappings, wantPorts)
+	}
+}
+
+// TestEnsureNoopWhenAllMatch is the drift matrix's negative case: a
+// running container whose state, image, ports, and mounts (regardless of
+// declaration order) all match the desired spec exactly must not be
+// touched at all.
+func TestEnsureNoopWhenAllMatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	mounts := wantMounts(t, configDir)
+	// Deliberately reversed order vs. desiredMounts() too, to prove that
+	// comparison is set-based, not positional, exactly like ports below.
+	reversedMounts := []podman.BindMount{mounts[2], mounts[1], mounts[0]}
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image,
+		// Deliberately reversed order vs. desiredPorts() to prove the
+		// comparison is set-based, not positional.
+		Ports: []podman.PortMapping{
+			{ContainerPort: 443, HostPort: 8443},
+			{ContainerPort: 80, HostPort: 8080},
+		},
+		Mounts: reversedMounts,
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	wantCalls := []string{"EnsureNetwork", "InspectContainer"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no drift — must not stop/remove/recreate)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureRecreatesOnMountMismatch proves a running container whose
+// inspected bind mounts don't match the currently desired set is
+// recreated with the correct mounts — the case that matters most in
+// practice: a bp-caddy container created by a pre-dashboard BasePod build
+// (missing the caddy-sock mount entirely) must be recreated on upgrade so
+// it picks up the new mount, rather than running forever without it.
+func TestEnsureRecreatesOnMountMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{
+		ID: "abc123", Name: ContainerName, State: "running",
+		Image: Image, Ports: matchingPorts,
+		// No caddy-sock mount at all — as an old (pre-dashboard) bp-caddy
+		// container would report.
+		Mounts: []podman.BindMount{
+			{Source: "/old/config", Dest: "/etc/caddy"},
+			{Source: "/old/data", Dest: "/data"},
+		},
+	}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v", fr.calls, wantRecreateCalls)
+	}
+
+	want := wantMounts(t, configDir)
+	if !reflect.DeepEqual(fr.createSpec.Mounts, want) {
+		t.Errorf("recreated spec.Mounts = %+v, want %+v", fr.createSpec.Mounts, want)
+	}
+}
+
+// TestEnsureDriftRecreatePullFailureLeavesOldContainer proves the ordering
+// fix at the heart of this change: if the image needs pulling and the pull
+// fails (registry blip, rate limit), the old drifted container must never
+// be stopped or removed — StopContainer/RemoveContainer must not appear in
+// the call log at all — so a transient pull failure never leaves the host
+// with zero ingress. Ensure must surface the pull error.
+func TestEnsureDriftRecreatePullFailureLeavesOldContainer(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	pullErr := errors.New("registry: rate limited")
+	fr := &fakeRuntime{
+		inspectInfo: &podman.ContainerInfo{
+			ID: "abc123", Name: ContainerName, State: "created",
+			Image: Image, Ports: matchingPorts,
+		},
+		imageExists: false,
+		pullErr:     pullErr,
+	}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	err := mgr.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure: expected error, got nil")
+	}
+	if !errors.Is(err, pullErr) {
+		t.Fatalf("Ensure error = %v, want wrapping %v", err, pullErr)
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (old container must never be stopped/removed on pull failure)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureDriftRecreateSkipsPullWhenImageCached proves the drift-recreate
+// path never calls PullImage at all when the image is already present
+// locally — the fix's other half: a cached image must not create a new
+// online dependency (registry reachability) that a purely-local recreate
+// (e.g. a port-mapping or mount drift, nothing to do with the image)
+// doesn't otherwise need.
+func TestEnsureDriftRecreateSkipsPullWhenImageCached(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{
+		inspectInfo: &podman.ContainerInfo{
+			ID: "abc123", Name: ContainerName, State: "created",
+			Image: Image, Ports: matchingPorts,
+		},
+		imageExists: true,
+	}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	wantCalls := []string{
+		"EnsureNetwork", "InspectContainer", "ImageExists",
+		"StopContainer", "RemoveContainer", "ImageExists", "CreateContainer", "StartContainer",
+	}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no PullImage call — image already present)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureCreateSkipsPullWhenImageCached covers the same "no unnecessary
+// pull" fix on the plain first-run create() path (no existing container at
+// all), not just drift-recreate: a cached image must not pull there
+// either.
+func TestEnsureCreateSkipsPullWhenImageCached(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectErr: podman.ErrNotFound, imageExists: true}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "CreateContainer", "StartContainer"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no PullImage call — image already present)", fr.calls, wantCalls)
 	}
 }
 
@@ -221,7 +590,7 @@ func TestApplyWritesAndReloads(t *testing.T) {
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
 	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
-	if err := mgr.Apply(context.Background(), routes); err != nil {
+	if err := mgr.Apply(context.Background(), routes, nil); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -238,6 +607,37 @@ func TestApplyWritesAndReloads(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fe.calls, wantCalls) {
 		t.Fatalf("exec calls = %v, want %v", fe.calls, wantCalls)
+	}
+}
+
+// TestApplyWritesDashboardRoute proves a non-nil dashboard argument lands
+// in the written current.json alongside the app routes.
+func TestApplyWritesDashboardRoute(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := &fakeRuntime{}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	routes := []AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.example.com"}, Upstream: "bp-blog:8080"}}
+	dashboard := &DashboardRoute{Hostname: "basepod.apps.example.com", Upstream: DashboardSockDial()}
+	if err := mgr.Apply(context.Background(), routes, dashboard); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(configDir, "current.json"))
+	if err != nil {
+		t.Fatalf("reading current.json: %v", err)
+	}
+	if !strings.Contains(string(got), "basepod.apps.example.com") {
+		t.Errorf("current.json missing dashboard hostname, got: %s", got)
+	}
+	if !strings.Contains(string(got), DashboardSockDial()) {
+		t.Errorf("current.json missing dashboard upstream, got: %s", got)
 	}
 }
 
@@ -264,7 +664,7 @@ func TestApplyRetriesReloadOnTransientFailure(t *testing.T) {
 	fe := &fakeExecer{errSequence: []error{transient, transient, nil}}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
-	if err := mgr.Apply(context.Background(), nil); err != nil {
+	if err := mgr.Apply(context.Background(), nil, nil); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if len(fe.calls) != 3 {
@@ -291,7 +691,7 @@ func TestApplyFailsAfterExhaustingReloadRetries(t *testing.T) {
 	fe := &fakeExecer{err: persistent}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
-	err := mgr.Apply(context.Background(), nil)
+	err := mgr.Apply(context.Background(), nil, nil)
 	if err == nil {
 		t.Fatal("Apply: expected error, got nil")
 	}

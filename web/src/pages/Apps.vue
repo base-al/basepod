@@ -41,8 +41,8 @@ const columns: TableColumn<App>[] = [
   { accessorKey: 'port', header: 'Port' },
 ]
 
-function handleLogout() {
-  auth.logout()
+async function handleLogout() {
+  await auth.logout()
   router.push({ name: 'login' })
 }
 </script>

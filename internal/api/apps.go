@@ -2,15 +2,17 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/base-al/basepod/internal/build"
+	"github.com/base-al/basepod/internal/deploy"
 	"github.com/base-al/basepod/internal/store"
 )
 
@@ -39,22 +41,28 @@ func toAppResponse(app *store.App) appResponse {
 }
 
 type deploymentResponse struct {
-	Number     int    `json:"number"`
-	Image      string `json:"image"`
-	Status     string `json:"status"`
-	Error      string `json:"error"`
-	StartedAt  string `json:"started_at"`
-	FinishedAt string `json:"finished_at"`
+	Number      int    `json:"number"`
+	Image       string `json:"image"`
+	Status      string `json:"status"`
+	Error       string `json:"error"`
+	StartedAt   string `json:"started_at"`
+	FinishedAt  string `json:"finished_at"`
+	Source      string `json:"source"`
+	Trigger     string `json:"trigger"`
+	HasBuildLog bool   `json:"has_build_log"`
 }
 
 func toDeploymentResponse(d store.Deployment) deploymentResponse {
 	return deploymentResponse{
-		Number:     d.Number,
-		Image:      d.ImageRef,
-		Status:     d.Status,
-		Error:      d.Error,
-		StartedAt:  d.StartedAt,
-		FinishedAt: d.FinishedAt,
+		Number:      d.Number,
+		Image:       d.ImageRef,
+		Status:      d.Status,
+		Error:       d.Error,
+		StartedAt:   d.StartedAt,
+		FinishedAt:  d.FinishedAt,
+		Source:      d.Source,
+		Trigger:     d.TriggerKind,
+		HasBuildLog: d.BuildLogPath != "",
 	}
 }
 
@@ -75,8 +83,7 @@ type createAppRequest struct {
 // constraint.
 func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	var req createAppRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if !readJSON(w, r, &req) {
 		return
 	}
 
@@ -92,6 +99,35 @@ func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Port < 1 || req.Port > 65535 {
 		writeError(w, http.StatusUnprocessableEntity, "validation", "port must be between 1 and 65535")
+		return
+	}
+
+	rootDomain, err := a.st.Setting("root_domain")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to read root domain")
+		return
+	}
+	dashboardDomain, err := a.st.Setting("dashboard_domain")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to read dashboard domain")
+		return
+	}
+	// See the matching check in domains.go's handleAddDomain: "" (unset)
+	// and the literal "off" both mean the dashboard isn't actually routed
+	// anywhere, so neither is a real collision.
+	if dashboardDomain != "" && dashboardDomain != "off" && slug+"."+rootDomain == dashboardDomain {
+		writeError(w, http.StatusUnprocessableEntity, "validation", "app slug's generated hostname collides with the dashboard domain")
+		return
+	}
+
+	// Check for bidirectional hostname collision: reject if the generated
+	// hostname (slug + "." + root_domain) matches an existing custom domain.
+	generatedHostname := slug + "." + rootDomain
+	if _, err := a.st.DomainByHostname(generatedHostname); err == nil {
+		writeError(w, http.StatusUnprocessableEntity, "validation", "app slug's generated hostname collides with an existing custom domain")
+		return
+	} else if !errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to check for hostname collision")
 		return
 	}
 
@@ -195,8 +231,8 @@ func (a *api) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req deployRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed request body")
+	if err := decodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		writeDecodeError(w, err)
 		return
 	}
 
@@ -215,6 +251,140 @@ func (a *api) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
+}
+
+type rollbackRequest struct {
+	Number int `json:"number"`
+}
+
+// handleRollback triggers a synchronous rollback of an app to an earlier
+// deployment's exact image (body: {"number": N}). Bounded by the same
+// deployTimeout as handleDeploy, since — like a normal deploy — it may
+// pull an image and runs the same probe-gated rollout.
+func (a *api) handleRollback(w http.ResponseWriter, r *http.Request) {
+	app, ok := a.appBySlugOrNotFound(w, r)
+	if !ok {
+		return
+	}
+
+	var req rollbackRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), deployTimeout)
+	defer cancel()
+
+	dep, err := a.dep.Rollback(ctx, app, req.Number)
+	if err != nil {
+		writeRollbackError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
+}
+
+// writeRollbackError maps a Rollback failure to the documented
+// status/error code: deploy_engine's typed pre-flight errors (target
+// missing/unhealthy, or a local build image no longer available) each get
+// their own 404/409 code; anything else (a rollout failure past that
+// point, e.g. a failed pull or probe) falls through to the same generic
+// 502 "deploy_failed" handleDeploy's own catch-all uses.
+func writeRollbackError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, deploy.ErrRollbackTargetNotFound):
+		writeError(w, http.StatusNotFound, "rollback_target_not_found", err.Error())
+	case errors.Is(err, deploy.ErrRollbackTargetUnhealthy):
+		writeError(w, http.StatusConflict, "rollback_target_unhealthy", err.Error())
+	case errors.Is(err, deploy.ErrRollbackImageMissing):
+		writeError(w, http.StatusConflict, "rollback_image_missing", err.Error())
+	default:
+		writeError(w, http.StatusBadGateway, "deploy_failed", err.Error())
+	}
+}
+
+// maxTarballBody caps a tarball deploy upload at 256 MiB — generously
+// larger than any legitimate build context BasePod expects, but small
+// enough to bound worst-case memory/disk use against a malicious or
+// buggy client. It is enforced by this route's own http.MaxBytesReader
+// rather than bodyLimit's maxJSONBody: the route is deliberately
+// registered outside that middleware's group (see router.go) so a build
+// upload isn't bound by a cap sized for JSON payloads.
+const maxTarballBody = 256 << 20 // 256 MiB
+
+// buildTimeout bounds a single tarball deploy request — much longer than
+// deployTimeout, since it also has to decompress the upload and run a
+// full container build before the existing pull-less rollout even
+// starts.
+const buildTimeout = 60 * time.Minute
+
+// gzipContentTypes are the Content-Type header values handleDeployTarball
+// accepts for the raw gzipped-tar upload body.
+var gzipContentTypes = map[string]bool{
+	"application/gzip":   true,
+	"application/x-gzip": true,
+}
+
+// handleDeployTarball triggers a build-from-upload deploy: the request
+// body must be a raw gzipped tar (Content-Type application/gzip or
+// application/x-gzip) containing a Containerfile or Dockerfile at its
+// root. It streams the body straight into Deployer.DeployBuild (via
+// a.builder) rather than buffering it itself, bounded by maxTarballBody
+// and buildTimeout regardless of the caller's own timeout.
+//
+// Errors: 400 "invalid_content_type" for a non-gzip Content-Type, 413
+// "request_too_large" if the body exceeds maxTarballBody, 422
+// "no_containerfile"/"bad_path" for a build context that fails
+// validation (see internal/build.ErrNoContainerfile / ErrBadPath), 502
+// "deploy_failed" for any other build/rollout failure.
+func (a *api) handleDeployTarball(w http.ResponseWriter, r *http.Request) {
+	app, ok := a.appBySlugOrNotFound(w, r)
+	if !ok {
+		return
+	}
+
+	if !gzipContentTypes[r.Header.Get("Content-Type")] {
+		writeError(w, http.StatusBadRequest, "invalid_content_type", "Content-Type must be application/gzip")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxTarballBody)
+
+	ctx, cancel := context.WithTimeout(r.Context(), buildTimeout)
+	defer cancel()
+
+	dep, err := a.dep.DeployBuild(ctx, app, r.Body, a.builder)
+	if err != nil {
+		writeDeployBuildError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
+}
+
+// writeDeployBuildError maps a DeployBuild failure to the documented
+// status/error code: an oversize upload (bodyLimit's *http.MaxBytesError,
+// surfacing here through the io.Copy chain inside the build pipeline
+// rather than a JSON decode) is 413, as is a build context that decompresses
+// past the pipeline's own size cap (build.ErrContextTooLarge — a defense
+// against a small compressed upload expanding into a much larger one, a
+// "gzip bomb"); a build-context validation failure is 422 with a code
+// naming which check failed; anything else is a generic 502
+// "deploy_failed", matching handleDeploy's own catch-all.
+func writeDeployBuildError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	switch {
+	case errors.As(err, &maxErr):
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body too large")
+	case errors.Is(err, build.ErrContextTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "context_too_large", err.Error())
+	case errors.Is(err, build.ErrNoContainerfile):
+		writeError(w, http.StatusUnprocessableEntity, "no_containerfile", err.Error())
+	case errors.Is(err, build.ErrBadPath):
+		writeError(w, http.StatusUnprocessableEntity, "bad_path", err.Error())
+	default:
+		writeError(w, http.StatusBadGateway, "deploy_failed", err.Error())
+	}
 }
 
 // handleDeleteApp tears down an app's containers/routes via the Deployer
