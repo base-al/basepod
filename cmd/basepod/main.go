@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -42,6 +43,27 @@ func newServerCmd() *cobra.Command {
 	return cmd
 }
 
+// adminPasswordFlagWarning is printed to stderr whenever --admin-password
+// is actually used (audit finding L4): a password passed as a CLI flag
+// is visible to any other process on the host via `ps` for as long as
+// `basepod setup` is running, and often persists in shell history
+// afterward. The flag itself is kept — removing it breaks the documented
+// setup flow — but this warning at least tells an operator an
+// interactive prompt is the safer path, once one exists.
+const adminPasswordFlagWarning = "warning: --admin-password is visible via `ps` and may be recorded in shell history; " +
+	"prefer an interactive password prompt once one is available (see the BasePod docs)."
+
+// warnAdminPasswordFlag writes adminPasswordFlagWarning to w if pw is
+// non-empty (i.e. --admin-password was actually supplied). Split out from
+// newSetupCmd's RunE so it's testable without exercising the rest of the
+// setup pipeline (which touches the real filesystem/store).
+func warnAdminPasswordFlag(w io.Writer, pw string) {
+	if pw == "" {
+		return
+	}
+	fmt.Fprintln(w, adminPasswordFlagWarning)
+}
+
 func newSetupCmd() *cobra.Command {
 	var (
 		cfgPath       string
@@ -64,6 +86,7 @@ func newSetupCmd() *cobra.Command {
 			if adminPassword == "" {
 				return fmt.Errorf("--admin-password is required")
 			}
+			warnAdminPasswordFlag(os.Stderr, adminPassword)
 
 			// If data-dir is empty, use the config default
 			if dataDir == "" {
