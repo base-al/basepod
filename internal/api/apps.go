@@ -67,6 +67,16 @@ type appResponse struct {
 	// actual name — see volumeResponse).
 	DeployStrategy string           `json:"deploy_strategy"`
 	Volumes        []volumeResponse `json:"volumes"`
+	// ComposeProject/ComposeService/Internal are v0.5 Task 8's additions
+	// (migration 00009_compose.sql): "" / "" / false for a hand-created
+	// app; set for one created by POST /api/v1/compose/up, so a client
+	// (the dashboard's Apps list — Task 10) can group compose-managed
+	// apps by project and show an "internal" badge instead of a domain
+	// link for a service with no Caddy route — see store.App's doc
+	// comment for what Internal governs.
+	ComposeProject string `json:"compose_project"`
+	ComposeService string `json:"compose_service"`
+	Internal       bool   `json:"internal"`
 }
 
 // volumeResponse is the wire shape of one of an app's declared volumes —
@@ -100,6 +110,9 @@ func toAppResponse(app *store.App, volumes []store.Volume) appResponse {
 		MemoryLimitMB: app.MemoryLimitMB, CPULimit: app.CPULimit, PidsLimit: app.PidsLimit,
 		DeployStrategy: app.DeployStrategy,
 		Volumes:        toVolumeResponses(volumes),
+		ComposeProject: app.ComposeProject,
+		ComposeService: app.ComposeService,
+		Internal:       app.Internal,
 	}
 }
 
