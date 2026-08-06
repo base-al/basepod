@@ -166,6 +166,15 @@ every app in one shot), and `basepod context list|use <name>` for
 juggling multiple saved servers. Every server-talking command accepts a
 one-off `--context <name>` flag.
 
+## Known issues
+
+- Behind the HTTPS dashboard proxy, the login rate limit is currently
+  shared across all remote clients (10/min total) — a deliberate
+  fail-closed tradeoff for v0.3. Sustained failed logins can temporarily
+  lock out remote login; existing sessions are unaffected and `ssh -L
+  3080:localhost:3080` + http://localhost:3080 always works. Per-client
+  limiting returns in v0.4.
+
 ## Contributing
 
 The dashboard (`web/`) is a Vite/Vue app that gets embedded into the

@@ -60,6 +60,7 @@ func DashboardSockDial() string {
 type Runtime interface {
 	EnsureNetwork(ctx context.Context, name string) error
 	PullImage(ctx context.Context, ref string) error
+	ImageExists(ctx context.Context, ref string) (bool, error)
 	CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string, timeoutSec int) error
@@ -134,10 +135,14 @@ const driftStopTimeout = 5
 // spec create would build today — a different image, different host port
 // mappings, or a container stuck in the "created" state (meaning it was
 // made but never successfully started, e.g. because its port mapping lost
-// a bind race on a previous boot) — and if any of those differ, stops and
+// a bind race on a previous boot) — and if any of those differ, confirms
+// (pulling if necessary) that the image is available, then stops and
 // removes the old container and recreates it fresh, rather than trying to
-// reconcile it in place. Otherwise it just starts the container if it
-// isn't already running.
+// reconcile it in place. The image check happens before the old container
+// is touched, so a pull failure (registry blip, rate limit) leaves the old
+// container running rather than tearing down ingress with nothing to
+// replace it. Otherwise it just starts the container if it isn't already
+// running.
 func (m *Manager) Ensure(ctx context.Context) error {
 	if err := m.rt.EnsureNetwork(ctx, NetworkName); err != nil {
 		return fmt.Errorf("caddy: ensure network %q: %w", NetworkName, err)
@@ -157,6 +162,17 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	}
 	if reason := driftReason(info, m.desiredPorts(), desiredMounts); reason != "" {
 		log.Printf("caddy: %s has drifted (%s) — recreating", ContainerName, reason)
+		// Confirm (and, if necessary, pull) the image BEFORE tearing down
+		// the old container: create()'s own PullImage can fail (registry
+		// blip, rate limit — no local dependency, so no reason it can't),
+		// and if that happened after StopContainer/RemoveContainer had
+		// already run, the old container would already be gone with
+		// nothing to replace it, leaving zero ingress until the operator
+		// retries. Checking (and pulling) first means a pull failure here
+		// leaves the old, still-serving container untouched.
+		if err := m.ensureImage(ctx); err != nil {
+			return err
+		}
 		if err := m.rt.StopContainer(ctx, info.ID, driftStopTimeout); err != nil {
 			return fmt.Errorf("caddy: stop drifted %s: %w", ContainerName, err)
 		}
@@ -309,9 +325,31 @@ func portsEqual(a, b []podman.PortMapping) bool {
 	return true
 }
 
-// create writes the initial (empty-routes) config, pulls the Caddy image,
-// and creates and starts the bp-caddy container. Called only when
-// InspectContainer reports the container doesn't exist yet.
+// ensureImage makes sure Image is present in the local image store,
+// pulling it only if ImageExists reports it isn't already there. Called
+// both by create() (so a cached image never depends on registry
+// reachability — only a genuinely missing image, e.g. first install,
+// pulls) and, before that, by Ensure's drift-recreate branch (so a pull
+// failure there is caught before the old container is torn down).
+func (m *Manager) ensureImage(ctx context.Context) error {
+	exists, err := m.rt.ImageExists(ctx, Image)
+	if err != nil {
+		return fmt.Errorf("caddy: check image %s exists: %w", Image, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := m.rt.PullImage(ctx, Image); err != nil {
+		return fmt.Errorf("caddy: pull %s: %w", Image, err)
+	}
+	return nil
+}
+
+// create writes the initial (empty-routes) config, ensures the Caddy image
+// is present (pulling it only if missing — see ensureImage), and creates
+// and starts the bp-caddy container. Called both on first run
+// (InspectContainer reports the container doesn't exist yet) and at the
+// end of Ensure's drift-recreate branch.
 func (m *Manager) create(ctx context.Context) error {
 	// Resolve bind-mount sources to their real (symlink-free) path (also
 	// MkdirAll's config/data/sock dirs into existence — see
@@ -334,8 +372,8 @@ func (m *Manager) create(ctx context.Context) error {
 		return fmt.Errorf("caddy: write initial config: %w", err)
 	}
 
-	if err := m.rt.PullImage(ctx, Image); err != nil {
-		return fmt.Errorf("caddy: pull %s: %w", Image, err)
+	if err := m.ensureImage(ctx); err != nil {
+		return err
 	}
 
 	spec := podman.CreateSpec{

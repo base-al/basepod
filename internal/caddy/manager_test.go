@@ -35,6 +35,15 @@ type fakeRuntime struct {
 	networkErr error
 	stopErr    error
 	removeErr  error
+
+	// imageExists is both ImageExists's canned answer and, once a
+	// PullImage call succeeds, gets set true — mirroring a real registry
+	// pull making a subsequent ImageExists check on the same ref come back
+	// true. That statefulness is what lets a single test prove create()'s
+	// own ImageExists check (see ensureImage) skips PullImage the second
+	// time around after Ensure's drift branch already pulled the image.
+	imageExists    bool
+	imageExistsErr error
 }
 
 func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
@@ -44,7 +53,19 @@ func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
 
 func (f *fakeRuntime) PullImage(ctx context.Context, ref string) error {
 	f.calls = append(f.calls, "PullImage")
-	return f.pullErr
+	if f.pullErr != nil {
+		return f.pullErr
+	}
+	f.imageExists = true
+	return nil
+}
+
+func (f *fakeRuntime) ImageExists(ctx context.Context, ref string) (bool, error) {
+	f.calls = append(f.calls, "ImageExists")
+	if f.imageExistsErr != nil {
+		return false, f.imageExistsErr
+	}
+	return f.imageExists, nil
 }
 
 func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error) {
@@ -127,7 +148,7 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 
-	wantCalls := []string{"EnsureNetwork", "InspectContainer", "PullImage", "CreateContainer", "StartContainer"}
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage", "CreateContainer", "StartContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v", fr.calls, wantCalls)
 	}
@@ -298,11 +319,16 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 }
 
 // wantRecreateCalls is the call sequence Ensure makes when it decides an
-// existing bp-caddy container has drifted: stop+remove the old one, then
-// the same pull+create+start sequence as a first-run create().
+// existing bp-caddy container has drifted and the image needs pulling
+// (fakeRuntime's default imageExists: false): confirm+pull the image
+// BEFORE touching the old container, then stop+remove it, then the same
+// image-check+create+start sequence as a first-run create() — except
+// create()'s own ImageExists call (second in this list) finds the image
+// already present (the fakeRuntime's PullImage sets imageExists true) and
+// so does not pull it again.
 var wantRecreateCalls = []string{
-	"EnsureNetwork", "InspectContainer", "StopContainer", "RemoveContainer",
-	"PullImage", "CreateContainer", "StartContainer",
+	"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage",
+	"StopContainer", "RemoveContainer", "ImageExists", "CreateContainer", "StartContainer",
 }
 
 // TestEnsureRecreatesWhenStateCreated proves a container stuck in the
@@ -458,6 +484,97 @@ func TestEnsureRecreatesOnMountMismatch(t *testing.T) {
 	want := wantMounts(t, configDir)
 	if !reflect.DeepEqual(fr.createSpec.Mounts, want) {
 		t.Errorf("recreated spec.Mounts = %+v, want %+v", fr.createSpec.Mounts, want)
+	}
+}
+
+// TestEnsureDriftRecreatePullFailureLeavesOldContainer proves the ordering
+// fix at the heart of this change: if the image needs pulling and the pull
+// fails (registry blip, rate limit), the old drifted container must never
+// be stopped or removed — StopContainer/RemoveContainer must not appear in
+// the call log at all — so a transient pull failure never leaves the host
+// with zero ingress. Ensure must surface the pull error.
+func TestEnsureDriftRecreatePullFailureLeavesOldContainer(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	pullErr := errors.New("registry: rate limited")
+	fr := &fakeRuntime{
+		inspectInfo: &podman.ContainerInfo{
+			ID: "abc123", Name: ContainerName, State: "created",
+			Image: Image, Ports: matchingPorts,
+		},
+		imageExists: false,
+		pullErr:     pullErr,
+	}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	err := mgr.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure: expected error, got nil")
+	}
+	if !errors.Is(err, pullErr) {
+		t.Fatalf("Ensure error = %v, want wrapping %v", err, pullErr)
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (old container must never be stopped/removed on pull failure)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureDriftRecreateSkipsPullWhenImageCached proves the drift-recreate
+// path never calls PullImage at all when the image is already present
+// locally — the fix's other half: a cached image must not create a new
+// online dependency (registry reachability) that a purely-local recreate
+// (e.g. a port-mapping or mount drift, nothing to do with the image)
+// doesn't otherwise need.
+func TestEnsureDriftRecreateSkipsPullWhenImageCached(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{
+		inspectInfo: &podman.ContainerInfo{
+			ID: "abc123", Name: ContainerName, State: "created",
+			Image: Image, Ports: matchingPorts,
+		},
+		imageExists: true,
+	}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	wantCalls := []string{
+		"EnsureNetwork", "InspectContainer", "ImageExists",
+		"StopContainer", "RemoveContainer", "ImageExists", "CreateContainer", "StartContainer",
+	}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no PullImage call — image already present)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureCreateSkipsPullWhenImageCached covers the same "no unnecessary
+// pull" fix on the plain first-run create() path (no existing container at
+// all), not just drift-recreate: a cached image must not pull there
+// either.
+func TestEnsureCreateSkipsPullWhenImageCached(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectErr: podman.ErrNotFound, imageExists: true}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+
+	if err := mgr.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "CreateContainer", "StartContainer"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no PullImage call — image already present)", fr.calls, wantCalls)
 	}
 }
 
