@@ -108,6 +108,24 @@ export interface SystemInfo {
   apps: number
 }
 
+/** One live session, in the exact wire shape internal/api/auth.go's
+ * sessionResponse returns (GET /auth/sessions). created_at/expires_at are
+ * RFC3339 strings. current flags exactly the session this very request was
+ * authenticated with — never more than one entry in a response. */
+export interface Session {
+  id: number
+  created_at: string
+  expires_at: string
+  current: boolean
+}
+
+/** Body for POST /auth/password (internal/api/auth.go's
+ * passwordChangeRequest). */
+export interface PasswordChangeRequest {
+  current_password: string
+  new_password: string
+}
+
 /** Typed error thrown for any non-2xx response, parsed from BasePod's
  * {"error":{"code","message"}} envelope. */
 export class ApiError extends Error {
@@ -370,6 +388,32 @@ export const api = {
   deleteDomain: (slug: string, id: number) => request<void>(`/apps/${slug}/domains/${id}`, { method: 'DELETE' }),
 
   system: () => request<SystemInfo>('/system'),
+
+  /** Lists every live session for the current user, newest first, with
+   * exactly one entry flagged `current` (see internal/api/auth.go's
+   * handleListSessions). */
+  listSessions: () => request<Session[]>('/auth/sessions'),
+
+  /** Revokes a session by id (internal/api/auth.go's handleDeleteSession).
+   * Scoped server-side to the caller's own sessions — a 404 covers both
+   * "no such session" and "not yours", indistinguishably. Revoking the
+   * session this very request is authenticated with logs the caller out
+   * immediately; SessionsPanel.vue handles that by checking `current`
+   * before/after the call rather than the server special-casing it. */
+  deleteSession: (id: number) => request<void>(`/auth/sessions/${id}`, { method: 'DELETE' }),
+
+  /** Changes the current user's password: verifies current_password,
+   * enforces the same 8-character minimum `basepod setup` does on the new
+   * one, then revokes every OTHER session while leaving this one (the one
+   * this request is authenticated with) alive — see
+   * internal/api/auth.go's handleChangePassword. Errors (401
+   * invalid_credentials, 422 validation) carry a message meant to be shown
+   * verbatim. */
+  changePassword: (payload: PasswordChangeRequest) =>
+    request<void>('/auth/password', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   logsPreflight,
 

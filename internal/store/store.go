@@ -220,6 +220,86 @@ func (s *Store) PruneExpiredSessions() (int64, error) {
 	return res.RowsAffected()
 }
 
+// Session is one saved login session, as returned by ListSessions. TokenHash
+// is carried here only so the API layer can compare it against the
+// caller's own (already-hashed) bearer token to flag "current" — it must
+// never be serialized back to a client.
+//
+// The sessions table has no user_agent/ip columns (see migration
+// 00001_init.sql) — this milestone's session list identifies sessions by
+// creation/expiry time only, not "which device", so no additive migration
+// was needed to support it.
+type Session struct {
+	ID        int64
+	CreatedAt string
+	ExpiresAt string
+	TokenHash string
+}
+
+// ListSessions returns every session belonging to userID, newest first.
+func (s *Store) ListSessions(userID int64) ([]Session, error) {
+	rows, err := s.db.Query(`SELECT id, token_hash, created_at, expires_at
+		FROM sessions WHERE user_id = ? ORDER BY created_at DESC, id DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var sess Session
+		if err := rows.Scan(&sess.ID, &sess.TokenHash, &sess.CreatedAt, &sess.ExpiresAt); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, sess)
+	}
+	return sessions, rows.Err()
+}
+
+// DeleteSession removes session id, scoped to userID so one user can never
+// revoke another user's session by guessing/enumerating ids. Returns
+// ErrNotFound if no session with that id belongs to userID (whether it
+// doesn't exist at all, or exists but belongs to someone else — the two are
+// indistinguishable to the caller, matching DeleteDomain's cross-owner
+// behavior).
+func (s *Store) DeleteSession(id, userID int64) error {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND user_id = ?`, id, userID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteSessionsExcept removes every session belonging to userID EXCEPT the
+// one whose token hash is keepTokenHash, returning the number of rows
+// removed. Used by a password change to revoke every other session while
+// keeping the caller's own alive (see internal/api/auth.go's
+// handleChangePassword) — getting this backwards either locks the user out
+// of the session they're using right now, or leaves every other
+// session (e.g. an attacker's) alive.
+func (s *Store) DeleteSessionsExcept(userID int64, keepTokenHash string) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE user_id = ? AND token_hash != ?`, userID, keepTokenHash)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// UpdatePassword sets userID's password_hash to hash (an already-computed
+// argon2id encoding — see auth.HashPassword). The caller owns verifying the
+// current password and the new password's strength before calling this.
+func (s *Store) UpdatePassword(userID int64, hash string) error {
+	_, err := s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, hash, userID)
+	return err
+}
+
 // defaultMemoryLimitMB, defaultCPULimit, and defaultPidsLimit mirror the
 // column defaults migration 00004_resource_limits.sql sets on the apps
 // table (memory_limit_mb, cpu_limit, pids_limit) — kept here as named

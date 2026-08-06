@@ -107,6 +107,134 @@ func TestPruneExpiredSessions(t *testing.T) {
 	}
 }
 
+func TestListSessions(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+	s.CreateSession(uid, "th1", time.Now().Add(time.Hour))
+	s.CreateSession(uid, "th2", time.Now().Add(2*time.Hour))
+
+	sessions, err := s.ListSessions(uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(sessions))
+	}
+	hashes := map[string]bool{sessions[0].TokenHash: true, sessions[1].TokenHash: true}
+	if !hashes["th1"] || !hashes["th2"] {
+		t.Fatalf("unexpected session hashes: %+v", sessions)
+	}
+	for _, sess := range sessions {
+		if sess.ID == 0 || sess.CreatedAt == "" || sess.ExpiresAt == "" {
+			t.Fatalf("session missing expected fields: %+v", sess)
+		}
+	}
+}
+
+func TestListSessionsEmptyForUnknownUser(t *testing.T) {
+	s := open(t)
+	sessions, err := s.ListSessions(999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("got %d sessions, want 0", len(sessions))
+	}
+}
+
+// TestDeleteSessionOwnerScoping proves DeleteSession is scoped to the
+// caller's own userID: user A cannot delete user B's session by id, even
+// though the id alone would otherwise be enough to find it.
+func TestDeleteSessionOwnerScoping(t *testing.T) {
+	s := open(t)
+	uidA, _ := s.CreateUser("a@example.com", "A", "hash", true)
+	uidB, _ := s.CreateUser("b@example.com", "B", "hash", false)
+
+	s.CreateSession(uidB, "b-token", time.Now().Add(time.Hour))
+	bSessions, err := s.ListSessions(uidB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bSessions) != 1 {
+		t.Fatalf("got %d sessions for B, want 1", len(bSessions))
+	}
+	bSessionID := bSessions[0].ID
+
+	// A cannot delete B's session.
+	if err := s.DeleteSession(bSessionID, uidA); err != ErrNotFound {
+		t.Fatalf("cross-owner delete: got %v, want ErrNotFound", err)
+	}
+	if _, err := s.UserBySessionTokenHash("b-token"); err != nil {
+		t.Fatalf("B's session was deleted by A's request: %v", err)
+	}
+
+	// B can delete their own session.
+	if err := s.DeleteSession(bSessionID, uidB); err != nil {
+		t.Fatalf("owner delete: %v", err)
+	}
+	if _, err := s.UserBySessionTokenHash("b-token"); err != ErrNotFound {
+		t.Fatal("expected B's session to be gone after B deleted it")
+	}
+}
+
+func TestDeleteSessionNotFound(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+	if err := s.DeleteSession(999, uid); err != ErrNotFound {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteSessionsExcept(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "hash", true)
+	s.CreateSession(uid, "keep", time.Now().Add(time.Hour))
+	s.CreateSession(uid, "other1", time.Now().Add(time.Hour))
+	s.CreateSession(uid, "other2", time.Now().Add(time.Hour))
+
+	// Another user's session must never be touched by this call.
+	otherUID, _ := s.CreateUser("z@b.c", "Z", "hash", false)
+	s.CreateSession(otherUID, "unrelated", time.Now().Add(time.Hour))
+
+	n, err := s.DeleteSessionsExcept(uid, "keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("deleted %d sessions, want 2", n)
+	}
+
+	if _, err := s.UserBySessionTokenHash("keep"); err != nil {
+		t.Fatalf("kept session was deleted: %v", err)
+	}
+	if _, err := s.UserBySessionTokenHash("other1"); err != ErrNotFound {
+		t.Fatal("expected other1 to be deleted")
+	}
+	if _, err := s.UserBySessionTokenHash("other2"); err != ErrNotFound {
+		t.Fatal("expected other2 to be deleted")
+	}
+	if _, err := s.UserBySessionTokenHash("unrelated"); err != nil {
+		t.Fatalf("unrelated user's session was deleted: %v", err)
+	}
+}
+
+func TestUpdatePassword(t *testing.T) {
+	s := open(t)
+	uid, _ := s.CreateUser("a@b.c", "A", "old-hash", true)
+
+	if err := s.UpdatePassword(uid, "new-hash"); err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := s.UserByEmail("a@b.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.PasswordHash != "new-hash" {
+		t.Fatalf("PasswordHash = %q, want %q", u.PasswordHash, "new-hash")
+	}
+}
+
 func TestDeploymentNumbering(t *testing.T) {
 	s := open(t)
 	app, _ := s.CreateApp("blog", "nginx:alpine", 80)

@@ -27,6 +27,7 @@ const sizeWarnThreshold = 64 << 20 // 64 MiB
 func Commands() []*cobra.Command {
 	return []*cobra.Command{
 		newLoginCmd(),
+		newLogoutCmd(),
 		newContextCmd(),
 		newAppsCmd(),
 		newDeployCmd(),
@@ -145,6 +146,58 @@ func newLoginCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&email, "email", "", "account email (prompted if omitted)")
 	cmd.Flags().StringVar(&ctxName, "context", "", "name for the saved context (default: the URL's host)")
+	return cmd
+}
+
+// newLogoutCmd builds `basepod logout`: revokes the current context's
+// session server-side (best-effort — see below) and then clears its saved
+// token, leaving the context entry itself in place (so `basepod login`
+// against the same server later reuses the same context name, and
+// `basepod context list` still shows it). Scope is deliberately narrow:
+// only the current (or --context-named) context's token is touched, never
+// every saved context at once — a broader "log out everywhere" is out of
+// scope for this command.
+func newLogoutCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "logout",
+		Short:        "Log out of the current context, revoking its session server-side",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := LoadConfig()
+			if err != nil {
+				return err
+			}
+			name, _ := cmd.Flags().GetString("context")
+			ctxCfg, resolvedName, err := cfg.CurrentContext(name)
+			if err != nil {
+				return err
+			}
+
+			// The server-side revoke is best-effort: a token that's already
+			// expired or was already revoked (e.g. a double logout, or a
+			// prior password change that killed it) must not block clearing
+			// the now-useless local token — the whole point of this command
+			// is to leave the CLI with no usable credential for this
+			// context, and failing to reach the server is not a reason to
+			// keep one lying around on disk.
+			logoutErr := NewClient(ctxCfg.URL, ctxCfg.Token).Logout(cmd.Context())
+
+			ctxCfg.Token = ""
+			cfg.Contexts[resolvedName] = ctxCfg
+			if err := SaveConfig(cfg); err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			if logoutErr != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not revoke session server-side: %v\n", logoutErr)
+			}
+			fmt.Fprintf(out, "Logged out of context %q\n", resolvedName)
+			return nil
+		},
+	}
+	addContextFlag(cmd)
 	return cmd
 }
 

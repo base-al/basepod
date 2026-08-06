@@ -128,6 +128,17 @@ func (c *Client) Login(ctx context.Context, email, password string) (*LoginResul
 	return &out, nil
 }
 
+// Logout revokes the current session token server-side (POST
+// /auth/logout). It does not touch the CLI's local config — the caller
+// (basepod logout) is responsible for clearing the saved token afterward.
+func (c *Client) Logout(ctx context.Context) error {
+	req, err := c.newRequest(ctx, http.MethodPost, "/auth/logout", "", nil)
+	if err != nil {
+		return err
+	}
+	return c.do(req, nil)
+}
+
 // AppInfo is the wire shape of one app in a list/create response.
 type AppInfo struct {
 	Slug   string `json:"slug"`
