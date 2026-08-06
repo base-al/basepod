@@ -96,6 +96,22 @@ frontend verification is clean locally; pushed and CI to be confirmed (see below
   requirement driving it.
 
 ## Commits
-See `git log feat/stream-tokens` on top of `origin/main`. Pushed to
-`origin/feat/stream-tokens`; CI status to be confirmed via
-`gh run list --branch feat/stream-tokens`.
+`1eb6cb7` — `feat(api,store,auth,web): scoped short-lived tokens for SSE streams`
+(on top of `origin/main` @ `90bc386`). Pushed to `origin/feat/stream-tokens`.
+
+## CI result
+https://github.com/base-al/basepod/actions/runs/31067182221
+
+- `test` job (go build/vet/test, web build/type-check/test): **success**.
+- `e2e` job: **failure** — exactly and only at the anticipated point:
+  ```
+  [e2e] FAIL: logs stream missing an 'event: log' line:
+  {"error":{"code":"unauthorized","message":"invalid or expired token"}}
+  ```
+  This is `scripts/e2e-local.sh` line ~404, still sending the session token as
+  `?access_token=` on the logs route — which the fix now correctly rejects (401).
+  This is the intended, correct behavior change, not a regression; the script needs
+  the coordinated update described under Concerns above. Per this task's explicit
+  scope (own only `internal/api/**`, `internal/store/**`, `internal/auth/**`,
+  `web/src/lib/sse.ts` + callers) and instruction not to run/touch
+  `scripts/e2e-local.sh`, I did not edit it.
