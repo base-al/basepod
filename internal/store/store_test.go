@@ -1,10 +1,13 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/pressly/goose/v3"
 )
 
 func open(t *testing.T) *Store {
@@ -315,6 +318,129 @@ func TestAppBySlugNotFound(t *testing.T) {
 	s := open(t)
 	if _, err := s.AppBySlug("does-not-exist"); err != ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// TestCreateAppDefaultsResourceLimits covers audit finding H2's default
+// posture: a freshly created app is never accidentally unlimited — it gets
+// the schema's bounded defaults (matching migration
+// 00004_resource_limits.sql's column defaults exactly) on both the
+// returned App and what AppBySlug/ListApps read back.
+func TestCreateAppDefaultsResourceLimits(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("blog", "nginx:alpine", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.MemoryLimitMB != 512 || app.CPULimit != 1.0 || app.PidsLimit != 512 {
+		t.Fatalf("unexpected default limits on created app: %+v", app)
+	}
+
+	got, err := s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MemoryLimitMB != 512 || got.CPULimit != 1.0 || got.PidsLimit != 512 {
+		t.Fatalf("unexpected default limits from AppBySlug: %+v", got)
+	}
+
+	apps, err := s.ListApps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(apps) != 1 || apps[0].MemoryLimitMB != 512 || apps[0].CPULimit != 1.0 || apps[0].PidsLimit != 512 {
+		t.Fatalf("unexpected default limits from ListApps: %+v", apps)
+	}
+}
+
+// TestUpdateAppLimits covers the store-level half of PATCH
+// /api/v1/apps/{slug} (internal/api/apps.go's handlePatchApp): the three
+// limits update independently and persist, including setting one to 0
+// (unlimited) — verifying UpdateAppLimits doesn't reject or coerce that
+// the way a naive "0 means don't update" implementation might.
+func TestUpdateAppLimits(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("blog", "nginx:alpine", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateAppLimits(app.ID, 1024, 2.5, 1024); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MemoryLimitMB != 1024 || got.CPULimit != 2.5 || got.PidsLimit != 1024 {
+		t.Fatalf("unexpected limits after update: %+v", got)
+	}
+
+	// 0 means unlimited and must be settable, not silently ignored.
+	if err := s.UpdateAppLimits(app.ID, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MemoryLimitMB != 0 || got.CPULimit != 0 || got.PidsLimit != 0 {
+		t.Fatalf("unexpected limits after setting unlimited: %+v", got)
+	}
+}
+
+// TestMigrationDefaultsApplyToExistingApp is the specific regression the
+// v0.4 plan calls out for migration 00004_resource_limits.sql: an app row
+// inserted BEFORE that migration ever ran (i.e. a real v0.3.0 data dir
+// upgrading in place) must come out the other side with the same bounded
+// defaults a brand-new app gets — not NULL, not 0 (accidentally
+// unlimited), and not a migration failure. This bypasses Store.Open (which
+// always migrates straight to the latest schema before returning) to
+// reproduce that exact sequence: migrate up to version 3 only, insert a
+// row the way version-3 schema would have, then migrate the rest of the
+// way and read it back through the normal Store API.
+func TestMigrationDefaultsApplyToExistingApp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, "migrations", 3); err != nil {
+		t.Fatalf("migrate to version 3: %v", err)
+	}
+
+	// Insert exactly as version-3 schema's apps table would have accepted
+	// — no resource-limit columns exist yet at this point.
+	if _, err := db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, "legacy", "nginx:alpine", 80); err != nil {
+		t.Fatalf("insert pre-migration-4 row: %v", err)
+	}
+
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	got, err := s.AppBySlug("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MemoryLimitMB != 512 || got.CPULimit != 1.0 || got.PidsLimit != 512 {
+		t.Fatalf("pre-existing row did not get migration defaults: %+v", got)
 	}
 }
 

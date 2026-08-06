@@ -14,6 +14,7 @@ import ConfirmDanger from '../components/ConfirmDanger.vue'
 import LogViewer from '../components/LogViewer.vue'
 import EnvEditor from '../components/EnvEditor.vue'
 import DomainsPanel from '../components/DomainsPanel.vue'
+import ResourceLimitsPanel from '../components/ResourceLimitsPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -410,6 +411,8 @@ const deleteMutation = useMutation({
               </div>
             </dl>
           </UCard>
+
+          <ResourceLimitsPanel :slug="slug" />
 
           <UCard variant="subtle" :ui="{ root: 'ring-red-900/60' }">
             <template #header>

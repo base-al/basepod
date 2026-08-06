@@ -663,6 +663,114 @@ func TestDeployInjectsDecryptedEnv(t *testing.T) {
 	}
 }
 
+// TestDeployPassesAppResourceLimits covers audit finding H2's other half
+// (podman/client_test.go covers the spec->wire mapping): runRollout must
+// carry the app's stored memory/cpu/pids limits into every CreateSpec it
+// builds, converting MemoryLimitMB (MiB, as stored) to
+// CreateSpec.MemoryLimitBytes. A freshly created app gets store.CreateApp's
+// defaults (512 MiB / 1.0 cores / 512 pids) with no explicit
+// UpdateAppLimits call, so this also proves a brand-new app is never
+// accidentally deployed unlimited.
+func TestDeployPassesAppResourceLimits(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:old", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.Deploy(ctx, app, "nginx:new"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	spec, ok := rt.createdSpecs["bp-blog-1"]
+	if !ok {
+		t.Fatal("CreateContainer spec not recorded for bp-blog-1")
+	}
+	wantMemBytes := int64(512) * 1024 * 1024
+	if spec.MemoryLimitBytes != wantMemBytes || spec.CPUQuota != 1.0 || spec.PidsLimit != 512 {
+		t.Fatalf("spec limits = mem=%d cpu=%g pids=%d, want mem=%d cpu=1 pids=512",
+			spec.MemoryLimitBytes, spec.CPUQuota, spec.PidsLimit, wantMemBytes)
+	}
+}
+
+// TestDeployPassesCustomAppResourceLimits proves runRollout picks up
+// whatever limits are currently stored for the app (as an admin's
+// PATCH /api/v1/apps/{slug} would set via store.UpdateAppLimits) rather
+// than a value baked in at app-creation time — including the explicit-0
+// ("unlimited") case for one of the three independently.
+func TestDeployPassesCustomAppResourceLimits(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "nginx:old", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppLimits(app.ID, 2048, 2.5, 0); err != nil {
+		t.Fatal(err)
+	}
+	app, err = st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.Deploy(ctx, app, "nginx:new"); err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	spec, ok := rt.createdSpecs["bp-blog-1"]
+	if !ok {
+		t.Fatal("CreateContainer spec not recorded for bp-blog-1")
+	}
+	wantMemBytes := int64(2048) * 1024 * 1024
+	if spec.MemoryLimitBytes != wantMemBytes || spec.CPUQuota != 2.5 || spec.PidsLimit != 0 {
+		t.Fatalf("spec limits = mem=%d cpu=%g pids=%d, want mem=%d cpu=2.5 pids=0",
+			spec.MemoryLimitBytes, spec.CPUQuota, spec.PidsLimit, wantMemBytes)
+	}
+}
+
+// TestDeployBuildPassesAppResourceLimits proves the tarball-build rollout
+// path (DeployBuild, which shares runRollout with Deploy) carries the same
+// app resource limits into CreateSpec — the plan explicitly calls out both
+// entry points since it would be easy to wire this into only one of them.
+func TestDeployBuildPassesAppResourceLimits(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	buildRt := &fakeBuildRuntime{logLine: "Successfully built abc123\n"}
+	builder := build.New(buildRt, t.TempDir(), 2)
+	ctx := context.Background()
+
+	app, err := st.CreateApp("blog", "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppLimits(app.ID, 1024, 0.5, 128); err != nil {
+		t.Fatal(err)
+	}
+	app, err = st.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.DeployBuild(ctx, app, gzipTarWithContainerfile(t), builder); err != nil {
+		t.Fatalf("DeployBuild: %v", err)
+	}
+
+	spec, ok := rt.createdSpecs["bp-blog-1"]
+	if !ok {
+		t.Fatal("CreateContainer spec not recorded for bp-blog-1")
+	}
+	wantMemBytes := int64(1024) * 1024 * 1024
+	if spec.MemoryLimitBytes != wantMemBytes || spec.CPUQuota != 0.5 || spec.PidsLimit != 128 {
+		t.Fatalf("spec limits = mem=%d cpu=%g pids=%d, want mem=%d cpu=0.5 pids=128",
+			spec.MemoryLimitBytes, spec.CPUQuota, spec.PidsLimit, wantMemBytes)
+	}
+}
+
 // TestDeployFailsOnDecryptError proves that when decrypting a stored env
 // var fails, Deploy fails through the normal fail() path: no new
 // container is ever created, and the previous (old, healthy) container is

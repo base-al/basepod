@@ -315,6 +315,18 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 		NetworkName:    caddy.NetworkName,
 		NetworkAliases: []string{"bp-" + app.Slug},
 		RestartPolicy:  "always",
+		// Resource limits (audit H2): every app container is created with
+		// the app's stored limits, which default to a sane bounded value
+		// for every new app (see store.CreateApp) and are retroactively
+		// backfilled for pre-existing apps by migration
+		// 00004_resource_limits.sql — so this is never accidentally
+		// "unlimited" by omission. An admin can still explicitly set any
+		// of the three to 0 via PATCH /api/v1/apps/{slug} to mean
+		// unlimited (see podman.CreateSpec's doc comment), which
+		// CreateContainer honors by omitting that field entirely.
+		MemoryLimitBytes: app.MemoryLimitMB * 1024 * 1024,
+		CPUQuota:         app.CPULimit,
+		PidsLimit:        app.PidsLimit,
 	}
 
 	envVars, err := e.st.ListEnvVars(app.ID)

@@ -191,6 +191,13 @@ func fileExists(p string) bool {
 	return err == nil && !fi.IsDir()
 }
 
+// boolPtr and int64Ptr take the address of a literal — Go has no syntax
+// for that inline, and runtime-spec's pointer-typed fields (see
+// linuxMemory, linuxCPU, and specGen.NoNewPrivileges in types.go) need one
+// to distinguish "absent" from "explicitly zero/false".
+func boolPtr(b bool) *bool    { return &b }
+func int64Ptr(n int64) *int64 { return &n }
+
 // request performs an HTTP call against the libpod API and returns the
 // response status code and raw body. body, if non-nil, is JSON-marshaled
 // as the request payload.
@@ -700,16 +707,44 @@ func (c *Client) RemoveNetwork(ctx context.Context, name string) error {
 	return apiError(status, data)
 }
 
+// cpuPeriodMicros is the fixed CPU cgroup period (100ms, in microseconds)
+// CreateContainer uses to convert CreateSpec.CPUQuota (a core count, e.g.
+// 1.5) into libpod's quota/period pair: quota = cores * period. 100ms is
+// the conventional default period (matching `podman run --cpus`'s own
+// choice) — short enough to keep scheduling fair-grained, long enough that
+// the resulting quota doesn't lose meaningful precision to integer
+// rounding for realistic core counts.
+const cpuPeriodMicros = 100_000
+
 // CreateContainer creates a container from spec and returns its ID.
+//
+// Every created container gets fixed security hardening applied
+// unconditionally, regardless of what spec sets: no-new-privileges (blocks
+// gaining privileges via setuid/setgid binaries inside the container) and
+// dropping the NET_RAW capability (blocks crafting raw/packet sockets,
+// e.g. for ARP/ICMP spoofing on the shared "basepod" network). This is
+// applied here — at the mapping layer, not as CreateSpec fields — rather
+// than being opt-in per caller, so it covers every container BasePod
+// creates (both internal/deploy's app containers and
+// internal/caddy.Manager's own bp-caddy container) with no risk of a
+// caller forgetting to set it; neither hardening flag has any legitimate
+// use in either container BasePod creates, so there is nothing to make
+// configurable. Resource limits (memory/CPU/pids), by contrast, ARE
+// opt-in per CreateSpec (via MemoryLimitBytes/CPUQuota/PidsLimit): a zero
+// value there is a real, callers-need-it "unlimited", not a hole to close
+// unconditionally, and internal/caddy.Manager deliberately never sets
+// them, leaving bp-caddy exactly as unbounded as it always was.
 func (c *Client) CreateContainer(ctx context.Context, spec CreateSpec) (string, error) {
 	sg := specGen{
-		Name:          spec.Name,
-		Image:         spec.Image,
-		Labels:        spec.Labels,
-		Env:           spec.Env,
-		Command:       spec.Command,
-		PortMappings:  spec.PortMappings,
-		RestartPolicy: spec.RestartPolicy,
+		Name:            spec.Name,
+		Image:           spec.Image,
+		Labels:          spec.Labels,
+		Env:             spec.Env,
+		Command:         spec.Command,
+		PortMappings:    spec.PortMappings,
+		RestartPolicy:   spec.RestartPolicy,
+		CapDrop:         []string{"NET_RAW"},
+		NoNewPrivileges: boolPtr(true),
 	}
 	if spec.NetworkName != "" {
 		sg.Networks = map[string]perNetworkOptions{
@@ -719,6 +754,27 @@ func (c *Client) CreateContainer(ctx context.Context, spec CreateSpec) (string, 
 		// types.go for why the API doesn't infer this the way the CLI does.
 		sg.NetNS = &namespace{NSMode: "bridge"}
 	}
+
+	var rl resourceLimits
+	var hasLimits bool
+	if spec.MemoryLimitBytes > 0 {
+		rl.Memory = &linuxMemory{Limit: int64Ptr(spec.MemoryLimitBytes)}
+		hasLimits = true
+	}
+	if spec.CPUQuota > 0 {
+		quota := int64(spec.CPUQuota * cpuPeriodMicros)
+		period := uint64(cpuPeriodMicros)
+		rl.CPU = &linuxCPU{Quota: &quota, Period: &period}
+		hasLimits = true
+	}
+	if spec.PidsLimit > 0 {
+		rl.Pids = &linuxPids{Limit: spec.PidsLimit}
+		hasLimits = true
+	}
+	if hasLimits {
+		sg.ResourceLimits = &rl
+	}
+
 	for _, m := range spec.Mounts {
 		sm := specMount{
 			Destination: m.Dest,
