@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -36,14 +37,15 @@ type fakeRuntime struct {
 	stopErr    error
 	removeErr  error
 
-	// imageExists is both ImageExists's canned answer and, once a
-	// PullImage call succeeds, gets set true — mirroring a real registry
-	// pull making a subsequent ImageExists check on the same ref come back
-	// true. That statefulness is what lets a single test prove create()'s
-	// own ImageExists check (see ensureImage) skips PullImage the second
-	// time around after Ensure's drift branch already pulled the image.
-	imageExists    bool
-	imageExistsErr error
+	// archResult is ImageArchitecture's canned answer; "" means "report
+	// whatever the current host's runtime.GOARCH is" (i.e. always match a
+	// Manager's default expectedArch), so tests that don't care about the
+	// arch check never need to set this. Tests proving the mismatch path
+	// set it to a value that deliberately differs from the Manager's
+	// expectedArch (itself overridden directly, since manager_test.go is
+	// package caddy).
+	archResult string
+	archErr    error
 }
 
 func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
@@ -53,19 +55,18 @@ func (f *fakeRuntime) EnsureNetwork(ctx context.Context, name string) error {
 
 func (f *fakeRuntime) PullImage(ctx context.Context, ref string) error {
 	f.calls = append(f.calls, "PullImage")
-	if f.pullErr != nil {
-		return f.pullErr
-	}
-	f.imageExists = true
-	return nil
+	return f.pullErr
 }
 
-func (f *fakeRuntime) ImageExists(ctx context.Context, ref string) (bool, error) {
-	f.calls = append(f.calls, "ImageExists")
-	if f.imageExistsErr != nil {
-		return false, f.imageExistsErr
+func (f *fakeRuntime) ImageArchitecture(ctx context.Context, ref string) (string, error) {
+	f.calls = append(f.calls, "ImageArchitecture")
+	if f.archErr != nil {
+		return "", f.archErr
 	}
-	return f.imageExists, nil
+	if f.archResult == "" {
+		return runtime.GOARCH, nil
+	}
+	return f.archResult, nil
 }
 
 func (f *fakeRuntime) CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error) {
@@ -148,7 +149,7 @@ func TestEnsureCreatesWhenMissing(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 
-	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage", "CreateContainer", "StartContainer"}
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "PullImage", "ImageArchitecture", "CreateContainer", "StartContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v", fr.calls, wantCalls)
 	}
@@ -319,16 +320,15 @@ func TestEnsureNoopWhenRunning(t *testing.T) {
 }
 
 // wantRecreateCalls is the call sequence Ensure makes when it decides an
-// existing bp-caddy container has drifted and the image needs pulling
-// (fakeRuntime's default imageExists: false): confirm+pull the image
+// existing bp-caddy container has drifted: pull+arch-verify the image
 // BEFORE touching the old container, then stop+remove it, then the same
-// image-check+create+start sequence as a first-run create() — except
-// create()'s own ImageExists call (second in this list) finds the image
-// already present (the fakeRuntime's PullImage sets imageExists true) and
-// so does not pull it again.
+// pull+arch-verify+create+start sequence as a first-run create() — the
+// image step is unconditional (see pullImage's doc comment for why it's no
+// longer gated on an existence check), so it runs a second time here even
+// though the first pull just confirmed the image is present and correct.
 var wantRecreateCalls = []string{
-	"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage",
-	"StopContainer", "RemoveContainer", "ImageExists", "CreateContainer", "StartContainer",
+	"EnsureNetwork", "InspectContainer", "PullImage", "ImageArchitecture",
+	"StopContainer", "RemoveContainer", "PullImage", "ImageArchitecture", "CreateContainer", "StartContainer",
 }
 
 // TestEnsureRecreatesWhenStateCreated proves a container stuck in the
@@ -503,8 +503,7 @@ func TestEnsureDriftRecreatePullFailureLeavesOldContainer(t *testing.T) {
 			ID: "abc123", Name: ContainerName, State: "created",
 			Image: Image, Ports: matchingPorts,
 		},
-		imageExists: false,
-		pullErr:     pullErr,
+		pullErr: pullErr,
 	}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -517,19 +516,24 @@ func TestEnsureDriftRecreatePullFailureLeavesOldContainer(t *testing.T) {
 		t.Fatalf("Ensure error = %v, want wrapping %v", err, pullErr)
 	}
 
-	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "PullImage"}
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "PullImage"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
-		t.Fatalf("calls = %v, want %v (old container must never be stopped/removed on pull failure)", fr.calls, wantCalls)
+		t.Fatalf("calls = %v, want %v (old container must never be stopped/removed on pull failure, and a failed pull must short-circuit before the arch check)", fr.calls, wantCalls)
 	}
 }
 
-// TestEnsureDriftRecreateSkipsPullWhenImageCached proves the drift-recreate
-// path never calls PullImage at all when the image is already present
-// locally — the fix's other half: a cached image must not create a new
-// online dependency (registry reachability) that a purely-local recreate
-// (e.g. a port-mapping or mount drift, nothing to do with the image)
-// doesn't otherwise need.
-func TestEnsureDriftRecreateSkipsPullWhenImageCached(t *testing.T) {
+// TestEnsureDriftRecreateAlwaysPulls proves the drift-recreate path calls
+// PullImage even when the image is already present locally — replacing
+// v0.3's first cut, which gated the pull on an ImageExists check and so
+// could skip re-resolving the image manifest entirely. That skip is the
+// production bug this change fixes: on an arm64 host with a wrong-arch
+// (amd64) copy of the image already cached (e.g. left behind by an earlier
+// `podman build --platform linux/amd64`), ImageExists reports true, the
+// pull that would have re-resolved the manifest for the host arch never
+// happens, and bp-caddy starts under emulation and crashes instantly. The
+// pull must happen (and, per pullImage, be arch-verified) before the old
+// container is stopped/removed, exactly like a genuinely missing image.
+func TestEnsureDriftRecreateAlwaysPulls(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
 
@@ -538,7 +542,6 @@ func TestEnsureDriftRecreateSkipsPullWhenImageCached(t *testing.T) {
 			ID: "abc123", Name: ContainerName, State: "created",
 			Image: Image, Ports: matchingPorts,
 		},
-		imageExists: true,
 	}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
@@ -546,25 +549,19 @@ func TestEnsureDriftRecreateSkipsPullWhenImageCached(t *testing.T) {
 	if err := mgr.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-
-	wantCalls := []string{
-		"EnsureNetwork", "InspectContainer", "ImageExists",
-		"StopContainer", "RemoveContainer", "ImageExists", "CreateContainer", "StartContainer",
-	}
-	if !reflect.DeepEqual(fr.calls, wantCalls) {
-		t.Fatalf("calls = %v, want %v (no PullImage call — image already present)", fr.calls, wantCalls)
+	if !reflect.DeepEqual(fr.calls, wantRecreateCalls) {
+		t.Fatalf("calls = %v, want %v (PullImage must run before StopContainer/RemoveContainer)", fr.calls, wantRecreateCalls)
 	}
 }
 
-// TestEnsureCreateSkipsPullWhenImageCached covers the same "no unnecessary
-// pull" fix on the plain first-run create() path (no existing container at
-// all), not just drift-recreate: a cached image must not pull there
-// either.
-func TestEnsureCreateSkipsPullWhenImageCached(t *testing.T) {
+// TestEnsureCreateAlwaysPulls covers the same "always pull, never gated on
+// existence" fix on the plain first-run create() path (no existing
+// container at all), not just drift-recreate.
+func TestEnsureCreateAlwaysPulls(t *testing.T) {
 	tmp := t.TempDir()
 	configDir := filepath.Join(tmp, "caddy-config")
 
-	fr := &fakeRuntime{inspectErr: podman.ErrNotFound, imageExists: true}
+	fr := &fakeRuntime{inspectErr: podman.ErrNotFound}
 	fe := &fakeExecer{}
 	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
 
@@ -572,9 +569,71 @@ func TestEnsureCreateSkipsPullWhenImageCached(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 
-	wantCalls := []string{"EnsureNetwork", "InspectContainer", "ImageExists", "CreateContainer", "StartContainer"}
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "PullImage", "ImageArchitecture", "CreateContainer", "StartContainer"}
 	if !reflect.DeepEqual(fr.calls, wantCalls) {
-		t.Fatalf("calls = %v, want %v (no PullImage call — image already present)", fr.calls, wantCalls)
+		t.Fatalf("calls = %v, want %v", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureDriftRecreateArchMismatchLeavesOldContainer proves the
+// defensive arch check added alongside the always-pull fix: if the pulled
+// image's architecture doesn't match the Manager's expectedArch, Ensure
+// returns an actionable error (naming both architectures and the fix
+// command) and — critically — never stops or removes the still-running old
+// container, exactly like a pull failure. expectedArch is overridden
+// directly here (this file is package caddy) to deterministically force a
+// mismatch regardless of which architecture the test happens to run on.
+func TestEnsureDriftRecreateArchMismatchLeavesOldContainer(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{
+		inspectInfo: &podman.ContainerInfo{
+			ID: "abc123", Name: ContainerName, State: "created",
+			Image: Image, Ports: matchingPorts,
+		},
+		archResult: "amd64",
+	}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr.expectedArch = "arm64"
+
+	err := mgr.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure: expected error, got nil")
+	}
+	for _, want := range []string{"amd64", "arm64", "podman pull --arch arm64"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Ensure error = %q, want it to contain %q", err.Error(), want)
+		}
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "PullImage", "ImageArchitecture"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (old container must never be stopped/removed on an arch mismatch)", fr.calls, wantCalls)
+	}
+}
+
+// TestEnsureCreateArchMismatch covers the same arch-mismatch fix on the
+// plain first-run create() path: Ensure must fail with the actionable
+// error rather than creating a container from a wrong-arch image.
+func TestEnsureCreateArchMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "caddy-config")
+
+	fr := &fakeRuntime{inspectErr: podman.ErrNotFound, archResult: "amd64"}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, configDir, 8080, 8443)
+	mgr.expectedArch = "arm64"
+
+	err := mgr.Ensure(context.Background())
+	if err == nil {
+		t.Fatal("Ensure: expected error, got nil")
+	}
+
+	wantCalls := []string{"EnsureNetwork", "InspectContainer", "PullImage", "ImageArchitecture"}
+	if !reflect.DeepEqual(fr.calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no CreateContainer/StartContainer on an arch mismatch)", fr.calls, wantCalls)
 	}
 }
 

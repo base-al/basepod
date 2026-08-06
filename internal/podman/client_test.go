@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -333,6 +334,58 @@ func TestImageExistsErrorStatus(t *testing.T) {
 	})
 	c := fakeDaemon(t, mux)
 	if _, err := c.ImageExists(context.Background(), "x"); err == nil {
+		t.Fatal("expected an error for a 500 response")
+	}
+}
+
+// TestImageArchitectureReturnsArch proves ImageArchitecture decodes the
+// "Architecture" field out of libpod's GET /images/{ref}/json response, via
+// a catch-all handler asserting on the escaped path for the same reason as
+// TestImageExistsTrue.
+func TestImageArchitectureReturnsArch(t *testing.T) {
+	ref := "docker.io/library/caddy:2.10-alpine"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		want := "/v5.0.0/libpod/images/" + url.PathEscape(ref) + "/json"
+		if r.URL.EscapedPath() != want {
+			t.Errorf("request path = %q, want %q", r.URL.EscapedPath(), want)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"Architecture": "amd64"})
+	})
+	c := fakeDaemon(t, mux)
+	arch, err := c.ImageArchitecture(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if arch != "amd64" {
+		t.Fatalf("ImageArchitecture = %q, want %q", arch, "amd64")
+	}
+}
+
+// TestImageArchitectureNotFound proves a 404 (image not present at all)
+// surfaces as ErrNotFound, mirroring InspectContainer's not-found handling.
+func TestImageArchitectureNotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/images/x/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]any{"cause": "no such image", "message": "no such image", "response": 404})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.ImageArchitecture(context.Background(), "x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestImageArchitectureErrorStatus proves a non-200/404 status surfaces as
+// an error.
+func TestImageArchitectureErrorStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/images/x/json", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"message": "boom"})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.ImageArchitecture(context.Background(), "x"); err == nil {
 		t.Fatal("expected an error for a 500 response")
 	}
 }

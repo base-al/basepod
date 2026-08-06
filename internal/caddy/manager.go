@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -60,7 +61,10 @@ func DashboardSockDial() string {
 type Runtime interface {
 	EnsureNetwork(ctx context.Context, name string) error
 	PullImage(ctx context.Context, ref string) error
-	ImageExists(ctx context.Context, ref string) (bool, error)
+	// ImageArchitecture reports the architecture recorded in ref's image
+	// manifest/config — used by Manager to catch a wrong-arch image that
+	// slipped into the local store (see pullImage).
+	ImageArchitecture(ctx context.Context, ref string) (string, error)
 	CreateContainer(ctx context.Context, spec podman.CreateSpec) (string, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string, timeoutSec int) error
@@ -81,6 +85,18 @@ type Manager struct {
 	configDir string
 	httpPort  int
 	httpsPort int
+
+	// expectedArch is the architecture pullImage requires the Image ref to
+	// resolve to after pulling — defaults to runtime.GOARCH (see
+	// NewManager) and is only ever overridden by tests. runtime.GOARCH is
+	// correct here even under podman machine on macOS: BasePod itself runs
+	// on the host (darwin/arm64 on Apple Silicon) while containers run
+	// inside the podman-machine Linux VM, but that VM's architecture always
+	// matches the host's — an arm64 Mac gets an arm64 VM, never an
+	// emulated amd64 one — so the host process's own GOARCH is the right
+	// value to compare a container image's architecture against on both
+	// bare Linux and macOS/Apple-Silicon.
+	expectedArch string
 }
 
 // NewManager builds a Manager. configDir is the host directory bind-mounted
@@ -89,11 +105,12 @@ type Manager struct {
 // and 443.
 func NewManager(rt Runtime, exec Execer, configDir string, httpPort, httpsPort int) *Manager {
 	return &Manager{
-		rt:        rt,
-		exec:      exec,
-		configDir: configDir,
-		httpPort:  httpPort,
-		httpsPort: httpsPort,
+		rt:           rt,
+		exec:         exec,
+		configDir:    configDir,
+		httpPort:     httpPort,
+		httpsPort:    httpsPort,
+		expectedArch: runtime.GOARCH,
 	}
 }
 
@@ -135,14 +152,27 @@ const driftStopTimeout = 5
 // spec create would build today — a different image, different host port
 // mappings, or a container stuck in the "created" state (meaning it was
 // made but never successfully started, e.g. because its port mapping lost
-// a bind race on a previous boot) — and if any of those differ, confirms
-// (pulling if necessary) that the image is available, then stops and
-// removes the old container and recreates it fresh, rather than trying to
-// reconcile it in place. The image check happens before the old container
-// is touched, so a pull failure (registry blip, rate limit) leaves the old
-// container running rather than tearing down ingress with nothing to
-// replace it. Otherwise it just starts the container if it isn't already
-// running.
+// a bind race on a previous boot) — and if any of those differ, pulls the
+// image fresh, then stops and removes the old container and recreates it
+// fresh, rather than trying to reconcile it in place. The pull happens
+// before the old container is touched, so a pull failure (registry blip,
+// rate limit) leaves the old container running rather than tearing down
+// ingress with nothing to replace it. Otherwise it just starts the
+// container if it isn't already running.
+//
+// The pull is unconditional — never gated on an existence check — even
+// though the image is very often already present locally: v0.3's first cut
+// of this skipped PullImage whenever ImageExists reported the image was
+// already cached, which is exactly what let a stale wrong-architecture
+// image (e.g. an amd64 docker.io/library/caddy:2.10-alpine pulled once as a
+// `podman build --platform linux/amd64` base layer, sitting in an arm64
+// Mac's local store) get used unchanged: existence says nothing about which
+// architecture's manifest got resolved, but `podman pull` re-resolves the
+// manifest for the host architecture every time. pullImage additionally
+// double-checks the result via ImageArchitecture as a defensive backstop —
+// see its doc comment — for the residual case where the pull itself is a
+// no-op against a wrong-arch cache entry (e.g. daemon offline, or a future
+// libpod/registry combination that doesn't re-resolve on every call).
 func (m *Manager) Ensure(ctx context.Context) error {
 	if err := m.rt.EnsureNetwork(ctx, NetworkName); err != nil {
 		return fmt.Errorf("caddy: ensure network %q: %w", NetworkName, err)
@@ -162,15 +192,16 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	}
 	if reason := driftReason(info, m.desiredPorts(), desiredMounts); reason != "" {
 		log.Printf("caddy: %s has drifted (%s) — recreating", ContainerName, reason)
-		// Confirm (and, if necessary, pull) the image BEFORE tearing down
-		// the old container: create()'s own PullImage can fail (registry
-		// blip, rate limit — no local dependency, so no reason it can't),
-		// and if that happened after StopContainer/RemoveContainer had
-		// already run, the old container would already be gone with
-		// nothing to replace it, leaving zero ingress until the operator
-		// retries. Checking (and pulling) first means a pull failure here
-		// leaves the old, still-serving container untouched.
-		if err := m.ensureImage(ctx); err != nil {
+		// Pull (and arch-verify) the image BEFORE tearing down the old
+		// container: pullImage can fail (registry blip, rate limit — no
+		// local dependency, so no reason it can't, and now also a wrong-arch
+		// result — see pullImage's doc comment), and if that happened after
+		// StopContainer/RemoveContainer had already run, the old container
+		// would already be gone with nothing to replace it, leaving zero
+		// ingress until the operator retries. Pulling first means a pull or
+		// arch-mismatch failure here leaves the old, still-serving container
+		// untouched.
+		if err := m.pullImage(ctx); err != nil {
 			return err
 		}
 		if err := m.rt.StopContainer(ctx, info.ID, driftStopTimeout); err != nil {
@@ -325,29 +356,44 @@ func portsEqual(a, b []podman.PortMapping) bool {
 	return true
 }
 
-// ensureImage makes sure Image is present in the local image store,
-// pulling it only if ImageExists reports it isn't already there. Called
-// both by create() (so a cached image never depends on registry
-// reachability — only a genuinely missing image, e.g. first install,
-// pulls) and, before that, by Ensure's drift-recreate branch (so a pull
-// failure there is caught before the old container is torn down).
-func (m *Manager) ensureImage(ctx context.Context) error {
-	exists, err := m.rt.ImageExists(ctx, Image)
-	if err != nil {
-		return fmt.Errorf("caddy: check image %s exists: %w", Image, err)
-	}
-	if exists {
-		return nil
-	}
+// pullImage unconditionally pulls Image and verifies the result's
+// architecture matches expectedArch, returning an actionable error on
+// mismatch. Called by create() (so both first install and the end of
+// Ensure's drift-recreate branch always pull) and, before that, by
+// Ensure's drift-recreate branch itself (so a pull or arch-mismatch
+// failure there is caught before the old container is torn down — see
+// Ensure's doc comment for why this must never be gated on an existence
+// check).
+//
+// The arch check is a defensive backstop, not the primary fix: `podman
+// pull` itself re-resolves the image manifest for the host architecture,
+// so in the overwhelmingly common case a wrong-arch image simply can't
+// survive a real pull. This still confirms it explicitly and fails loudly
+// (naming both architectures and the exact command to fix it) rather than
+// silently handing a container spec to CreateContainer that's certain to
+// crash the moment it starts (the qemu-emulation "taggedPointerPack
+// invalid packing" style failure this whole fix exists to prevent) — cheap
+// insurance against any pull path that turns out to be a no-op against a
+// stale wrong-arch cache entry (e.g. a daemon that's unreachable but
+// reports success, or a future libpod/registry combination that doesn't
+// re-resolve on every call).
+func (m *Manager) pullImage(ctx context.Context) error {
 	if err := m.rt.PullImage(ctx, Image); err != nil {
 		return fmt.Errorf("caddy: pull %s: %w", Image, err)
+	}
+	arch, err := m.rt.ImageArchitecture(ctx, Image)
+	if err != nil {
+		return fmt.Errorf("caddy: check architecture of %s: %w", Image, err)
+	}
+	if arch != m.expectedArch {
+		return fmt.Errorf("caddy: %s resolved to architecture %q, but this host needs %q — likely a stale cached image (e.g. pulled earlier as a build's base layer under a different --platform); fix with `podman pull --arch %s %s`, or remove the cached image and retry", Image, arch, m.expectedArch, m.expectedArch, Image)
 	}
 	return nil
 }
 
-// create writes the initial (empty-routes) config, ensures the Caddy image
-// is present (pulling it only if missing — see ensureImage), and creates
-// and starts the bp-caddy container. Called both on first run
+// create writes the initial (empty-routes) config, unconditionally pulls
+// and arch-verifies the Caddy image (see pullImage), and creates and
+// starts the bp-caddy container. Called both on first run
 // (InspectContainer reports the container doesn't exist yet) and at the
 // end of Ensure's drift-recreate branch.
 func (m *Manager) create(ctx context.Context) error {
@@ -372,7 +418,7 @@ func (m *Manager) create(ctx context.Context) error {
 		return fmt.Errorf("caddy: write initial config: %w", err)
 	}
 
-	if err := m.ensureImage(ctx); err != nil {
+	if err := m.pullImage(ctx); err != nil {
 		return err
 	}
 
