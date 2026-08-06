@@ -40,7 +40,12 @@ type CreateSpec struct {
 	NetworkAliases []string
 	PortMappings   []PortMapping
 	Mounts         []BindMount
-	RestartPolicy  string // "always" | "no"
+	// NamedVolumes are libpod named volumes (as opposed to Mounts's host
+	// bind mounts) mounted into the container — v0.5 Task 6's substrate
+	// for compose's stateful services (SQLite/Postgres-style apps). See
+	// NamedVolume's doc comment for the wire-format verification trail.
+	NamedVolumes  []NamedVolume
+	RestartPolicy string // "always" | "no"
 
 	// MemoryLimitBytes caps the container's memory (libpod
 	// resource_limits.memory.limit). 0 = unlimited.
@@ -93,6 +98,37 @@ type BindMount struct {
 	ReadOnly bool
 }
 
+// NamedVolume describes a libpod named volume mounted into the container
+// — as opposed to BindMount's host bind mount. Name is the actual libpod
+// volume name (already fully derived by the caller — internal/deploy's
+// VolumeName, "bp-<slug>-<volume-name>" — not the app's short logical
+// name); Dest is the absolute path inside the container it's mounted at.
+//
+// Wire-format verification (v0.5 Task 6, following the same drill v0.4's
+// resource limits used — see specGen's doc comment): confirmed against
+// podman v5.7.1's actual source at the exact commit (f845d14e) the local
+// dev daemon (podman machine, server API version 5.7.1) reports itself
+// built from — pkg/specgen/specgen.go's ContainerStorageConfig.Volumes
+// (`json:"volumes,omitempty"`, type []*NamedVolume) and
+// pkg/specgen/volumes.go's NamedVolume struct itself: Name/Dest/Options/
+// IsAnonymous/SubPath, all string/[]string/bool with NO json tags at
+// all — meaning the wire keys are the bare Go field names ("Name",
+// "Dest"), not the lowercase forms the SpecGenerator's OTHER embedded
+// structs use. ContainerStorageConfig is anonymously embedded in
+// SpecGenerator (alongside ContainerBasicConfig, ContainerSecurityConfig,
+// etc.), so its Volumes field flattens onto the top-level request body as
+// "volumes" — the same flattening pattern this package's ResourceLimits
+// field already relies on (see specGen's doc comment). Cross-checked live
+// against the local socket: created a container with
+// {"volumes":[{"Name":"...","Dest":"/data"}]} and confirmed via
+// GET .../json that libpod auto-created and mounted the named volume at
+// the given destination — see the v0.5 Task 6 report for the full
+// request/response trail.
+type NamedVolume struct {
+	Name string
+	Dest string
+}
+
 // specGen is the subset of libpod's SpecGenerator that CreateContainer
 // sends to POST /libpod/containers/create. Field names/casing follow the
 // libpod API exactly (see docs/plan/03 and the podman API reference).
@@ -111,19 +147,23 @@ type BindMount struct {
 // perNetworkOptions/specMount already hand-roll their own libpod wire
 // subsets instead of depending on podman's or runtime-spec's Go packages.
 type specGen struct {
-	Name            string                       `json:"name"`
-	Image           string                       `json:"image"`
-	Labels          map[string]string            `json:"labels,omitempty"`
-	Env             map[string]string            `json:"env,omitempty"`
-	Command         []string                     `json:"command,omitempty"`
-	Networks        map[string]perNetworkOptions `json:"Networks,omitempty"`
-	NetNS           *namespace                   `json:"netns,omitempty"`
-	PortMappings    []PortMapping                `json:"portmappings,omitempty"`
-	Mounts          []specMount                  `json:"mounts,omitempty"`
-	RestartPolicy   string                       `json:"restart_policy,omitempty"`
-	ResourceLimits  *resourceLimits              `json:"resource_limits,omitempty"`
-	CapDrop         []string                     `json:"cap_drop,omitempty"`
-	NoNewPrivileges *bool                        `json:"no_new_privileges,omitempty"`
+	Name         string                       `json:"name"`
+	Image        string                       `json:"image"`
+	Labels       map[string]string            `json:"labels,omitempty"`
+	Env          map[string]string            `json:"env,omitempty"`
+	Command      []string                     `json:"command,omitempty"`
+	Networks     map[string]perNetworkOptions `json:"Networks,omitempty"`
+	NetNS        *namespace                   `json:"netns,omitempty"`
+	PortMappings []PortMapping                `json:"portmappings,omitempty"`
+	Mounts       []specMount                  `json:"mounts,omitempty"`
+	// Volumes maps onto ContainerStorageConfig.Volumes when flattened —
+	// see NamedVolume's doc comment for the wire-format verification
+	// trail (v0.5 Task 6).
+	Volumes         []namedVolume   `json:"volumes,omitempty"`
+	RestartPolicy   string          `json:"restart_policy,omitempty"`
+	ResourceLimits  *resourceLimits `json:"resource_limits,omitempty"`
+	CapDrop         []string        `json:"cap_drop,omitempty"`
+	NoNewPrivileges *bool           `json:"no_new_privileges,omitempty"`
 }
 
 // resourceLimits mirrors the subset of OCI runtime-spec's LinuxResources
@@ -195,6 +235,18 @@ type specMount struct {
 	Options     []string `json:"options,omitempty"` // ["ro"] when ReadOnly
 }
 
+// namedVolume is the wire shape of one entry in specGen.Volumes. Mirrors
+// libpod's own pkg/specgen.NamedVolume exactly — Name and Dest only (the
+// other real fields, Options/IsAnonymous/SubPath, are unused by BasePod
+// and left off rather than carried as always-zero placeholders) — with NO
+// json tags, deliberately: see NamedVolume's doc comment for why the real
+// struct has none either, so the wire keys must be the literal Go field
+// names "Name"/"Dest", not lowercased.
+type namedVolume struct {
+	Name string
+	Dest string
+}
+
 // networkCreate is the body for POST /libpod/networks/create. DNSEnabled
 // must be set explicitly: unlike `podman network create` (whose CLI
 // defaults to DNS-enabled), the raw libpod API defaults dns_enabled to
@@ -205,4 +257,30 @@ type networkCreate struct {
 	Name       string            `json:"name"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	DNSEnabled bool              `json:"dns_enabled"`
+}
+
+// volumeCreate is the body for POST /libpod/volumes/create
+// (Client.EnsureVolume). Field names verified against libpod v5.7.1's
+// actual source at the exact commit (f845d14e) the local dev daemon
+// reports itself built from:
+// pkg/api/handlers/libpod/volumes.go's CreateVolume handler decodes the
+// request BODY via plain json.Decode into
+// entities.VolumeCreateOptions (a type alias for
+// pkg/domain/entities/types.VolumeCreateOptions), whose fields (Name,
+// Driver, Label, Labels, Options, IgnoreIfExists, UID, GID) carry ONLY
+// `schema:"..."` tags — used for that same struct's OTHER binding path,
+// decoding query-string parameters, which volumes/create doesn't use for
+// the body — and no `json` tags at all, so like NamedVolume the wire keys
+// for the body are the bare Go field names. Only Name and Labels are
+// populated here (the rest default to their zero value and are omitted).
+// Verified live against the local socket: POST'd
+// {"Name":"...","Labels":{"basepod.managed":"true",...}}, confirmed via
+// GET .../json that the created volume carries exactly those labels, and
+// confirmed a container referencing that volume by name in its "volumes"
+// field mounts it as-is (labels preserved) rather than silently
+// re-creating an unlabeled one — see the v0.5 Task 6 report for the full
+// request/response trail.
+type volumeCreate struct {
+	Name   string            `json:"Name,omitempty"`
+	Labels map[string]string `json:"Labels,omitempty"`
 }

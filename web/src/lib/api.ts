@@ -25,6 +25,25 @@ export interface LoginResponse {
   user: User
 }
 
+/** deploy_strategy values (v0.5 Task 6) — see store.App.DeployStrategy's
+ * doc comment. "replace" stops+removes the app's previous container
+ * BEFORE creating the new one (required for volume-backed apps so two
+ * containers never write the same named volume at once); the trade is
+ * that a failed "replace" deploy leaves the app down with status "error"
+ * rather than falling back to the old container, since there is none. */
+export type DeployStrategy = 'zero-downtime' | 'replace'
+
+/** One of an app's declared named volumes (v0.5 Task 6), in the exact
+ * wire shape internal/api/apps.go's volumeResponse returns. `name` is the
+ * app-scoped logical name, not the derived libpod volume name
+ * ("bp-<slug>-<name>", internal/deploy.VolumeName) — the API never
+ * exposes that. Manual volume create/delete is out of scope this
+ * milestone; volumes are declared by Task 8's compose apply only. */
+export interface Volume {
+  name: string
+  container_path: string
+}
+
 export interface App {
   slug: string
   image: string
@@ -38,15 +57,22 @@ export interface App {
   memory_limit_mb: number
   cpu_limit: number
   pids_limit: number
+  /** v0.5 Task 6 additions — see DeployStrategy's and Volume's doc
+   * comments. Always present (Volumes is [] rather than omitted/null when
+   * an app has none). */
+  deploy_strategy: DeployStrategy
+  volumes: Volume[]
 }
 
 /** Body for PATCH /apps/{slug} (internal/api/apps.go's patchAppRequest):
- * every field is optional so a caller can update just one limit — an
- * omitted field leaves that limit unchanged server-side. */
+ * every field is optional so a caller can update just one limit (or the
+ * deploy strategy) — an omitted field leaves it unchanged server-side. An
+ * unrecognized deploy_strategy value 422s. */
 export interface PatchAppRequest {
   memory_limit_mb?: number
   cpu_limit?: number
   pids_limit?: number
+  deploy_strategy?: DeployStrategy
 }
 
 /** One deploy attempt for an app, in the exact wire shape
@@ -390,6 +416,12 @@ export const api = {
     }),
 
   deleteApp: (slug: string) => request<void>(`/apps/${slug}`, { method: 'DELETE' }),
+
+  /** Read-only list of an app's declared named volumes (v0.5 Task 6) —
+   * same data as App.volumes, independently addressable. Manual volume
+   * create/delete is out of scope this milestone (see Volume's doc
+   * comment), so there is no corresponding write method here. */
+  getAppVolumes: (slug: string) => request<Volume[]>(`/apps/${slug}/volumes`),
 
   getEnv: (slug: string) => request<EnvVar[]>(`/apps/${slug}/env`),
 

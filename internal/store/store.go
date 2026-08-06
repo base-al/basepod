@@ -50,16 +50,27 @@ type User struct {
 // container with the new alias — Routes() must render whichever alias the
 // app's currently-running container really has, not whichever scheme is
 // "newest".
+//
+// DeployStrategy selects how internal/deploy's runRollout cuts over an
+// app's container generation on every deploy/rollback — see migration
+// 00008_volumes_strategy.sql's doc comment for the full rationale.
+// DeployStrategyZeroDowntime (the schema default) creates+starts+probes
+// the new container before tearing down the old one; DeployStrategyReplace
+// tears the old one down FIRST, which volume-backed (SQLite/Postgres-style)
+// apps require to avoid two containers writing one named volume at once,
+// at the cost of a failed deploy leaving the app down with no old
+// container to fall back to.
 type App struct {
-	ID            int64
-	Slug          string
-	ImageRef      string
-	Port          int
-	Status        string
-	MemoryLimitMB int64
-	CPULimit      float64
-	PidsLimit     int64
-	AliasScheme   string
+	ID             int64
+	Slug           string
+	ImageRef       string
+	Port           int
+	Status         string
+	MemoryLimitMB  int64
+	CPULimit       float64
+	PidsLimit      int64
+	AliasScheme    string
+	DeployStrategy string
 }
 
 // AliasSchemeLegacy and AliasSchemeV2 are the two values App.AliasScheme
@@ -68,6 +79,23 @@ const (
 	AliasSchemeLegacy = "legacy"
 	AliasSchemeV2     = "v2"
 )
+
+// DeployStrategyZeroDowntime and DeployStrategyReplace are the two values
+// App.DeployStrategy (and the apps.deploy_strategy column) can hold — see
+// App's doc comment and migration 00008_volumes_strategy.sql.
+const (
+	DeployStrategyZeroDowntime = "zero-downtime"
+	DeployStrategyReplace      = "replace"
+)
+
+// ValidDeployStrategy reports whether s is one of the two recognized
+// App.DeployStrategy values — used by the API layer (PATCH
+// /api/v1/apps/{slug}) to 422 on an unknown value rather than silently
+// persisting garbage that internal/deploy's runRollout would fall through
+// to zero-downtime behavior for.
+func ValidDeployStrategy(s string) bool {
+	return s == DeployStrategyZeroDowntime || s == DeployStrategyReplace
+}
 
 // Deployment is a single deploy attempt for an App. StartedAt is always
 // set (RFC3339 UTC); FinishedAt is "" until the deployment reaches a
@@ -445,13 +473,14 @@ const (
 
 // appColumns is the column list (in scan order) shared by CreateApp's
 // implicit row shape, scanApp, and ListApps.
-const appColumns = `id, slug, image_ref, port, status, memory_limit_mb, cpu_limit, pids_limit, alias_scheme`
+const appColumns = `id, slug, image_ref, port, status, memory_limit_mb, cpu_limit, pids_limit, alias_scheme, deploy_strategy`
 
 // CreateApp inserts a new app with status "created", the schema's default
-// resource limits (see defaultMemoryLimitMB etc.), and the schema's
-// default alias_scheme ("legacy" — see App.AliasScheme's doc comment: it
-// only becomes "v2" once a rollout actually creates a container with the
-// new alias), and returns it.
+// resource limits (see defaultMemoryLimitMB etc.), the schema's default
+// alias_scheme ("legacy" — see App.AliasScheme's doc comment: it only
+// becomes "v2" once a rollout actually creates a container with the new
+// alias), and the schema's default deploy_strategy ("zero-downtime" — see
+// App.DeployStrategy's doc comment), and returns it.
 func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	res, err := s.db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, slug, imageRef, port)
 	if err != nil {
@@ -464,13 +493,14 @@ func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	return &App{
 		ID: id, Slug: slug, ImageRef: imageRef, Port: port, Status: "created",
 		MemoryLimitMB: DefaultMemoryLimitMB, CPULimit: DefaultCPULimit, PidsLimit: DefaultPidsLimit,
-		AliasScheme: AliasSchemeLegacy,
+		AliasScheme:    AliasSchemeLegacy,
+		DeployStrategy: DeployStrategyZeroDowntime,
 	}, nil
 }
 
 func scanApp(row *sql.Row) (*App, error) {
 	var a App
-	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme)
+	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -506,7 +536,7 @@ func (s *Store) ListApps() ([]App, error) {
 	var apps []App
 	for rows.Next() {
 		var a App
-		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme); err != nil {
+		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit, &a.AliasScheme, &a.DeployStrategy); err != nil {
 			return nil, err
 		}
 		apps = append(apps, a)
@@ -523,6 +553,16 @@ func (s *Store) ListApps() ([]App, error) {
 func (s *Store) UpdateAppAliasScheme(id int64, scheme string) error {
 	_, err := s.db.Exec(`UPDATE apps SET alias_scheme = ?, updated_at = ? WHERE id = ?`,
 		scheme, time.Now().UTC().Format(timeFormat), id)
+	return err
+}
+
+// UpdateAppDeployStrategy sets an app's deploy_strategy (see App's doc
+// comment) and bumps updated_at. The caller (API layer) owns validating
+// the value against ValidDeployStrategy before calling this — the store
+// applies it as given.
+func (s *Store) UpdateAppDeployStrategy(id int64, strategy string) error {
+	_, err := s.db.Exec(`UPDATE apps SET deploy_strategy = ?, updated_at = ? WHERE id = ?`,
+		strategy, time.Now().UTC().Format(timeFormat), id)
 	return err
 }
 
@@ -562,7 +602,14 @@ func (s *Store) UpdateAppImage(id int64, imageRef string) error {
 	return err
 }
 
-// DeleteApp removes an app (and its deployments, via ON DELETE CASCADE).
+// DeleteApp removes an app (and its deployments and declared-volume
+// bookkeeping rows, via ON DELETE CASCADE — see migration
+// 00008_volumes_strategy.sql). This only ever removes the volumes TABLE
+// row (metadata: logical name + container path); it never removes the
+// underlying libpod volume the data actually lives in — see
+// internal/api's handleDeleteApp, which lists this app's volumes via
+// ListVolumes BEFORE calling this, precisely so it can still log their
+// (surviving) libpod names afterward.
 func (s *Store) DeleteApp(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM apps WHERE id = ?`, id)
 	return err
@@ -876,4 +923,78 @@ func (s *Store) DeleteDomain(id int64) error {
 func (s *Store) DomainByHostname(hostname string) (*Domain, error) {
 	row := s.db.QueryRow(`SELECT id, app_id, hostname FROM domains WHERE hostname = ?`, hostname)
 	return scanDomain(row)
+}
+
+// ---------------------------------------------------------------------
+// v0.5 Task 6: named volumes (migration 00008_volumes_strategy.sql).
+// Kept in its own block at the end of the file deliberately — a
+// concurrent v0.5 task (git sources/deliveries, migration 00007) touches
+// this same file, and isolating this task's additions here keeps that
+// merge a pure append on both sides.
+// ---------------------------------------------------------------------
+
+// Volume is a named volume declared for an App (see migration
+// 00008_volumes_strategy.sql). Name is the short logical name an operator
+// (or Task 8's compose apply) assigns; the actual libpod volume a rollout
+// creates/mounts is derived from it as "bp-<app.Slug>-<name>" (see
+// internal/deploy.VolumeName) rather than stored here, so there is only
+// one source of truth for that derivation. ContainerPath is the absolute
+// path inside the container the volume is mounted at.
+type Volume struct {
+	ID            int64
+	AppID         int64
+	Name          string
+	ContainerPath string
+	CreatedAt     string
+}
+
+const volumeColumns = `id, app_id, name, container_path, created_at`
+
+func scanVolume(scan func(...any) error) (Volume, error) {
+	var v Volume
+	err := scan(&v.ID, &v.AppID, &v.Name, &v.ContainerPath, &v.CreatedAt)
+	return v, err
+}
+
+// UpsertVolume declares a named volume for appID, or updates its
+// container_path if one with this name already exists (UNIQUE(app_id,
+// name) — see the migration). Manual volume create/delete is out of scope
+// this milestone (v0.6+): Task 8's compose apply is this method's only
+// caller in production, deliberately upserting rather than failing on a
+// re-apply of an unchanged compose file.
+func (s *Store) UpsertVolume(appID int64, name, containerPath string) (*Volume, error) {
+	now := time.Now().UTC().Format(timeFormat)
+	if _, err := s.db.Exec(`
+		INSERT INTO volumes(app_id, name, container_path, created_at) VALUES(?, ?, ?, ?)
+		ON CONFLICT(app_id, name) DO UPDATE SET container_path = excluded.container_path`,
+		appID, name, containerPath, now); err != nil {
+		return nil, err
+	}
+	row := s.db.QueryRow(`SELECT `+volumeColumns+` FROM volumes WHERE app_id = ? AND name = ?`, appID, name)
+	v, err := scanVolume(row.Scan)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// ListVolumes returns appID's declared volumes, ordered by name. Backs
+// GET /api/v1/apps/{slug}/volumes and internal/deploy's runRollout (which
+// mounts every one of them into the app's next container).
+func (s *Store) ListVolumes(appID int64) ([]Volume, error) {
+	rows, err := s.db.Query(`SELECT `+volumeColumns+` FROM volumes WHERE app_id = ? ORDER BY name`, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var volumes []Volume
+	for rows.Next() {
+		v, err := scanVolume(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		volumes = append(volumes, v)
+	}
+	return volumes, rows.Err()
 }
