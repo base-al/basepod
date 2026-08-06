@@ -238,7 +238,29 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: apply routes: %w", err)
 	}
 
-	srv := newHTTPServer(cfg.Listen, rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder)))
+	// handler is shared by both listeners. The public loopback listener
+	// (cfg.Listen) serves it as-is — untrusted. The dashboard's
+	// unix-socket listener, reachable only by bp-caddy's container (see
+	// prepareDashboardListener's doc comment), serves it wrapped in
+	// api.TrustedProxyMiddleware — marking every request that arrives
+	// through it as having passed through Caddy, so clientIP (see
+	// internal/api/clientip.go) may honor its X-Forwarded-For header.
+	// This wrapping is the ONLY thing that ever grants trusted status:
+	// there is no header or other client-controlled input that can spoof
+	// it, since a request reaching the loopback listener never touches
+	// TrustedProxyMiddleware at all.
+	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder))
+	srv := newHTTPServer(cfg.Listen, handler)
+
+	// dashboardSrv is a second *http.Server sharing every setting
+	// newHTTPServer applies, but wired to the trust-marking handler above
+	// and served over dashboardListener directly (Serve, not
+	// ListenAndServe) rather than its own Addr, which is therefore left
+	// unset (unused; Serve ignores http.Server.Addr entirely).
+	var dashboardSrv *http.Server
+	if dashboardListener != nil {
+		dashboardSrv = newHTTPServer("", api.TrustedProxyMiddleware(handler))
+	}
 
 	log.Printf("basepod: listening on %s", cfg.Listen)
 	log.Printf("basepod: root domain %s", rootDomain)
@@ -265,7 +287,7 @@ func Run(ctx context.Context, cfgPath string) error {
 
 	if dashboardListener != nil {
 		go func() {
-			if err := srv.Serve(dashboardListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := dashboardSrv.Serve(dashboardListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				serveErr <- err
 				return
 			}
@@ -279,7 +301,16 @@ func Run(ctx context.Context, cfgPath string) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+		var shutdownErrs []error
 		if err := srv.Shutdown(shutdownCtx); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		if dashboardSrv != nil {
+			if err := dashboardSrv.Shutdown(shutdownCtx); err != nil {
+				shutdownErrs = append(shutdownErrs, err)
+			}
+		}
+		if err := errors.Join(shutdownErrs...); err != nil {
 			return fmt.Errorf("server: shutdown: %w", err)
 		}
 		return nil

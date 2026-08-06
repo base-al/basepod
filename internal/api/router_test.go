@@ -169,3 +169,63 @@ func TestRateLimiterStillEnforcesLimit(t *testing.T) {
 		t.Fatal("expected the 4th attempt within the window to be blocked")
 	}
 }
+
+// TestRateLimiterBlockedDoesNotConsume proves Blocked is a pure read: an
+// unlimited number of Blocked checks against an unused key never trips
+// the limiter, and Blocked itself never advances a key that's already at
+// its limit. Checking status must never be indistinguishable from making
+// an attempt (see api.handleLogin's use of Blocked before deciding
+// whether a request counts as one).
+func TestRateLimiterBlockedDoesNotConsume(t *testing.T) {
+	now := time.Now()
+	rl := newRateLimiter(3, time.Minute)
+	rl.nowFunc = func() time.Time { return now }
+
+	for i := 0; i < 10; i++ {
+		if rl.Blocked("k") {
+			t.Fatalf("Blocked check %d: unexpectedly blocked on a never-attempted key", i)
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		if !rl.Allow("k") {
+			t.Fatalf("Allow %d: expected allowed", i)
+		}
+	}
+	if !rl.Blocked("k") {
+		t.Fatal("expected Blocked to report true once the limit is reached")
+	}
+	// Checking again (repeatedly) must not itself do anything further.
+	if !rl.Blocked("k") {
+		t.Fatal("expected Blocked to still report true on a second check")
+	}
+}
+
+// TestRateLimiterGlobalCeilingTripsAndRecovers proves the exact
+// configuration handleLogin's global failed-login ceiling uses
+// (globalLoginRateLimit attempts within loginRateWindow, all recorded
+// under the single fixed globalLimiterKey) trips once exhausted and
+// recovers once the window has fully elapsed — using an injected clock
+// rather than sleeping for a real minute.
+func TestRateLimiterGlobalCeilingTripsAndRecovers(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := base
+
+	rl := newRateLimiter(globalLoginRateLimit, loginRateWindow)
+	rl.nowFunc = func() time.Time { return now }
+
+	for i := 0; i < globalLoginRateLimit; i++ {
+		if rl.Blocked(globalLimiterKey) {
+			t.Fatalf("attempt %d: unexpectedly already blocked", i)
+		}
+		rl.Allow(globalLimiterKey)
+	}
+	if !rl.Blocked(globalLimiterKey) {
+		t.Fatal("expected the global ceiling to be tripped after globalLoginRateLimit failures")
+	}
+
+	now = base.Add(loginRateWindow + time.Second)
+	if rl.Blocked(globalLimiterKey) {
+		t.Fatal("expected the global ceiling to have recovered after the window elapsed")
+	}
+}
