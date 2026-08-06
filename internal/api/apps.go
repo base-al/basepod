@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -34,10 +35,19 @@ type appResponse struct {
 	Image  string `json:"image"`
 	Port   int    `json:"port"`
 	Status string `json:"status"`
+	// MemoryLimitMB, CPULimit (cores, e.g. 1.5), and PidsLimit are the
+	// container resource limits applied on every deploy (audit H2) — see
+	// store.App's doc comment. 0 means unlimited.
+	MemoryLimitMB int64   `json:"memory_limit_mb"`
+	CPULimit      float64 `json:"cpu_limit"`
+	PidsLimit     int64   `json:"pids_limit"`
 }
 
 func toAppResponse(app *store.App) appResponse {
-	return appResponse{Slug: app.Slug, Image: app.ImageRef, Port: app.Port, Status: app.Status}
+	return appResponse{
+		Slug: app.Slug, Image: app.ImageRef, Port: app.Port, Status: app.Status,
+		MemoryLimitMB: app.MemoryLimitMB, CPULimit: app.CPULimit, PidsLimit: app.PidsLimit,
+	}
 }
 
 type deploymentResponse struct {
@@ -214,6 +224,128 @@ func (a *api) handleGetApp(w http.ResponseWriter, r *http.Request) {
 		out.Deployments = append(out.Deployments, toDeploymentResponse(d))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// Resource-limit validation bounds (audit H2): the lower bounds keep a
+// limit from being set so tight the app's own container can't start (a
+// container needs some floor to even exec its entrypoint; 16 pids is
+// roughly "one process plus a handful of threads/helper procs", 64 MiB is
+// a conservative floor for even a minimal static binary plus its runtime);
+// the upper bounds are a generous ceiling against a fat-fingered request
+// (64 cores / 256 GiB / 64K pids) rather than a real capacity limit — the
+// only way to truly go unbounded is the explicit 0 sentinel, not a huge
+// number. Kept as their own named constants (not folded into the range
+// checks below) so writeLimitValidationError and any future caller/test
+// can reference the same bounds without repeating the literals.
+const (
+	minMemoryLimitMB int64   = 64
+	maxMemoryLimitMB int64   = 262144
+	minCPULimit      float64 = 0.1
+	maxCPULimit      float64 = 64
+	minPidsLimit     int64   = 16
+	maxPidsLimit     int64   = 65536
+)
+
+// validateMemoryLimit reports a validation error message for a proposed
+// memory_limit_mb value, or "" if it's valid. 0 always means unlimited.
+func validateMemoryLimit(mb int64) string {
+	if mb == 0 {
+		return ""
+	}
+	if mb < minMemoryLimitMB || mb > maxMemoryLimitMB {
+		return fmt.Sprintf("memory_limit_mb must be 0 (unlimited) or between %d and %d", minMemoryLimitMB, maxMemoryLimitMB)
+	}
+	return ""
+}
+
+// validateCPULimit reports a validation error message for a proposed
+// cpu_limit value (in cores), or "" if it's valid. 0 always means unlimited.
+func validateCPULimit(cores float64) string {
+	if cores == 0 {
+		return ""
+	}
+	if cores < minCPULimit || cores > maxCPULimit {
+		return fmt.Sprintf("cpu_limit must be 0 (unlimited) or between %g and %g", minCPULimit, maxCPULimit)
+	}
+	return ""
+}
+
+// validatePidsLimit reports a validation error message for a proposed
+// pids_limit value, or "" if it's valid. 0 always means unlimited.
+func validatePidsLimit(pids int64) string {
+	if pids == 0 {
+		return ""
+	}
+	if pids < minPidsLimit || pids > maxPidsLimit {
+		return fmt.Sprintf("pids_limit must be 0 (unlimited) or between %d and %d", minPidsLimit, maxPidsLimit)
+	}
+	return ""
+}
+
+// patchAppRequest is the body for PATCH /api/v1/apps/{slug}: every field is
+// a pointer so an omitted field leaves that limit unchanged (a partial
+// update), distinguishing "not sent" from "sent as 0" (which is a real,
+// meaningful value — unlimited — not a no-op).
+type patchAppRequest struct {
+	MemoryLimitMB *int64   `json:"memory_limit_mb"`
+	CPULimit      *float64 `json:"cpu_limit"`
+	PidsLimit     *int64   `json:"pids_limit"`
+}
+
+// handlePatchApp updates an app's container resource limits (audit H2):
+// memory_limit_mb, cpu_limit, and pids_limit, each independently optional
+// in the request body (an omitted field is left unchanged) and each
+// independently validated against its own min/max — a request naming more
+// than one out-of-range field still gets a single 422 naming whichever is
+// checked first (memory, then cpu, then pids). Values only take effect on
+// the app's containers starting from its *next* deploy; this endpoint
+// itself never touches a running container, matching how env var changes
+// (PUT .../env) work today.
+func (a *api) handlePatchApp(w http.ResponseWriter, r *http.Request) {
+	app, ok := a.appBySlugOrNotFound(w, r)
+	if !ok {
+		return
+	}
+
+	var req patchAppRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+
+	memory := app.MemoryLimitMB
+	if req.MemoryLimitMB != nil {
+		if msg := validateMemoryLimit(*req.MemoryLimitMB); msg != "" {
+			writeError(w, http.StatusUnprocessableEntity, "validation", msg)
+			return
+		}
+		memory = *req.MemoryLimitMB
+	}
+
+	cpu := app.CPULimit
+	if req.CPULimit != nil {
+		if msg := validateCPULimit(*req.CPULimit); msg != "" {
+			writeError(w, http.StatusUnprocessableEntity, "validation", msg)
+			return
+		}
+		cpu = *req.CPULimit
+	}
+
+	pids := app.PidsLimit
+	if req.PidsLimit != nil {
+		if msg := validatePidsLimit(*req.PidsLimit); msg != "" {
+			writeError(w, http.StatusUnprocessableEntity, "validation", msg)
+			return
+		}
+		pids = *req.PidsLimit
+	}
+
+	if err := a.st.UpdateAppLimits(app.ID, memory, cpu, pids); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to update app limits")
+		return
+	}
+
+	app.MemoryLimitMB, app.CPULimit, app.PidsLimit = memory, cpu, pids
+	writeJSON(w, http.StatusOK, toAppResponse(app))
 }
 
 type deployRequest struct {

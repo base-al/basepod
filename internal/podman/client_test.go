@@ -118,6 +118,101 @@ func TestCreateContainerNoNetworkOmitsNetNS(t *testing.T) {
 	}
 }
 
+// TestCreateContainerHardeningAlwaysApplied covers audit finding H2's
+// fixed hardening: every container gets no-new-privileges and a NET_RAW
+// capability drop, even one with no resource limits set at all — this
+// isn't gated by CreateSpec (see CreateContainer's doc comment for why).
+func TestCreateContainerHardeningAlwaysApplied(t *testing.T) {
+	var got map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(map[string]string{"Id": "abc123"})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.CreateContainer(context.Background(), CreateSpec{Name: "x", Image: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	if got["no_new_privileges"] != true {
+		t.Fatalf("no_new_privileges = %v, want true", got["no_new_privileges"])
+	}
+	capDrop, ok := got["cap_drop"].([]any)
+	if !ok || len(capDrop) != 1 || capDrop[0] != "NET_RAW" {
+		t.Fatalf("cap_drop = %v, want [NET_RAW]", got["cap_drop"])
+	}
+}
+
+// TestCreateContainerResourceLimits covers audit finding H2's resource
+// caps: MemoryLimitBytes/CPUQuota/PidsLimit map onto libpod's
+// resource_limits.{memory.limit, cpu.quota, cpu.period, pids.limit} —
+// field names verified against podman v5.7.1's actual specgen source (see
+// the v0.4 Task 2 report). CPUQuota is in cores; period is fixed at
+// cpuPeriodMicros (100ms), so 1.5 cores -> quota 150000.
+func TestCreateContainerResourceLimits(t *testing.T) {
+	var got map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(map[string]string{"Id": "abc123"})
+	})
+	c := fakeDaemon(t, mux)
+	_, err := c.CreateContainer(context.Background(), CreateSpec{
+		Name: "x", Image: "y",
+		MemoryLimitBytes: 512 * 1024 * 1024,
+		CPUQuota:         1.5,
+		PidsLimit:        256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rl, ok := got["resource_limits"].(map[string]any)
+	if !ok {
+		t.Fatalf("resource_limits missing: %v", got)
+	}
+
+	mem, ok := rl["memory"].(map[string]any)
+	if !ok || mem["limit"] != float64(512*1024*1024) {
+		t.Fatalf("resource_limits.memory = %v, want limit=536870912", rl["memory"])
+	}
+
+	cpu, ok := rl["cpu"].(map[string]any)
+	if !ok || cpu["quota"] != float64(150000) || cpu["period"] != float64(100000) {
+		t.Fatalf("resource_limits.cpu = %v, want quota=150000 period=100000", rl["cpu"])
+	}
+
+	pids, ok := rl["pids"].(map[string]any)
+	if !ok || pids["limit"] != float64(256) {
+		t.Fatalf("resource_limits.pids = %v, want limit=256", rl["pids"])
+	}
+}
+
+// TestCreateContainerZeroLimitsOmitResourceLimits covers the "zero means
+// unlimited" contract (CreateSpec's doc comment): when
+// MemoryLimitBytes/CPUQuota/PidsLimit are all left at their zero value
+// (e.g. internal/caddy.Manager's own CreateSpec, which never sets them),
+// resource_limits must be omitted from the wire request entirely — not
+// present with a zero/empty value, and not regressing an unlimited
+// container into an accidentally memory/cpu/pids-capped one.
+func TestCreateContainerZeroLimitsOmitResourceLimits(t *testing.T) {
+	var got map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v5.0.0/libpod/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(map[string]string{"Id": "abc123"})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.CreateContainer(context.Background(), CreateSpec{Name: "x", Image: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["resource_limits"]; ok {
+		t.Fatalf("resource_limits should be omitted when all limits are 0: %v", got)
+	}
+}
+
 func TestStopAlreadyStoppedIsSuccess(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v5.0.0/libpod/containers/x/stop", func(w http.ResponseWriter, _ *http.Request) {

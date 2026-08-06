@@ -1,0 +1,8 @@
+-- +goose Up
+ALTER TABLE apps ADD COLUMN memory_limit_mb INTEGER NOT NULL DEFAULT 512;
+ALTER TABLE apps ADD COLUMN cpu_limit REAL NOT NULL DEFAULT 1.0;
+ALTER TABLE apps ADD COLUMN pids_limit INTEGER NOT NULL DEFAULT 512;
+-- +goose Down
+ALTER TABLE apps DROP COLUMN pids_limit;
+ALTER TABLE apps DROP COLUMN cpu_limit;
+ALTER TABLE apps DROP COLUMN memory_limit_mb;

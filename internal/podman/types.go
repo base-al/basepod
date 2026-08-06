@@ -9,6 +9,27 @@ var ErrNotFound = errors.New("podman: not found")
 // CreateSpec describes a container to create via the libpod SpecGenerator
 // (POST /libpod/containers/create). Only the fields BasePod needs are
 // exposed here; Client.CreateContainer maps this onto the wire format.
+//
+// MemoryLimitBytes, CPUQuota, and PidsLimit are resource limits (audit
+// finding H2: app containers previously ran with none at all, so a hostile
+// third-party image could fork-bomb or balloon memory and take down the
+// control plane and every neighbor app). Each is independently optional:
+// its zero value means "unlimited" and CreateContainer omits the
+// corresponding field from the wire request entirely rather than sending
+// an explicit zero, since libpod's own zero value for these fields already
+// means unlimited — sending it explicitly would be a no-op, not a
+// tightening, so omitting is just the honest way to say "no limit" (and
+// keeps a caller that never sets these, e.g. internal/caddy.Manager's own
+// CreateSpec values, byte-for-byte unaffected). CPUQuota is expressed in
+// CPU cores (e.g. 1.5), not raw microseconds — CreateContainer converts it
+// to libpod's quota/period pair using a fixed 100ms period.
+//
+// Every container created through CreateContainer also gets fixed
+// hardening applied unconditionally (not just for CreateSpec values that
+// set a limit): the no-new-privileges flag and a NET_RAW capability drop.
+// This isn't a CreateSpec field because it is not configurable — see
+// CreateContainer's doc comment for why it's applied at the client.go
+// mapping layer instead.
 type CreateSpec struct {
 	Name           string
 	Image          string
@@ -20,6 +41,19 @@ type CreateSpec struct {
 	PortMappings   []PortMapping
 	Mounts         []BindMount
 	RestartPolicy  string // "always" | "no"
+
+	// MemoryLimitBytes caps the container's memory (libpod
+	// resource_limits.memory.limit). 0 = unlimited.
+	MemoryLimitBytes int64
+	// CPUQuota caps the container's CPU allotment in cores (e.g. 1.5 =
+	// one and a half CPUs), mapped onto libpod resource_limits.cpu.quota
+	// with resource_limits.cpu.period fixed at cpuPeriodMicros (see
+	// CreateContainer). 0 = unlimited.
+	CPUQuota float64
+	// PidsLimit caps the number of processes/threads the container can
+	// create (libpod resource_limits.pids.limit) — the direct mitigation
+	// for a fork-bomb. 0 = unlimited.
+	PidsLimit int64
 }
 
 // ContainerInfo is a summarized view of a libpod container, as returned by
@@ -62,17 +96,75 @@ type BindMount struct {
 // specGen is the subset of libpod's SpecGenerator that CreateContainer
 // sends to POST /libpod/containers/create. Field names/casing follow the
 // libpod API exactly (see docs/plan/03 and the podman API reference).
+//
+// ResourceLimits/CapDrop/NoNewPrivileges field names were verified against
+// podman v5.7.1's actual source (matching the version of the live daemon
+// this was developed against — see the v0.4 Task 2 report for the full
+// verification trail): pkg/specgen/specgen.go's
+// ContainerResourceConfig.ResourceLimits
+// (`json:"resource_limits,omitempty"`, type *spec.LinuxResources) and
+// ContainerSecurityConfig.CapDrop (`json:"cap_drop,omitempty"`,
+// []string)/NoNewPrivileges (`json:"no_new_privileges,omitempty"`, *bool).
+// resourceLimits/linuxMemory/linuxCPU/linuxPids below hand-roll just the
+// subset of opencontainers/runtime-spec v1.2.1's LinuxResources this
+// client sets, rather than importing that module, matching how namespace/
+// perNetworkOptions/specMount already hand-roll their own libpod wire
+// subsets instead of depending on podman's or runtime-spec's Go packages.
 type specGen struct {
-	Name          string                       `json:"name"`
-	Image         string                       `json:"image"`
-	Labels        map[string]string            `json:"labels,omitempty"`
-	Env           map[string]string            `json:"env,omitempty"`
-	Command       []string                     `json:"command,omitempty"`
-	Networks      map[string]perNetworkOptions `json:"Networks,omitempty"`
-	NetNS         *namespace                   `json:"netns,omitempty"`
-	PortMappings  []PortMapping                `json:"portmappings,omitempty"`
-	Mounts        []specMount                  `json:"mounts,omitempty"`
-	RestartPolicy string                       `json:"restart_policy,omitempty"`
+	Name            string                       `json:"name"`
+	Image           string                       `json:"image"`
+	Labels          map[string]string            `json:"labels,omitempty"`
+	Env             map[string]string            `json:"env,omitempty"`
+	Command         []string                     `json:"command,omitempty"`
+	Networks        map[string]perNetworkOptions `json:"Networks,omitempty"`
+	NetNS           *namespace                   `json:"netns,omitempty"`
+	PortMappings    []PortMapping                `json:"portmappings,omitempty"`
+	Mounts          []specMount                  `json:"mounts,omitempty"`
+	RestartPolicy   string                       `json:"restart_policy,omitempty"`
+	ResourceLimits  *resourceLimits              `json:"resource_limits,omitempty"`
+	CapDrop         []string                     `json:"cap_drop,omitempty"`
+	NoNewPrivileges *bool                        `json:"no_new_privileges,omitempty"`
+}
+
+// resourceLimits mirrors the subset of OCI runtime-spec's LinuxResources
+// (github.com/opencontainers/runtime-spec v1.2.1, specs-go/config.go — the
+// version podman v5.7.1 itself depends on) that CreateContainer populates:
+// memory, cpu, and pids limits. Each sub-object is a pointer left nil (and
+// so omitted) when CreateSpec's corresponding field is 0 — see
+// CreateContainer.
+type resourceLimits struct {
+	Memory *linuxMemory `json:"memory,omitempty"`
+	CPU    *linuxCPU    `json:"cpu,omitempty"`
+	Pids   *linuxPids   `json:"pids,omitempty"`
+}
+
+// linuxMemory mirrors runtime-spec's LinuxMemory, restricted to the one
+// field CreateContainer sets. Limit is *int64 (matching runtime-spec
+// exactly) so a present-but-zero value is still distinguishable from
+// absent, though CreateContainer never constructs one with a zero Limit —
+// see resourceLimits's doc comment.
+type linuxMemory struct {
+	Limit *int64 `json:"limit,omitempty"`
+}
+
+// linuxCPU mirrors runtime-spec's LinuxCPU, restricted to Quota/Period —
+// the hardcap pair CreateContainer sets from CreateSpec.CPUQuota (cores)
+// via cpuPeriodMicros. Quota is *int64, Period is *uint64, matching
+// runtime-spec exactly.
+type linuxCPU struct {
+	Quota  *int64  `json:"quota,omitempty"`
+	Period *uint64 `json:"period,omitempty"`
+}
+
+// linuxPids mirrors runtime-spec's LinuxPids. Unlike LinuxMemory.Limit and
+// LinuxCPU.Quota, runtime-spec declares this field as a plain (non-pointer)
+// int64 with json tag "limit" (no omitempty) — verified directly against
+// opencontainers/runtime-spec v1.2.1's specs-go/config.go. That's harmless
+// here: linuxPids is only ever embedded via resourceLimits.Pids, itself a
+// pointer left nil (and so the whole "pids" object omitted) whenever
+// CreateSpec.PidsLimit is 0 — see CreateContainer.
+type linuxPids struct {
+	Limit int64 `json:"limit"`
 }
 
 // namespace is libpod SpecGenerator's Namespace type, used here only for

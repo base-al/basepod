@@ -30,6 +30,23 @@ export interface App {
   image: string
   port: number
   status: AppStatus
+  /** Container resource limits (audit finding H2), in the exact wire shape
+   * internal/api/apps.go's appResponse returns. 0 means unlimited.
+   * memory_limit_mb is MiB; cpu_limit is a core count (e.g. 1.5). Applied
+   * on the app's *next* deploy — PATCH never touches a running
+   * container. */
+  memory_limit_mb: number
+  cpu_limit: number
+  pids_limit: number
+}
+
+/** Body for PATCH /apps/{slug} (internal/api/apps.go's patchAppRequest):
+ * every field is optional so a caller can update just one limit — an
+ * omitted field leaves that limit unchanged server-side. */
+export interface PatchAppRequest {
+  memory_limit_mb?: number
+  cpu_limit?: number
+  pids_limit?: number
 }
 
 /** One deploy attempt for an app, in the exact wire shape
@@ -290,6 +307,17 @@ export const api = {
     }),
 
   getApp: (slug: string) => request<AppDetail>(`/apps/${slug}`),
+
+  /** Updates one or more of an app's container resource limits (audit
+   * finding H2). See internal/api/apps.go's handlePatchApp: 0 means
+   * unlimited, an omitted field is left unchanged, and out-of-range
+   * values 422 naming the field. Takes effect on the app's next deploy,
+   * not immediately. */
+  patchApp: (slug: string, patch: PatchAppRequest) =>
+    request<App>(`/apps/${slug}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
 
   /** Triggers a deploy. Omitting `image` redeploys the app's current
    * image. This call is synchronous server-side and can take minutes

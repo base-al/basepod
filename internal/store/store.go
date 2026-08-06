@@ -32,13 +32,22 @@ type User struct {
 	IsSuperadmin bool
 }
 
-// App is a deployed application.
+// App is a deployed application. MemoryLimitMB, CPULimit (in cores, e.g.
+// 1.5), and PidsLimit are the container resource limits applied to every
+// container this app deploys (see internal/podman.CreateSpec and
+// internal/deploy's runRollout) — 0 means unlimited for any of the three.
+// New apps get the schema defaults (512 MiB / 1.0 cores / 512 pids, see
+// migration 00004_resource_limits.sql), which also apply retroactively to
+// every app that existed before that migration ran.
 type App struct {
-	ID       int64
-	Slug     string
-	ImageRef string
-	Port     int
-	Status   string
+	ID            int64
+	Slug          string
+	ImageRef      string
+	Port          int
+	Status        string
+	MemoryLimitMB int64
+	CPULimit      float64
+	PidsLimit     int64
 }
 
 // Deployment is a single deploy attempt for an App. StartedAt is always
@@ -211,7 +220,24 @@ func (s *Store) PruneExpiredSessions() (int64, error) {
 	return res.RowsAffected()
 }
 
-// CreateApp inserts a new app with status "created" and returns it.
+// defaultMemoryLimitMB, defaultCPULimit, and defaultPidsLimit mirror the
+// column defaults migration 00004_resource_limits.sql sets on the apps
+// table (memory_limit_mb, cpu_limit, pids_limit) — kept here as named
+// constants so CreateApp's returned App (built directly, not re-SELECTed
+// after INSERT) reports exactly what the row actually holds, without
+// hardcoding the same magic numbers twice.
+const (
+	defaultMemoryLimitMB int64   = 512
+	defaultCPULimit      float64 = 1.0
+	defaultPidsLimit     int64   = 512
+)
+
+// appColumns is the column list (in scan order) shared by CreateApp's
+// implicit row shape, scanApp, and ListApps.
+const appColumns = `id, slug, image_ref, port, status, memory_limit_mb, cpu_limit, pids_limit`
+
+// CreateApp inserts a new app with status "created" and the schema's
+// default resource limits (see defaultMemoryLimitMB etc.), and returns it.
 func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	res, err := s.db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, slug, imageRef, port)
 	if err != nil {
@@ -221,12 +247,15 @@ func (s *Store) CreateApp(slug, imageRef string, port int) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{ID: id, Slug: slug, ImageRef: imageRef, Port: port, Status: "created"}, nil
+	return &App{
+		ID: id, Slug: slug, ImageRef: imageRef, Port: port, Status: "created",
+		MemoryLimitMB: defaultMemoryLimitMB, CPULimit: defaultCPULimit, PidsLimit: defaultPidsLimit,
+	}, nil
 }
 
 func scanApp(row *sql.Row) (*App, error) {
 	var a App
-	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status)
+	err := row.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -238,13 +267,13 @@ func scanApp(row *sql.Row) (*App, error) {
 
 // AppBySlug looks up an app by slug. Returns ErrNotFound if none exists.
 func (s *Store) AppBySlug(slug string) (*App, error) {
-	row := s.db.QueryRow(`SELECT id, slug, image_ref, port, status FROM apps WHERE slug = ?`, slug)
+	row := s.db.QueryRow(`SELECT `+appColumns+` FROM apps WHERE slug = ?`, slug)
 	return scanApp(row)
 }
 
 // ListApps returns all apps ordered by ID.
 func (s *Store) ListApps() ([]App, error) {
-	rows, err := s.db.Query(`SELECT id, slug, image_ref, port, status FROM apps ORDER BY id`)
+	rows, err := s.db.Query(`SELECT ` + appColumns + ` FROM apps ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -253,12 +282,22 @@ func (s *Store) ListApps() ([]App, error) {
 	var apps []App
 	for rows.Next() {
 		var a App
-		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status); err != nil {
+		if err := rows.Scan(&a.ID, &a.Slug, &a.ImageRef, &a.Port, &a.Status, &a.MemoryLimitMB, &a.CPULimit, &a.PidsLimit); err != nil {
 			return nil, err
 		}
 		apps = append(apps, a)
 	}
 	return apps, rows.Err()
+}
+
+// UpdateAppLimits sets an app's container resource limits (see the App
+// struct doc comment for the zero-means-unlimited convention) and bumps
+// updated_at. The caller (API layer) owns validating the values before
+// calling this — the store applies them as given.
+func (s *Store) UpdateAppLimits(id int64, memoryLimitMB int64, cpuLimit float64, pidsLimit int64) error {
+	_, err := s.db.Exec(`UPDATE apps SET memory_limit_mb = ?, cpu_limit = ?, pids_limit = ?, updated_at = ? WHERE id = ?`,
+		memoryLimitMB, cpuLimit, pidsLimit, time.Now().UTC().Format(timeFormat), id)
+	return err
 }
 
 // UpdateAppStatus sets an app's status and bumps updated_at.
