@@ -75,10 +75,10 @@ const (
 // pull, the original v0.1 path) or "tarball" (Task 6's build-from-upload
 // path). BuildLogPath is "" for image-sourced deployments, and the path
 // to a build log file on disk for tarball-sourced ones (see
-// SetDeploymentBuildLog). TriggerKind records what initiated the deploy
-// ("api" today; named trigger_kind in the schema because "trigger" is a
-// SQLite keyword) — reserved for a future non-API trigger (e.g. a cron
-// redeploy).
+// SetDeploymentBuildLog). TriggerKind records what initiated the deploy —
+// "api" for a normal deploy and "rollback" for one created by Rollback;
+// named trigger_kind in the schema because "trigger" is a SQLite keyword.
+// Future triggers (a git webhook, a cron redeploy) add values here.
 type Deployment struct {
 	ID           int64
 	AppID        int64
