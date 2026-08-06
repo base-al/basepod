@@ -185,6 +185,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(s
 			r.Post("/apps", a.handleCreateApp)
 			r.Get("/apps", a.handleListApps)
 			r.Get("/apps/{slug}", a.handleGetApp)
+			r.Patch("/apps/{slug}", a.handlePatchApp)
 			r.Post("/apps/{slug}/deploy", a.handleDeploy)
 			r.Post("/apps/{slug}/rollback", a.handleRollback)
 			r.Delete("/apps/{slug}", a.handleDeleteApp)
