@@ -160,7 +160,11 @@ func DetectSocket() (string, error) {
 // forwards API traffic to. Returns "" if no machine is configured or the
 // command fails.
 func machineForwardedSocket() (string, error) {
-	out, err := exec.Command("podman", "machine", "inspect", "--format", "{{.ConnectionInfo.PodmanSocket.Path}}").Output()
+	bin, err := BinPath()
+	if err != nil {
+		return "", err
+	}
+	out, err := exec.Command(bin, "machine", "inspect", "--format", "{{.ConnectionInfo.PodmanSocket.Path}}").Output()
 	if err != nil {
 		return "", err
 	}
@@ -170,7 +174,11 @@ func machineForwardedSocket() (string, error) {
 // defaultConnectionURI runs `podman system connection list --format json`
 // and returns the URI of the entry marked Default.
 func defaultConnectionURI() (string, error) {
-	out, err := exec.Command("podman", "system", "connection", "list", "--format", "json").Output()
+	bin, err := BinPath()
+	if err != nil {
+		return "", err
+	}
+	out, err := exec.Command(bin, "system", "connection", "list", "--format", "json").Output()
 	if err != nil {
 		return "", err
 	}
