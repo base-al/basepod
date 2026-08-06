@@ -20,6 +20,14 @@ type Config struct {
 	PodmanSocket string `yaml:"podman_socket"`
 	HTTPPort     int    `yaml:"http_port"`
 	HTTPSPort    int    `yaml:"https_port"`
+	// GitPath overrides internal/gitsource.BinPath's "git" binary
+	// resolution (config override, else $BASEPOD_GIT_BIN, else $PATH —
+	// see that function's doc comment) — an operator's explicit path,
+	// for the rare case git isn't on the control-plane process's $PATH.
+	// Empty means "resolve normally"; git being entirely unavailable
+	// only disables git push-to-deploy (warn-only at boot), never the
+	// image/tarball deploy paths.
+	GitPath string `yaml:"git_path"`
 }
 
 func DefaultPath() string {
@@ -68,6 +76,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("BASEPOD_PODMAN_SOCKET"); v != "" {
 		cfg.PodmanSocket = v
+	}
+	if v := os.Getenv("BASEPOD_GIT_PATH"); v != "" {
+		cfg.GitPath = v
 	}
 	if v := os.Getenv("BASEPOD_HTTP_PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {

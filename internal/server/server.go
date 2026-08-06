@@ -23,6 +23,7 @@ import (
 	"github.com/base-al/basepod/internal/config"
 	"github.com/base-al/basepod/internal/crypto"
 	"github.com/base-al/basepod/internal/deploy"
+	"github.com/base-al/basepod/internal/gitsource"
 	"github.com/base-al/basepod/internal/podman"
 	"github.com/base-al/basepod/internal/store"
 	"github.com/base-al/basepod/web"
@@ -144,6 +145,18 @@ func Run(ctx context.Context, cfgPath string) error {
 	}
 	if err := checkPodmanVersion(podmanVersion); err != nil {
 		return err
+	}
+
+	// Git availability is checked once here, warn-only (git deploys are a
+	// v0.5 addition; every existing image/tarball deploy path is
+	// unaffected either way) — see gitsource.BinPath's resolution order
+	// (cfg.GitPath, then $BASEPOD_GIT_BIN, then $PATH) and
+	// gitsource.New's doc comment on why an empty path is a valid,
+	// non-fatal Cloner state.
+	if gitBin, err := gitsource.BinPath(cfg.GitPath); err != nil {
+		log.Printf("basepod: git: %s — git push-to-deploy disabled until git is installed", err)
+	} else {
+		log.Printf("basepod: git: using %s for git push-to-deploy", gitBin)
 	}
 
 	mgr := caddy.NewManager(pc, caddy.PodmanExec, filepath.Join(cfg.DataDir, "caddy"), cfg.HTTPPort, cfg.HTTPSPort)
