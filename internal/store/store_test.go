@@ -517,6 +517,130 @@ func TestUpdateAppLimits(t *testing.T) {
 	}
 }
 
+// TestCreateAppDefaultsAliasScheme proves a brand-new app starts with
+// AliasScheme "legacy" (the schema default — see migration
+// 00005_alias_scheme.sql and App.AliasScheme's doc comment) on the
+// returned App and on what AppBySlug/ListApps read back. It only becomes
+// "v2" once internal/deploy's runRollout actually creates a container
+// with the new alias, which a freshly-created-but-never-deployed app
+// hasn't had happen yet.
+func TestCreateAppDefaultsAliasScheme(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("blog", "nginx:alpine", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.AliasScheme != AliasSchemeLegacy {
+		t.Fatalf("app.AliasScheme = %q, want %q", app.AliasScheme, AliasSchemeLegacy)
+	}
+
+	got, err := s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AliasScheme != AliasSchemeLegacy {
+		t.Fatalf("AppBySlug AliasScheme = %q, want %q", got.AliasScheme, AliasSchemeLegacy)
+	}
+
+	apps, err := s.ListApps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(apps) != 1 || apps[0].AliasScheme != AliasSchemeLegacy {
+		t.Fatalf("ListApps AliasScheme = %+v, want %q", apps, AliasSchemeLegacy)
+	}
+}
+
+// TestUpdateAppAliasScheme proves UpdateAppAliasScheme persists a new
+// alias_scheme value, and that it round-trips through both AliasScheme
+// values (not just legacy->v2, in case a future rollback path needs the
+// reverse — though internal/deploy's runRollout today only ever writes
+// "v2").
+func TestUpdateAppAliasScheme(t *testing.T) {
+	s := open(t)
+	app, err := s.CreateApp("blog", "nginx:alpine", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateAppAliasScheme(app.ID, AliasSchemeV2); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AliasScheme != AliasSchemeV2 {
+		t.Fatalf("AliasScheme after update = %q, want %q", got.AliasScheme, AliasSchemeV2)
+	}
+
+	if err := s.UpdateAppAliasScheme(app.ID, AliasSchemeLegacy); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.AppBySlug("blog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AliasScheme != AliasSchemeLegacy {
+		t.Fatalf("AliasScheme after second update = %q, want %q", got.AliasScheme, AliasSchemeLegacy)
+	}
+}
+
+// TestMigrationAliasSchemeDefaultsAppliesToExistingApp is migration
+// 00005_alias_scheme.sql's regression, mirroring
+// TestMigrationDefaultsApplyToExistingApp for migration 4: an app row
+// inserted BEFORE migration 5 ever ran (a real pre-v0.4.x data dir
+// upgrading in place, whose already-running container carries only the
+// legacy "bp-<slug>" alias) must come out the other side as AliasScheme
+// "legacy" — never NULL, never accidentally "v2" (which would make
+// Routes() render an upstream ("app-<slug>") the app's actual,
+// not-yet-redeployed container was never given, 502ing every request
+// until its next redeploy).
+func TestMigrationAliasSchemeDefaultsAppliesToExistingApp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, "migrations", 4); err != nil {
+		t.Fatalf("migrate to version 4: %v", err)
+	}
+
+	// Insert exactly as version-4 schema's apps table would have accepted
+	// — no alias_scheme column exists yet at this point.
+	if _, err := db.Exec(`INSERT INTO apps(slug, image_ref, port) VALUES(?, ?, ?)`, "legacyapp", "nginx:alpine", 80); err != nil {
+		t.Fatalf("insert pre-migration-5 row: %v", err)
+	}
+
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	got, err := s.AppBySlug("legacyapp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AliasScheme != AliasSchemeLegacy {
+		t.Fatalf("pre-existing row's AliasScheme = %q, want %q", got.AliasScheme, AliasSchemeLegacy)
+	}
+}
+
 // TestMigrationDefaultsApplyToExistingApp is the specific regression the
 // v0.4 plan calls out for migration 00004_resource_limits.sql: an app row
 // inserted BEFORE that migration ever ran (i.e. a real v0.3.0 data dir

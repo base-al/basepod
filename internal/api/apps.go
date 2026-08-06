@@ -26,6 +26,20 @@ import (
 // digits, and hyphens, up to 32 characters.
 var slugPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
+// reservedSlugPrefixPattern and reservedSlugs guard the container-name and
+// network-alias namespaces (audit finding M1 — see internal/deploy's
+// runRollout and Routes()): "caddy" is the managed proxy's own container
+// name (bp-caddy), "basepod" is reserved for the control plane itself, and
+// a slug starting with either the container-name prefix ("bp-") or the
+// alias prefix ("app-") could otherwise be crafted to collide with a
+// generated container name or alias.
+var reservedSlugPrefixPattern = regexp.MustCompile(`^(bp-|app-)`)
+
+var reservedSlugs = map[string]bool{
+	"caddy":   true,
+	"basepod": true,
+}
+
 // slugify derives a candidate slug from a user-supplied app name:
 // lowercase, spaces become hyphens. The result still needs validating
 // against slugPattern — this step does not strip other punctuation.
@@ -104,6 +118,11 @@ func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 	if !slugPattern.MatchString(slug) {
 		writeError(w, http.StatusUnprocessableEntity, "validation",
 			"name must start with a letter and contain only letters, digits, spaces, and hyphens (max 32 characters)")
+		return
+	}
+	if reservedSlugs[slug] || reservedSlugPrefixPattern.MatchString(slug) {
+		writeError(w, http.StatusUnprocessableEntity, "validation",
+			`slug is reserved: must not be "caddy" or "basepod", and must not start with "bp-" or "app-"`)
 		return
 	}
 	if req.Image == "" {

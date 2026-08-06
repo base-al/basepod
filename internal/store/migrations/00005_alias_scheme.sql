@@ -1,0 +1,29 @@
+-- +goose Up
+-- Audit finding M1: container names ("bp-<slug>-<n>") and the network
+-- alias every app container carried ("bp-<slug>") shared one aardvark-dns
+-- namespace, so a slug like "foo-2" could alias identically to app "foo"'s
+-- deployment-2 container name, letting Caddy deliver one app's traffic
+-- into a different app's container. The fix (see internal/deploy's
+-- runRollout) gives new rollouts a disjoint alias, "app-<slug>", which can
+-- never collide with any "bp-<slug>-<n>" container name.
+--
+-- Existing apps' already-running containers still carry only the legacy
+-- "bp-<slug>" alias — they are NOT recreated by this migration or by boot
+-- reconciliation (see internal/deploy.CleanupOrphans), since recreating
+-- every running container on upgrade is exactly the disruption this fix
+-- must avoid. alias_scheme records, per app, which alias its current
+-- container generation actually carries: existing rows default to
+-- 'legacy' (matching what their running containers already have), and
+-- internal/deploy's runRollout sets a row to 'v2' only once a rollout has
+-- actually created a container with the new "app-<slug>" alias. Routes()
+-- reads this column to decide which upstream to render for each app, so a
+-- legacy app keeps resolving correctly until its next redeploy flips it to
+-- 'v2' — see internal/deploy/deploy.go's Routes() and runRollout doc
+-- comments.
+--
+-- Legacy-scheme support (and this column) is intended to be dropped once
+-- every app has redeployed at least once past this release — tracked for
+-- removal in a later release (see the v0.4 plan doc's Task 4 note).
+ALTER TABLE apps ADD COLUMN alias_scheme TEXT NOT NULL DEFAULT 'legacy';
+-- +goose Down
+ALTER TABLE apps DROP COLUMN alias_scheme;

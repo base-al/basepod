@@ -62,6 +62,21 @@ const localImagePrefix = "localhost/"
 // first, after every successful rollout.
 const retainBuiltImages = 5
 
+// aliasV2Prefix and legacyAliasPrefix are the two network-alias prefixes
+// an app container can carry (audit finding M1). Every rollout from this
+// release on creates its container with aliasV2Prefix+slug (see
+// runRollout) — disjoint from the "bp-<slug>-<n>" container-name
+// namespace, so the two can never collide, unlike the legacy scheme's
+// "bp-<slug>" alias which shared that namespace. Containers created before
+// this fix still carry only legacyAliasPrefix+slug and are never
+// recreated just to relabel them (see migration 00005_alias_scheme.sql and
+// store.App.AliasScheme's doc comment) — Routes() picks the right prefix
+// per app from its stored alias_scheme.
+const (
+	aliasV2Prefix     = "app-"
+	legacyAliasPrefix = "bp-"
+)
+
 // Engine drives app deployments: pull, create, start, probe, cut traffic
 // over, and tear down the previous container generation.
 type Engine struct {
@@ -449,8 +464,16 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 			"basepod.app":        app.Slug,
 			"basepod.deployment": strconv.Itoa(dep.Number),
 		},
-		NetworkName:    caddy.NetworkName,
-		NetworkAliases: []string{"bp-" + app.Slug},
+		NetworkName: caddy.NetworkName,
+		// audit finding M1: the alias namespace ("app-<slug>") is
+		// deliberately disjoint from the container-name namespace
+		// ("bp-<slug>-<n>", see name above) — a slug containing digits
+		// and hyphens (e.g. "foo-2") could otherwise make one app's
+		// alias identical to a different app's container name, letting
+		// Caddy deliver traffic into the wrong container. See
+		// aliasScheme's own doc comment for how this interacts with
+		// apps deployed before this fix existed.
+		NetworkAliases: []string{aliasV2Prefix + app.Slug},
 		RestartPolicy:  "always",
 		// Resource limits (audit H2): every app container is created with
 		// the app's stored limits, which default to a sane bounded value
@@ -505,6 +528,16 @@ func (e *Engine) runRollout(ctx context.Context, app *store.App, dep *store.Depl
 
 	if err := e.st.UpdateAppImage(app.ID, imageRef); err != nil {
 		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: update app image: %w", err))
+	}
+	// The container just created above carries the new "app-<slug>" alias
+	// (see spec.NetworkAliases), so this app's alias_scheme must record
+	// "v2" from here on — before Routes() is computed below, since
+	// Routes() reads alias_scheme to decide which upstream to render (see
+	// its doc comment) and must never render a stale "bp-<slug>" upstream
+	// for a container that no longer carries that alias. A no-op (but
+	// still executed) UPDATE for an app that was already "v2".
+	if err := e.st.UpdateAppAliasScheme(app.ID, store.AliasSchemeV2); err != nil {
+		return e.fail(ctx, app, dep, id, fmt.Errorf("deploy: update alias scheme: %w", err))
 	}
 	// The new container just passed its health probe, so the app is
 	// running from here on. Flip the store status to "running" before
@@ -905,6 +938,15 @@ func (e *Engine) RemoveApp(ctx context.Context, app *store.App) error {
 // the app's generated slug.rootDomain hostname first, followed by its
 // custom domains (from ListAllDomains) sorted lexically. The result is
 // not sorted by slug; caddy.Render sorts by slug itself.
+//
+// Each app's upstream is built from its own stored AliasScheme (audit
+// finding M1) rather than unconditionally using the new "app-<slug>"
+// alias: an app whose currently-running container was created before
+// this fix (AliasScheme == store.AliasSchemeLegacy) still only answers on
+// "bp-<slug>" — rendering "app-<slug>" for it would 502 every request
+// until that app's next redeploy flips its AliasScheme to "v2" (see
+// runRollout). This is what makes the migration safe for apps already
+// running when this fix is deployed.
 func (e *Engine) Routes() ([]caddy.AppRoute, error) {
 	apps, err := e.st.ListApps()
 	if err != nil {
@@ -929,10 +971,14 @@ func (e *Engine) Routes() ([]caddy.AppRoute, error) {
 		custom := customByApp[a.ID]
 		sort.Strings(custom)
 		hostnames := append([]string{a.Slug + "." + e.rootDomain}, custom...)
+		aliasPrefix := aliasV2Prefix
+		if a.AliasScheme == store.AliasSchemeLegacy {
+			aliasPrefix = legacyAliasPrefix
+		}
 		routes = append(routes, caddy.AppRoute{
 			Slug:      a.Slug,
 			Hostnames: hostnames,
-			Upstream:  fmt.Sprintf("bp-%s:%d", a.Slug, a.Port),
+			Upstream:  fmt.Sprintf("%s%s:%d", aliasPrefix, a.Slug, a.Port),
 		})
 	}
 	return routes, nil

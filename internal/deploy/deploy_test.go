@@ -457,7 +457,7 @@ func TestDeployHappyPath(t *testing.T) {
 	if router.calls != 1 {
 		t.Fatalf("router.calls = %d, want 1", router.calls)
 	}
-	want := []caddy.AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.localhost"}, Upstream: "bp-blog:80"}}
+	want := []caddy.AppRoute{{Slug: "blog", Hostnames: []string{"blog.apps.localhost"}, Upstream: "app-blog:80"}}
 	if len(router.lastRoutes) != 1 || !reflect.DeepEqual(router.lastRoutes[0], want[0]) {
 		t.Errorf("router.lastRoutes = %+v, want %+v", router.lastRoutes, want)
 	}
@@ -530,7 +530,7 @@ func TestSecondDeployRemovesOld(t *testing.T) {
 	if router.calls != 1 {
 		t.Fatalf("router.calls (this deploy) = %d, want 1", router.calls)
 	}
-	if len(router.lastRoutes) != 1 || router.lastRoutes[0].Upstream != "bp-blog:80" {
+	if len(router.lastRoutes) != 1 || router.lastRoutes[0].Upstream != "app-blog:80" {
 		t.Errorf("router.lastRoutes = %+v", router.lastRoutes)
 	}
 }
@@ -950,6 +950,152 @@ func TestRoutesIncludeCustomDomains(t *testing.T) {
 	want := []string{"blog.apps.localhost", "aaa.example.com", "blog.example.com"}
 	if !reflect.DeepEqual(routes[0].Hostnames, want) {
 		t.Errorf("Hostnames = %v, want %v", routes[0].Hostnames, want)
+	}
+}
+
+// TestRoutesDisjointNamespaceNoCollision is the exact regression for audit
+// finding M1: under the old scheme, app "foo"'s second deployment
+// container was named "bp-foo-2" and app "foo-2"'s network alias was also
+// "bp-foo-2" — identical strings in the same aardvark-dns namespace, so
+// Caddy could resolve "foo-2"'s route into "foo"'s deployment-2 container.
+// With the new alias scheme (container names "bp-<slug>-<n>", aliases
+// "app-<slug>"), those two can never collide: this deploys "foo" twice
+// (landing its live container on "bp-foo-2", the exact string that used to
+// double as "foo-2"'s alias) and "foo-2" once, then proves Routes() gives
+// each app its own distinct upstream and that neither app's rendered
+// upstream host equals any other app's actual container name.
+func TestRoutesDisjointNamespaceNoCollision(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	foo, err := st.CreateApp("foo", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, foo, "nginx:v1"); err != nil {
+		t.Fatalf("foo deploy 1: %v", err)
+	}
+	if _, err := eng.Deploy(ctx, foo, "nginx:v2"); err != nil {
+		t.Fatalf("foo deploy 2: %v", err)
+	}
+
+	foo2, err := st.CreateApp("foo-2", "nginx:v1", 81)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, foo2, "nginx:v1"); err != nil {
+		t.Fatalf("foo-2 deploy 1: %v", err)
+	}
+
+	// Sanity check the exact collision shape the bug report describes:
+	// "foo"'s live (deployment-2) container is really named "bp-foo-2".
+	var fooLiveContainer string
+	for _, c := range rt.containers {
+		if c.Name == "bp-foo-2" {
+			fooLiveContainer = c.Name
+		}
+	}
+	if fooLiveContainer == "" {
+		t.Fatal("expected foo's deployment-2 container to be named bp-foo-2 (sanity check for the collision shape this test guards against)")
+	}
+
+	routes, err := eng.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bySlug := make(map[string]string, len(routes))
+	for _, r := range routes {
+		bySlug[r.Slug] = r.Upstream
+	}
+	if len(bySlug) != 2 {
+		t.Fatalf("routes = %+v, want exactly 2 (foo, foo-2)", routes)
+	}
+	if bySlug["foo"] != "app-foo:80" {
+		t.Errorf("foo's upstream = %q, want app-foo:80", bySlug["foo"])
+	}
+	if bySlug["foo-2"] != "app-foo-2:81" {
+		t.Errorf("foo-2's upstream = %q, want app-foo-2:81", bySlug["foo-2"])
+	}
+	// The core of the bug: foo-2's alias must never equal foo's real
+	// (deployment-2) container name.
+	if bySlug["foo-2"] == fooLiveContainer+":81" {
+		t.Fatalf("foo-2's upstream %q collides with foo's actual container name %q", bySlug["foo-2"], fooLiveContainer)
+	}
+
+	// General regression: no route's upstream host may equal any
+	// currently-running container's own name, for either app.
+	for _, r := range routes {
+		host, _, _ := strings.Cut(r.Upstream, ":")
+		for _, c := range rt.containers {
+			if host == c.Name {
+				t.Fatalf("route %+v's upstream host %q collides with real container name %q (container %+v)", r, host, c.Name, c)
+			}
+		}
+	}
+}
+
+// TestRoutesLegacySchemeAppKeepsLegacyUpstreamUntilRedeployed proves the
+// migration-safety half of audit finding M1's fix: an app whose stored
+// AliasScheme is still "legacy" (a pre-fix container that only carries the
+// old "bp-<slug>" alias — see migration 00005_alias_scheme.sql) keeps
+// resolving to its legacy upstream through Routes() until it actually
+// redeploys, at which point runRollout creates a container with the new
+// alias and flips the stored scheme to "v2" — never before that, since
+// rendering "app-<slug>" for a container that doesn't carry that alias
+// would 502 every request to it.
+func TestRoutesLegacySchemeAppKeepsLegacyUpstreamUntilRedeployed(t *testing.T) {
+	st := openStore(t)
+	eng, _, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	// Simulate an app that survived from before this fix: CreateApp's
+	// schema default already leaves AliasScheme "legacy" (proven by
+	// store.TestCreateAppDefaultsAliasScheme), matching a real upgrade
+	// where migration 00005 defaults every pre-existing row the same way.
+	// UpdateAppStatus mirrors what a real prior deploy already did,
+	// without going through this Engine's Deploy (which would immediately
+	// assign the new alias) — Routes() must reflect the app's actual
+	// container, not "whatever the newest code would do".
+	app, err := st.CreateApp("oldapp", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateAppStatus(app.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if app.AliasScheme != "legacy" {
+		t.Fatalf("app.AliasScheme = %q, want legacy (schema default)", app.AliasScheme)
+	}
+
+	routes, err := eng.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Upstream != "bp-oldapp:80" {
+		t.Fatalf("routes = %+v, want a single legacy upstream bp-oldapp:80", routes)
+	}
+
+	// Redeploy through the real Engine: this is what actually creates a
+	// container with the new alias and must flip alias_scheme to v2.
+	if _, err := eng.Deploy(ctx, app, "nginx:v2"); err != nil {
+		t.Fatalf("redeploy: %v", err)
+	}
+
+	routes, err = eng.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Upstream != "app-oldapp:80" {
+		t.Fatalf("routes after redeploy = %+v, want the new upstream app-oldapp:80", routes)
+	}
+
+	gotApp, err := st.AppBySlug("oldapp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApp.AliasScheme != "v2" {
+		t.Fatalf("app.AliasScheme after redeploy = %q, want v2", gotApp.AliasScheme)
 	}
 }
 

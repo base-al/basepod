@@ -44,7 +44,7 @@
                   "handler": "reverse_proxy",
                   "upstreams": [
                     {
-                      "dial": "bp-blog:8080"
+                      "dial": "app-blog:8080"
                     }
                   ]
                 }
@@ -65,7 +65,7 @@
                   "handler": "reverse_proxy",
                   "upstreams": [
                     {
-                      "dial": "bp-wiki:3000"
+                      "dial": "app-wiki:3000"
                     }
                   ]
                 }
