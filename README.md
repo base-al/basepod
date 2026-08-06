@@ -5,9 +5,11 @@ image, a git repo, or a compose file — and get a running app with
 automatic HTTPS. Like CapRover, but rootless, daemonless, and shipped as
 a single Go binary.
 
-> **Status: v0.1 and v0.2 shipped; v0.3 (real deploys — tarball builds,
-> rollback, CLI core) is complete on this branch, pending release.**
-> The detailed design lives in [`docs/plan/`](docs/plan/) — start with
+> **Status: v0.1, v0.2, and
+> [v0.3](https://github.com/base-al/basepod/releases/tag/v0.3.0) shipped**
+> (real deploys — tarball builds, rollback, CLI core — plus hardening
+> and the dashboard served remotely over HTTPS). The detailed design
+> lives in [`docs/plan/`](docs/plan/) — start with
 > [01 — Overview & Architecture](docs/plan/01.overview-and-architecture.md).
 
 ## Quickstart
@@ -194,17 +196,22 @@ a real `make ui` build**; CI builds the dashboard fresh on every run.
 
 ## Why BasePod
 
-- **Rootless Podman** instead of a privileged Docker daemon; apps are
-  supervised by systemd (Quadlet) and survive control-plane restarts.
+- **Rootless Podman** instead of a privileged Docker daemon; apps run
+  with Podman's own `restart: always` policy and survive control-plane
+  restarts (boot-time reconciliation repairs Caddy/network drift and
+  cleans up orphans).
 - **Caddy** at the edge: automatic HTTPS, on-demand TLS for customer
   domains, zero-downtime config swaps via its admin API.
 - **One binary** — installs on any Linux VPS and on macOS (Intel &
   Apple Silicon), with SQLite embedded. No external dependencies.
 - **Web dashboard** — a Vue SPA embedded in the same binary: apps,
-  new-app wizard, live logs, env vars, and custom domains, no separate
-  frontend deployment.
-- **Teams & RBAC** — users, teams, roles, scoped API tokens, audit log.
-- **Extensible** — lifecycle webhooks, one-click app templates, and
+  new-app wizard, live logs, build logs, rollback, env vars, and custom
+  domains, no separate frontend deployment.
+- **Teams & RBAC** *(roadmap — [doc 08](docs/plan/08.teams-and-rbac.md))*
+  — users, teams, roles, scoped API tokens, audit log. Today: a single
+  admin account with session-based auth.
+- **Extensible** *(roadmap — [doc 09](docs/plan/09.plugins-and-extensibility.md))*
+  — lifecycle webhooks, one-click app templates, and
   OCI-image plugins.
 
 ## Plan
