@@ -527,7 +527,7 @@ func resolveDashboardDomain(current, rootDomain string) (domain string, writeDef
 // than inventing a second, parallel vocabulary or a separate status
 // field.
 //
-// dashboardDomain is resolveDashboardDomain's own result (""  when the
+// dashboardDomain is resolveDashboardDomain's own result ("" when the
 // setting is "off", the resolved hostname otherwise); routeActive is
 // whether Run actually got as far as building a non-nil dashboardRoute
 // for that hostname (both the setting isn't "off" AND
