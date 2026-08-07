@@ -972,6 +972,46 @@ func TestManagerHealthCaching(t *testing.T) {
 	}
 }
 
+// TestManagerHealthCancelledProbeIsNotCached proves a probe that failed
+// only because its caller's context was cancelled does not poison the
+// cache. handleSystem passes the HTTP request's context and the dashboard
+// polls /system every 5s from every page, so a tab closing mid-probe
+// cancels one routinely — caching that would report a false "admin
+// unreachable" to every later caller for the rest of the TTL.
+func TestManagerHealthCancelledProbeIsNotCached(t *testing.T) {
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{State: "running"}}
+
+	// First call: the exec fails the way a cancelled podman-exec does, and
+	// the context is already cancelled by the time Health inspects it.
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	var execCalls int32
+	exec := func(ctx context.Context, container string, cmd ...string) error {
+		atomic.AddInt32(&execCalls, 1)
+		if ctx == cancelledCtx {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
+	mgr := NewManager(fr, exec, t.TempDir(), 8080, 8443, testInstanceID)
+	now := time.Now()
+	mgr.now = func() time.Time { return now }
+
+	if err := mgr.Health(cancelledCtx); err == nil {
+		t.Fatal("Health with a cancelled context: got nil error, want the probe failure")
+	}
+
+	// Same instant, so the TTL has definitely not expired: if the
+	// cancelled result had been cached, this would return it without
+	// re-probing. It must probe again instead, and report healthy.
+	if err := mgr.Health(context.Background()); err != nil {
+		t.Fatalf("Health after a cancelled probe: %v, want nil (cancelled result must not be cached)", err)
+	}
+	if got := atomic.LoadInt32(&execCalls); got != 2 {
+		t.Fatalf("exec called %d time(s), want 2 (the cancelled probe must not have been cached)", got)
+	}
+}
+
 // TestManagerHealthConcurrentRequestsShareOneProbe proves Health
 // single-flights concurrent callers landing during a cache-miss window
 // into exactly one real probe (issue #16 review feedback's "make sure

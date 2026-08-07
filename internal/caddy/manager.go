@@ -726,6 +726,18 @@ func (m *Manager) Health(ctx context.Context) error {
 	}
 
 	err := m.probeHealth(ctx)
+	// A probe that failed because the *caller* went away says nothing
+	// about Caddy. handleSystem passes the HTTP request's context, and the
+	// dashboard polls /system every 5s from every page, so a tab closing
+	// or navigating mid-probe cancels one — cheap to hit, given the probe
+	// is a ~200ms window. Caching that would report a false "admin
+	// unreachable" to every other caller for the rest of the TTL, which
+	// reads to an operator as their ingress having just broken. Leave the
+	// previous entry alone (stale is better than wrong) and let the next
+	// caller with a live context probe again.
+	if ctx.Err() != nil {
+		return err
+	}
 	m.healthCachedAt = now
 	m.healthCachedErr = err
 	return err
