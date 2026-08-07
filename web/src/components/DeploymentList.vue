@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import { useToast } from '@nuxt/ui/composables'
-import type { TableColumn } from '@nuxt/ui'
 
 import { api, ApiError, type Deployment } from '../lib/api'
+import { canRollBackTo, currentHealthyNumber, displayError, isErrorTruncated } from '../lib/deploymentDisplay'
 import { shortSha } from '../lib/gitFormat'
 import { relativeTime } from '../lib/relativeTime'
 import StatusBadge from './StatusBadge.vue'
+import ImageRef from './ImageRef.vue'
 import BuildLogPanel from './BuildLogPanel.vue'
 
 const props = defineProps<{
@@ -34,56 +35,91 @@ const rows = computed(() => [...props.deployments].sort((a, b) => b.number - a.n
 // healthy row gets a "Roll back" action, this one doesn't (rolling back
 // to the current live deployment would be a no-op deploy of the same
 // image). rows is already sorted newest-first, so this is just the first
-// healthy row's number.
-const currentHealthyNumber = computed(() => rows.value.find((d) => d.status === 'healthy')?.number ?? null)
+// healthy row's number. Eligibility rule itself lives in
+// lib/deploymentDisplay.ts, shared verbatim between the desktop and
+// mobile layouts below (and unit-tested there) rather than duplicated.
+const currentHealthy = computed(() => currentHealthyNumber(rows.value))
 
-function canRollBackTo(deployment: Deployment) {
-  return deployment.status === 'healthy' && deployment.number !== currentHealthyNumber.value
+function rollbackEligible(deployment: Deployment) {
+  return canRollBackTo(deployment, currentHealthy.value)
 }
 
-const columns: TableColumn<Deployment>[] = [
-  { accessorKey: 'number', header: '#' },
-  { accessorKey: 'image', header: 'Image' },
-  { accessorKey: 'status', header: 'Status' },
-  { accessorKey: 'started_at', header: 'Started' },
-  { accessorKey: 'error', header: 'Error' },
-  { id: 'actions', header: '' },
-]
+// --- Responsive layout: table (>= md) vs cards (< phone/tablet) ----------
+//
+// Deployments render inside AppDetail.vue's Deployments tab, which sits
+// in AppShell same as Apps.vue — no nested side-nav on top of AppShell's
+// own rail (unlike SettingsShell, which adds a second nav column and is
+// why settings/Users.vue only collapses to cards at `lg`). That's the
+// same container shape Apps.vue's own app-list table already solved at
+// `md` (768px): AppShell's rail turns on at exactly that breakpoint too,
+// and Apps.vue's wider 7-column table already fits what's left. Verified
+// in a real browser at 768px/414px/390px (see issue #14's verification
+// notes) — this table has fewer columns than Apps.vue's, so if that one
+// clears `md`, this one comfortably does too.
+//
+// UNLIKE Apps.vue/Users.vue, this component can't just render both
+// layouts always and hide one with CSS: the build-log drawer
+// (BuildLogPanel below) opens a live SSE stream or fetches the log on
+// mount, and only one deployment is ever expanded at a time. If both the
+// table and the card list stayed mounted (one merely `hidden` via CSS),
+// toggling a drawer open would mount BuildLogPanel twice — once visible,
+// once invisible-but-still-fetching/streaming — doubling load on the
+// server for zero benefit. So the layout choice here is driven by a real
+// `matchMedia` check against the same breakpoint the CSS uses, and only
+// the layout that's actually visible ever mounts, exclusively via v-if
+// rather than v-show/hidden.
+const DESKTOP_QUERY = '(min-width: 768px)' // Tailwind's `md`
+
+const isDesktopLayout = ref(typeof window !== 'undefined' ? window.matchMedia(DESKTOP_QUERY).matches : true)
+let mediaQuery: MediaQueryList | null = null
+
+function handleMediaChange(event: MediaQueryListEvent) {
+  isDesktopLayout.value = event.matches
+}
+
+onMounted(() => {
+  mediaQuery = window.matchMedia(DESKTOP_QUERY)
+  isDesktopLayout.value = mediaQuery.matches
+  mediaQuery.addEventListener('change', handleMediaChange)
+})
+
+onUnmounted(() => {
+  mediaQuery?.removeEventListener('change', handleMediaChange)
+  mediaQuery = null
+})
 
 // Deployment errors can be long stack-trace-ish strings; truncate by
-// default and let the row expand in place on click (also has a native
-// title tooltip for a no-click hover preview).
-const ERROR_TRUNCATE_AT = 72
-const expanded = ref<Set<number>>(new Set())
+// default and let the row/card expand in place on click (also has a
+// native title tooltip for a no-click hover preview). Truncation length
+// and the actual substring logic live in lib/deploymentDisplay.ts.
+const expandedErrors = ref<Set<number>>(new Set())
 
-function toggle(number: number) {
-  const next = new Set(expanded.value)
+function toggleError(number: number) {
+  const next = new Set(expandedErrors.value)
   if (next.has(number)) {
     next.delete(number)
   } else {
     next.add(number)
   }
-  expanded.value = next
+  expandedErrors.value = next
 }
 
-function isTruncated(error: string) {
-  return error.length > ERROR_TRUNCATE_AT
+function errorText(deployment: Deployment): string {
+  return displayError(deployment.error, expandedErrors.value.has(deployment.number))
 }
 
-function displayError(deployment: Deployment) {
-  if (!isTruncated(deployment.error) || expanded.value.has(deployment.number)) {
-    return deployment.error
-  }
-  return `${deployment.error.slice(0, ERROR_TRUNCATE_AT)}…`
-}
-
-// Build-log drawer: keyed by TanStack's row-id (see getRowId below, set
-// to the deployment number) rather than row.toggleExpanded(), so opening
-// one row's drawer collapses any other — running more than one build-log
-// SSE stream at once per app isn't worth the complexity. A plain object
-// (not a Set) because UTable's `expanded` v-model uses TanStack's
-// ExpandedState shape (Record<string, boolean>).
+// Build-log drawer: at most one open at a time — opening one deployment's
+// drawer collapses any other (running more than one build-log SSE stream
+// at once per app isn't worth the complexity). Keyed by deployment number
+// as a string so both layouts above can check `expandedState[String(n)]`
+// directly without needing TanStack's row APIs (this no longer backs a
+// UTable — see the layout note above for why the table itself was
+// rewritten as a plain grid).
 const expandedState = ref<Record<string, boolean>>({})
+
+function isBuildLogOpen(number: number): boolean {
+  return Boolean(expandedState.value[String(number)])
+}
 
 function toggleBuildLog(number: number) {
   const id = String(number)
@@ -100,11 +136,14 @@ watch(
   { immediate: true },
 )
 
-// Which row's confirm popover is open, and which target deployment number
-// a rollback is currently in flight for (kept separate from the popover's
-// own open state so the popover can close immediately on confirm while the
-// button keeps its loading state until the request settles — mirrors
-// DomainsPanel's delete confirm).
+// Which row/card's rollback confirm popover is open, and which target
+// deployment number a rollback is currently in flight for (kept separate
+// from the popover's own open state so the popover can close immediately
+// on confirm while the button keeps its loading state until the request
+// settles — mirrors DomainsPanel's delete confirm). Safe to key by plain
+// deployment number (not `${layout}:${number}` the way settings/Users.vue
+// keys its own duplicated-by-CSS rows) because exactly one layout is ever
+// mounted here — see the layout note above.
 const confirmOpenNumber = ref<number | null>(null)
 const rollingBackToNumber = ref<number | null>(null)
 
@@ -145,97 +184,209 @@ function confirmRollback(number: number) {
 </script>
 
 <template>
-  <UTable
-    v-model:expanded="expandedState"
-    :data="rows"
-    :columns="columns"
-    :get-row-id="(d: Deployment) => String(d.number)"
-    empty="No deployments yet."
-    class="w-full"
-  >
-    <template #number-cell="{ row }">
-      <span class="font-mono text-sm text-content-secondary">#{{ row.original.number }}</span>
-    </template>
+  <div v-if="rows.length === 0" class="flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-line py-16 text-center">
+    <UIcon name="i-lucide-rocket" class="h-8 w-8 text-content-muted" aria-hidden="true" />
+    <p class="text-sm font-medium text-content-secondary">No deployments yet</p>
+  </div>
 
-    <template #image-cell="{ row }">
-      <div class="flex flex-col gap-0.5">
-        <span class="font-mono text-xs text-content-secondary">{{ row.original.image }}</span>
-        <span class="text-[11px] text-content-muted">
-          {{ row.original.source }} · {{ row.original.trigger }}
-          <template v-if="row.original.source === 'git' && row.original.git_sha">
-            · <span class="font-mono">{{ shortSha(row.original.git_sha) }}</span>
-          </template>
-        </span>
+  <!-- Desktop / tablet (>= md): dense grid-row table — see the layout
+       note above for why `md` and why this mounts exclusively (never
+       alongside the card layout below). -->
+  <div v-else-if="isDesktopLayout" class="overflow-hidden rounded-lg border border-line">
+    <div
+      class="grid grid-cols-[2.75rem_minmax(0,1.6fr)_6.5rem_5.5rem_minmax(0,1fr)_4.5rem] items-center gap-3 border-b border-line bg-surface-elevated/40 px-5 py-2.5 text-xs font-medium uppercase tracking-wide text-content-muted"
+    >
+      <span>#</span>
+      <span>Image</span>
+      <span>Status</span>
+      <span>Started</span>
+      <span>Error</span>
+      <span class="text-right">Actions</span>
+    </div>
+
+    <template v-for="d in rows" :key="d.number">
+      <div class="grid grid-cols-[2.75rem_minmax(0,1.6fr)_6.5rem_5.5rem_minmax(0,1fr)_4.5rem] items-center gap-3 border-b border-line px-5 py-3.5 last:border-b-0">
+        <span class="font-mono text-sm text-content-secondary">#{{ d.number }}</span>
+
+        <div class="flex min-w-0 flex-col gap-0.5">
+          <ImageRef :value="d.image" />
+          <!-- `truncate` (not free-wrapping) so a long source/trigger/sha
+               combo never blows out the row's height — with the row
+               vertically centered (`items-center` above), a tall wrapped
+               cell here would visually crowd the Status/Actions columns
+               next to it even though they're in separate grid tracks. -->
+          <span class="truncate text-[11px] text-content-muted">
+            {{ d.source }} · {{ d.trigger }}
+            <template v-if="d.source === 'git' && d.git_sha">
+              · <span class="font-mono">{{ shortSha(d.git_sha) }}</span>
+            </template>
+          </span>
+        </div>
+
+        <StatusBadge :status="d.status" />
+
+        <span class="text-xs whitespace-nowrap text-content-secondary" :title="d.started_at">{{ relativeTime(d.started_at) }}</span>
+
+        <button
+          v-if="d.error"
+          type="button"
+          class="tap44 line-clamp-2 rounded-xs text-left text-xs text-status-error hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          :title="d.error"
+          @click="toggleError(d.number)"
+        >
+          {{ errorText(d) }}
+        </button>
+        <span v-else class="text-xs text-content-muted">—</span>
+
+        <!-- Icon-only (not the mobile card's full-text buttons) — mirrors
+             settings/Users.vue's own desktop action column, which made
+             the same call for the same reason: this column's width has
+             to share the row with Image/Error, and two full-text buttons
+             ("Build log" / "Roll back") don't fit next to a 1024×-wide
+             error/image pair once the sidebar rail is also taking space
+             (see the layout note up top on why `md` still works here —
+             it's the buttons, not the text columns, that needed to
+             shrink). Each still carries a real label via aria-label/title,
+             not just a bare icon. -->
+        <div class="tap-row flex items-center justify-end gap-1">
+          <UButton
+            v-if="d.has_build_log"
+            size="xs"
+            color="neutral"
+            variant="ghost"
+            square
+            class="tap44"
+            :icon="isBuildLogOpen(d.number) ? 'i-lucide-chevron-up' : 'i-lucide-terminal'"
+            :aria-label="isBuildLogOpen(d.number) ? `Collapse build log for deployment #${d.number}` : `View build log for deployment #${d.number}`"
+            :title="isBuildLogOpen(d.number) ? 'Collapse build log' : 'Build log'"
+            @click="toggleBuildLog(d.number)"
+          />
+
+          <UPopover
+            v-if="rollbackEligible(d)"
+            :open="confirmOpenNumber === d.number"
+            @update:open="(v: boolean) => (confirmOpenNumber = v ? d.number : null)"
+          >
+            <UButton
+              size="xs"
+              color="neutral"
+              variant="ghost"
+              square
+              class="tap44"
+              icon="i-lucide-history"
+              :loading="rollbackMutation.isPending.value && rollingBackToNumber === d.number"
+              :disabled="rollbackMutation.isPending.value"
+              :aria-label="`Roll back to deployment #${d.number}`"
+              title="Roll back"
+            />
+            <template #content>
+              <div class="flex flex-col gap-2 p-3">
+                <p class="text-xs text-content-secondary">
+                  Roll back to deployment <span class="font-mono">#{{ d.number }}</span>?
+                </p>
+                <p class="max-w-64 text-xs text-content-muted">This redeploys the image from that deployment as a new deployment.</p>
+                <div class="tap-row flex justify-end gap-2">
+                  <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="confirmOpenNumber = null">Cancel</UButton>
+                  <UButton
+                    size="xs"
+                    color="warning"
+                    class="tap44"
+                    :loading="rollbackMutation.isPending.value && rollingBackToNumber === d.number"
+                    @click="confirmRollback(d.number)"
+                  >
+                    Roll back
+                  </UButton>
+                </div>
+              </div>
+            </template>
+          </UPopover>
+        </div>
+      </div>
+
+      <div v-if="isBuildLogOpen(d.number)" class="border-b border-line bg-surface-sunken/40 px-5 py-3 last:border-b-0">
+        <BuildLogPanel :slug="slug" :deployment="d" />
       </div>
     </template>
+  </div>
 
-    <template #status-cell="{ row }">
-      <StatusBadge :status="row.original.status" />
-    </template>
+  <!-- Phone / narrow tablet (< md): cards instead of a horizontally-
+       scrolling table (issue #14). Number + status lead each card — the
+       two things you scan for first — with the error, when present,
+       called out in its own tinted block right under the image/meta so
+       it can't be missed rather than sitting in a narrow column. -->
+  <div v-else class="flex flex-col gap-3">
+    <div v-for="d in rows" :key="d.number" class="flex flex-col gap-3 rounded-lg border border-line p-4">
+      <div class="flex items-center justify-between gap-3">
+        <span class="font-mono text-sm font-medium text-content-primary">#{{ d.number }}</span>
+        <StatusBadge :status="d.status" class="shrink-0" />
+      </div>
 
-    <template #started_at-cell="{ row }">
-      <span class="text-xs text-content-secondary" :title="row.original.started_at">
-        {{ relativeTime(row.original.started_at) }}
-      </span>
-    </template>
+      <ImageRef :value="d.image" />
 
-    <template #error-cell="{ row }">
+      <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-content-muted">
+        <span class="font-mono">
+          {{ d.source }} · {{ d.trigger }}
+          <template v-if="d.source === 'git' && d.git_sha">
+            · <span class="font-mono">{{ shortSha(d.git_sha) }}</span>
+          </template>
+        </span>
+        <span class="ml-auto font-mono whitespace-nowrap" :title="d.started_at">{{ relativeTime(d.started_at) }}</span>
+      </div>
+
       <button
-        v-if="row.original.error"
+        v-if="d.error"
         type="button"
-        class="tap44 max-w-md rounded-xs text-left text-xs text-status-error hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-        :title="row.original.error"
-        @click="toggle(row.original.number)"
+        class="tap44 rounded-md border border-crimson-400/30 bg-status-error-bg px-2.5 py-2 text-left text-xs text-status-error"
+        :class="isErrorTruncated(d.error) ? '' : 'cursor-default'"
+        :title="d.error"
+        @click="isErrorTruncated(d.error) && toggleError(d.number)"
       >
-        {{ displayError(row.original) }}
+        {{ errorText(d) }}
       </button>
-      <span v-else class="text-xs text-content-muted">—</span>
-    </template>
 
-    <template #actions-cell="{ row }">
-      <div class="tap-row flex items-center justify-end gap-1.5">
+      <div v-if="d.has_build_log || rollbackEligible(d)" class="tap-row flex flex-wrap items-center gap-2 border-t border-line pt-3">
         <UButton
-          v-if="row.original.has_build_log"
+          v-if="d.has_build_log"
           size="xs"
           color="neutral"
-          variant="ghost"
+          variant="soft"
           class="tap44"
-          :icon="row.getIsExpanded() ? 'i-lucide-chevron-up' : 'i-lucide-terminal'"
-          @click="toggleBuildLog(row.original.number)"
+          :icon="isBuildLogOpen(d.number) ? 'i-lucide-chevron-up' : 'i-lucide-terminal'"
+          @click="toggleBuildLog(d.number)"
         >
           Build log
         </UButton>
 
         <UPopover
-          v-if="canRollBackTo(row.original)"
-          :open="confirmOpenNumber === row.original.number"
-          @update:open="(v: boolean) => (confirmOpenNumber = v ? row.original.number : null)"
+          v-if="rollbackEligible(d)"
+          :open="confirmOpenNumber === d.number"
+          @update:open="(v: boolean) => (confirmOpenNumber = v ? d.number : null)"
         >
           <UButton
             size="xs"
-            color="neutral"
-            variant="ghost"
+            color="warning"
+            variant="soft"
             class="tap44"
             icon="i-lucide-history"
-            :loading="rollbackMutation.isPending.value && rollingBackToNumber === row.original.number"
+            :loading="rollbackMutation.isPending.value && rollingBackToNumber === d.number"
             :disabled="rollbackMutation.isPending.value"
           >
             Roll back
           </UButton>
           <template #content>
-            <div class="flex flex-col gap-2 p-3">
+            <div class="flex w-64 flex-col gap-2 p-3">
               <p class="text-xs text-content-secondary">
-                Roll back to deployment <span class="font-mono">#{{ row.original.number }}</span>?
+                Roll back to deployment <span class="font-mono">#{{ d.number }}</span>?
               </p>
-              <p class="max-w-64 text-xs text-content-muted">This redeploys the image from that deployment as a new deployment.</p>
+              <p class="text-xs text-content-muted">This redeploys the image from that deployment as a new deployment.</p>
               <div class="tap-row flex justify-end gap-2">
                 <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="confirmOpenNumber = null">Cancel</UButton>
                 <UButton
                   size="xs"
                   color="warning"
                   class="tap44"
-                  :loading="rollbackMutation.isPending.value && rollingBackToNumber === row.original.number"
-                  @click="confirmRollback(row.original.number)"
+                  :loading="rollbackMutation.isPending.value && rollingBackToNumber === d.number"
+                  @click="confirmRollback(d.number)"
                 >
                   Roll back
                 </UButton>
@@ -244,10 +395,10 @@ function confirmRollback(number: number) {
           </template>
         </UPopover>
       </div>
-    </template>
 
-    <template #expanded="{ row }">
-      <BuildLogPanel :slug="slug" :deployment="row.original" />
-    </template>
-  </UTable>
+      <div v-if="isBuildLogOpen(d.number)" class="border-t border-line pt-3">
+        <BuildLogPanel :slug="slug" :deployment="d" />
+      </div>
+    </div>
+  </div>
 </template>
