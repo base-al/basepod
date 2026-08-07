@@ -237,6 +237,8 @@ func (a *api) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.audit(r, "app.create", app.Slug, "image="+app.ImageRef)
+
 	// A freshly created app can't have any declared volumes yet — manual
 	// volume create/delete is out of scope this milestone (Task 8's
 	// compose apply is the only writer, and it always operates on an app
@@ -502,6 +504,8 @@ func (a *api) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.audit(r, "app.deploy", app.Slug, "image="+image)
+
 	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
 }
 
@@ -532,6 +536,8 @@ func (a *api) handleRollback(w http.ResponseWriter, r *http.Request) {
 		writeRollbackError(w, err)
 		return
 	}
+
+	a.audit(r, "app.rollback", app.Slug, fmt.Sprintf("to=%d", req.Number))
 
 	writeJSON(w, http.StatusOK, toDeploymentResponse(*dep))
 }
@@ -625,6 +631,8 @@ func (a *api) handleDeployTarball(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "deploy_failed", err.Error())
 		return
 	}
+
+	a.audit(r, "app.deploy", app.Slug, "source=tarball")
 
 	writeJSON(w, http.StatusAccepted, toDeploymentResponse(*dep))
 }
@@ -792,6 +800,8 @@ func (a *api) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 			log.Printf("api: delete app %s: slug does not resolve inside the data directory — refusing to remove anything", app.Slug)
 		}
 	}
+
+	a.audit(r, "app.delete", app.Slug, "")
 
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -13,6 +13,10 @@ const sessionTokenPrefix = "bp_sess_"
 // two token spaces) — see NewStreamToken.
 const streamTokenPrefix = "bp_stream_"
 
+// inviteTokenPrefix distinguishes an invitation token from every other
+// token type this package mints — see NewInviteToken.
+const inviteTokenPrefix = "bp_invite_"
+
 // NewSessionToken generates a new random session token and its sha256 hex
 // digest. token has the form "bp_sess_"+48 hex characters (24 random bytes).
 // tokenHash is the sha256 hex digest of the full token string; only the
@@ -31,6 +35,17 @@ func NewSessionToken() (token, tokenHash string) {
 // session token is (see HashToken); only the hash is ever stored.
 func NewStreamToken() (token, tokenHash string) {
 	return newToken(streamTokenPrefix)
+}
+
+// NewInviteToken generates a new random invitation token and its sha256
+// hex digest, exactly like NewSessionToken but with a distinct prefix.
+// Only the hash is ever persisted (see store.CreateInvitation); the raw
+// token is returned to the inviting admin exactly once, in the invite-
+// creation API response, for them to deliver to the invitee out of
+// band — the same "shown once, hashed at rest" contract every other
+// token type in this package follows.
+func NewInviteToken() (token, tokenHash string) {
+	return newToken(inviteTokenPrefix)
 }
 
 // newToken generates a random token of the form prefix+48 hex characters

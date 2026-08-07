@@ -17,9 +17,21 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+// userResponse is the wire shape of the caller's own profile (GET
+// /auth/me, POST /auth/login, POST /invitations/accept). ID and Role are
+// the users + roles milestone's additions — Role in particular is what a
+// client (dashboard, CLI) needs to know to decide what UI/commands to
+// even offer, since the server is the sole enforcer of what each role
+// may actually do (see internal/authz).
 type userResponse struct {
+	ID    int64  `json:"id"`
 	Email string `json:"email"`
 	Name  string `json:"name"`
+	Role  string `json:"role"`
+}
+
+func toUserResponse(u *store.User) userResponse {
+	return userResponse{ID: u.ID, Email: u.Email, Name: u.Name, Role: u.Role}
 }
 
 type loginResponse struct {
@@ -89,22 +101,40 @@ func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A disabled user's password may still be correct — disabling doesn't
+	// touch password_hash — so this check must come AFTER VerifyPassword
+	// (not before, and not folded into the UserByEmail error branch above)
+	// to preserve the same login-timing shape every other rejection on
+	// this path already has (audit finding L1's fix — see
+	// verifyDummyLogin's doc comment): a disabled account's response time
+	// must not be distinguishable from a correct login. This does not
+	// consume a rate-limit slot, matching a successful login's own
+	// behavior (this IS a successful credential check; the account is
+	// just not allowed to use it) — a disabled user retrying isn't an
+	// attacker guessing passwords.
+	if user.DisabledAt != "" {
+		writeError(w, http.StatusForbidden, "account_disabled", "this account has been disabled")
+		return
+	}
+
 	token, tokenHash := auth.NewSessionToken()
 	if err := a.st.CreateSession(user.ID, tokenHash, time.Now().Add(sessionDuration)); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to create session")
 		return
 	}
 
+	a.auditAs(user.ID, user.Email, "auth.login", user.Email, "")
+
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token: token,
-		User:  userResponse{Email: user.Email, Name: user.Name},
+		User:  toUserResponse(user),
 	})
 }
 
 // handleMe returns the authenticated user's public profile.
 func (a *api) handleMe(w http.ResponseWriter, r *http.Request) {
 	user := userFromContext(r.Context())
-	writeJSON(w, http.StatusOK, userResponse{Email: user.Email, Name: user.Name})
+	writeJSON(w, http.StatusOK, toUserResponse(user))
 }
 
 // handleLogout revokes the caller's current session server-side, so the

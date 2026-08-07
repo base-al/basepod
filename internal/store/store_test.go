@@ -805,8 +805,8 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 9 {
-		t.Fatalf("db version after migrating = %d, want 9 (00001..00009)", version)
+	if version != 10 {
+		t.Fatalf("db version after migrating = %d, want 10 (00001..00010)", version)
 	}
 
 	var appliedCount int
@@ -815,8 +815,8 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	}
 	// goose_db_version always carries a synthetic version-0 bootstrap row in
 	// addition to one row per applied migration file.
-	if appliedCount != 10 {
-		t.Fatalf("applied migration rows = %d, want 10 (bootstrap + 9 migrations)", appliedCount)
+	if appliedCount != 11 {
+		t.Fatalf("applied migration rows = %d, want 11 (bootstrap + 10 migrations)", appliedCount)
 	}
 
 	// apps.alias_scheme (migration 00005_alias_scheme.sql, from
@@ -900,6 +900,122 @@ func TestAllMigrationsApplyCleanly(t *testing.T) {
 	rows.Close()
 	if !sawGitSha {
 		t.Fatal("deployments.git_sha column missing after migrating to latest")
+	}
+
+	// users.role/disabled_at (migration 00010_user_roles.sql, the users +
+	// roles milestone) must exist.
+	rows, err = db.Query(`PRAGMA table_info(users)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawRole, sawDisabledAt bool
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if name == "role" {
+			sawRole = true
+		}
+		if name == "disabled_at" {
+			sawDisabledAt = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if !sawRole {
+		t.Fatal("users.role column missing after migrating to latest")
+	}
+	if !sawDisabledAt {
+		t.Fatal("users.disabled_at column missing after migrating to latest")
+	}
+
+	// invitations and audit_log tables (migration 00010_user_roles.sql)
+	// must exist.
+	for _, want := range []string{"invitations", "audit_log"} {
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, want).Scan(&tableName); err != nil {
+			t.Fatalf("%s table missing after migrating to latest: %v", want, err)
+		}
+	}
+}
+
+// TestBootstrapFromV05YieldsOneOwnerNoLockout is the users + roles
+// milestone's specific bootstrap requirement: a database created by an
+// earlier BasePod version — migrations 00001..00009 only, i.e. no role
+// column exists yet, `basepod setup`'s one admin row is the only user,
+// distinguished solely by is_superadmin — must come out of migration
+// 00010_user_roles.sql with that admin at role "owner" and NOT locked
+// out of administering their own instance. This simulates the real
+// upgrade path (an operator on v0.5 pulling a build that includes this
+// milestone) rather than testing the schema in isolation: it drives goose
+// up to version 9 by hand, inserts a user exactly the way v0.5's
+// CreateUser did (raw INSERT — this predates the role column entirely,
+// so it cannot go through today's store.Store.CreateUser), then runs the
+// remaining migrations and asserts on the result.
+func TestBootstrapFromV05YieldsOneOwnerNoLockout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, "migrations", 9); err != nil {
+		t.Fatalf("migrate to v0.5 (version 9): %v", err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO users(email, name, password_hash, is_superadmin) VALUES(?, ?, ?, ?)`,
+		"admin@example.com", "Admin", "irrelevant-hash", true); err != nil {
+		t.Fatalf("seed pre-roles admin user: %v", err)
+	}
+
+	// The upgrade: apply every remaining migration, including
+	// 00010_user_roles.sql.
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("user count after migrating = %d, want 1 (no user should be created or lost by this migration)", count)
+	}
+
+	var role string
+	var disabledAt sql.NullString
+	if err := db.QueryRow(`SELECT role, disabled_at FROM users WHERE email = ?`, "admin@example.com").Scan(&role, &disabledAt); err != nil {
+		t.Fatal(err)
+	}
+	if role != RoleOwner {
+		t.Fatalf("pre-existing admin's role after migrating = %q, want %q — this is a lockout: nobody could grant anyone a role", role, RoleOwner)
+	}
+	if disabledAt.Valid {
+		t.Fatalf("pre-existing admin came out of the migration disabled (disabled_at = %q), want NULL", disabledAt.String)
+	}
+
+	// Exercising it through the real Store API too: the migrated admin
+	// must be usable as the last owner (SetUserRole must refuse to demote
+	// them), not merely carry the right string in the column.
+	s := &Store{db: db}
+	u, err := s.UserByEmail("admin@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail after migrating: %v", err)
+	}
+	if err := s.SetUserRole(u.ID, RoleViewer); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("SetUserRole(migrated admin, viewer) = %v, want ErrLastOwner (this is the only owner — demoting them is exactly the lockout this migration must prevent)", err)
 	}
 }
 
@@ -2190,5 +2306,357 @@ func TestListComposeApps(t *testing.T) {
 		if app.Slug == "standalone" {
 			t.Fatal("ListComposeApps must never include a hand-created app")
 		}
+	}
+}
+
+// ---------------------------------------------------------------------
+// Users + roles milestone: CreateUserWithRole, ListUsers, SetUserRole,
+// DisableUser/EnableUser, DeleteUser, last-owner protection, invitations,
+// and the audit log (migration 00010_user_roles.sql).
+// ---------------------------------------------------------------------
+
+func TestCreateUserWithRole(t *testing.T) {
+	s := open(t)
+	id, err := s.CreateUserWithRole("viewer@example.com", "Viewer", "hash", RoleViewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := s.UserByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Role != RoleViewer {
+		t.Fatalf("role = %q, want %q", u.Role, RoleViewer)
+	}
+	if u.IsSuperadmin {
+		t.Fatal("a viewer must not be flagged is_superadmin")
+	}
+	if u.DisabledAt != "" {
+		t.Fatalf("newly created user has non-empty DisabledAt: %q", u.DisabledAt)
+	}
+	if u.CreatedAt == "" {
+		t.Fatal("CreatedAt must be set")
+	}
+}
+
+// TestCreateUserDerivesRoleFromSuper proves the back-compat CreateUser
+// (still used by internal/server/setup.go and every test that predates
+// roles) maps super=true to RoleOwner and super=false to RoleMember —
+// see CreateUser's doc comment.
+func TestCreateUserDerivesRoleFromSuper(t *testing.T) {
+	s := open(t)
+	ownerID, _ := s.CreateUser("owner@example.com", "Owner", "hash", true)
+	memberID, _ := s.CreateUser("member@example.com", "Member", "hash", false)
+
+	owner, err := s.UserByID(ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner.Role != RoleOwner {
+		t.Fatalf("super=true role = %q, want %q", owner.Role, RoleOwner)
+	}
+	if !owner.IsSuperadmin {
+		t.Fatal("super=true must still set is_superadmin (legacy column)")
+	}
+
+	member, err := s.UserByID(memberID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Role != RoleMember {
+		t.Fatalf("super=false role = %q, want %q", member.Role, RoleMember)
+	}
+	if member.IsSuperadmin {
+		t.Fatal("super=false must not set is_superadmin")
+	}
+}
+
+func TestValidRole(t *testing.T) {
+	for _, r := range []string{RoleViewer, RoleMember, RoleAdmin, RoleOwner} {
+		if !ValidRole(r) {
+			t.Errorf("ValidRole(%q) = false, want true", r)
+		}
+	}
+	for _, r := range []string{"", "Owner", "superadmin", "root"} {
+		if ValidRole(r) {
+			t.Errorf("ValidRole(%q) = true, want false", r)
+		}
+	}
+}
+
+func TestListUsers(t *testing.T) {
+	s := open(t)
+	s.CreateUserWithRole("a@b.c", "A", "hash", RoleOwner)
+	s.CreateUserWithRole("b@b.c", "B", "hash", RoleViewer)
+
+	users, err := s.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(users))
+	}
+	if users[0].Email != "a@b.c" || users[1].Email != "b@b.c" {
+		t.Fatalf("expected users ordered by id (creation order), got %+v", users)
+	}
+}
+
+func TestSetUserRole(t *testing.T) {
+	s := open(t)
+	// Two owners, so demoting one is not a last-owner violation.
+	s.CreateUserWithRole("owner1@example.com", "O1", "hash", RoleOwner)
+	id2, _ := s.CreateUserWithRole("owner2@example.com", "O2", "hash", RoleOwner)
+
+	if err := s.SetUserRole(id2, RoleAdmin); err != nil {
+		t.Fatalf("demote a non-last owner: %v", err)
+	}
+	u, err := s.UserByID(id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Role != RoleAdmin {
+		t.Fatalf("role after SetUserRole = %q, want %q", u.Role, RoleAdmin)
+	}
+}
+
+// TestSetUserRoleLastOwnerProtection is the demote half of the
+// last-owner-protection requirement: the sole remaining active owner
+// cannot be demoted to any other role.
+func TestSetUserRoleLastOwnerProtection(t *testing.T) {
+	s := open(t)
+	id, _ := s.CreateUserWithRole("solo@example.com", "Solo", "hash", RoleOwner)
+
+	if err := s.SetUserRole(id, RoleAdmin); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("SetUserRole(last owner, admin) = %v, want ErrLastOwner", err)
+	}
+	// The role must be genuinely unchanged, not just the error returned.
+	u, err := s.UserByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Role != RoleOwner {
+		t.Fatalf("role after rejected SetUserRole = %q, want unchanged %q", u.Role, RoleOwner)
+	}
+}
+
+// TestSetUserRoleLastOwnerProtectionIgnoresDisabledOwners proves
+// countActiveOwners only counts NON-disabled owners: a disabled owner
+// doesn't "cover" for the last active one — demoting the sole active
+// owner must still be refused even if a disabled owner row also exists.
+func TestSetUserRoleLastOwnerProtectionIgnoresDisabledOwners(t *testing.T) {
+	s := open(t)
+	activeID, _ := s.CreateUserWithRole("active@example.com", "Active", "hash", RoleOwner)
+	disabledID, _ := s.CreateUserWithRole("disabled@example.com", "Disabled", "hash", RoleOwner)
+	if err := s.DisableUser(disabledID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetUserRole(activeID, RoleViewer); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("SetUserRole(sole active owner, viewer) = %v, want ErrLastOwner (a disabled owner must not count)", err)
+	}
+}
+
+func TestDisableUserRevokesSessions(t *testing.T) {
+	s := open(t)
+	// A second owner so disabling the first isn't a last-owner violation.
+	s.CreateUserWithRole("owner2@example.com", "O2", "hash", RoleOwner)
+	id, _ := s.CreateUserWithRole("target@example.com", "Target", "hash", RoleMember)
+	if err := s.CreateSession(id, "th1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UserBySessionTokenHash("th1"); err != nil {
+		t.Fatalf("session should be valid before disable: %v", err)
+	}
+
+	if err := s.DisableUser(id); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UserBySessionTokenHash("th1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("session must be revoked immediately on disable: got %v, want ErrNotFound", err)
+	}
+
+	u, err := s.UserByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.DisabledAt == "" {
+		t.Fatal("DisabledAt must be set after DisableUser")
+	}
+}
+
+// TestDisableUserLastOwnerProtection is the disable half of the
+// last-owner-protection requirement.
+func TestDisableUserLastOwnerProtection(t *testing.T) {
+	s := open(t)
+	id, _ := s.CreateUserWithRole("solo@example.com", "Solo", "hash", RoleOwner)
+
+	if err := s.DisableUser(id); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("DisableUser(last owner) = %v, want ErrLastOwner", err)
+	}
+	u, err := s.UserByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.DisabledAt != "" {
+		t.Fatal("last owner must not actually be disabled when the call is rejected")
+	}
+}
+
+func TestEnableUser(t *testing.T) {
+	s := open(t)
+	s.CreateUserWithRole("owner2@example.com", "O2", "hash", RoleOwner)
+	id, _ := s.CreateUserWithRole("target@example.com", "Target", "hash", RoleMember)
+
+	if err := s.DisableUser(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnableUser(id); err != nil {
+		t.Fatal(err)
+	}
+	u, err := s.UserByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.DisabledAt != "" {
+		t.Fatalf("DisabledAt after EnableUser = %q, want empty", u.DisabledAt)
+	}
+
+	// A fresh session minted after re-enabling must work (disable revoked
+	// the old ones; enabling doesn't restore them, but new logins must
+	// succeed again).
+	if err := s.CreateSession(id, "th-new", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserBySessionTokenHash("th-new"); err != nil {
+		t.Fatalf("session after re-enable should be valid: %v", err)
+	}
+}
+
+func TestDeleteUserCascadesSessions(t *testing.T) {
+	s := open(t)
+	s.CreateUserWithRole("owner2@example.com", "O2", "hash", RoleOwner)
+	id, _ := s.CreateUserWithRole("target@example.com", "Target", "hash", RoleMember)
+	if err := s.CreateSession(id, "th1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteUser(id); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UserByID(id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("user should be gone after DeleteUser: got %v", err)
+	}
+	if _, err := s.UserBySessionTokenHash("th1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("session must be gone (FK cascade) after DeleteUser: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestDeleteUserLastOwnerProtection is the delete half of the
+// last-owner-protection requirement.
+func TestDeleteUserLastOwnerProtection(t *testing.T) {
+	s := open(t)
+	id, _ := s.CreateUserWithRole("solo@example.com", "Solo", "hash", RoleOwner)
+
+	if err := s.DeleteUser(id); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("DeleteUser(last owner) = %v, want ErrLastOwner", err)
+	}
+	if _, err := s.UserByID(id); err != nil {
+		t.Fatal("last owner must still exist when the delete is rejected")
+	}
+}
+
+func TestInvitationLifecycle(t *testing.T) {
+	s := open(t)
+	adminID, _ := s.CreateUserWithRole("admin@example.com", "Admin", "hash", RoleAdmin)
+
+	inv, err := s.CreateInvitation("tokenhash1", "invitee@example.com", RoleMember, adminID, time.Now().Add(7*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.AcceptedAt != "" {
+		t.Fatal("a freshly created invitation must not be accepted")
+	}
+
+	got, err := s.InvitationByTokenHash("tokenhash1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Email != "invitee@example.com" || got.Role != RoleMember || got.CreatedBy != adminID {
+		t.Fatalf("unexpected invitation: %+v", got)
+	}
+
+	if err := s.AcceptInvitation(got.ID); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := s.InvitationByTokenHash("tokenhash1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.AcceptedAt == "" {
+		t.Fatal("AcceptedAt must be set after AcceptInvitation")
+	}
+
+	list, err := s.ListInvitations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 invitation, got %d", len(list))
+	}
+}
+
+func TestInvitationByTokenHashNotFound(t *testing.T) {
+	s := open(t)
+	if _, err := s.InvitationByTokenHash("does-not-exist"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestAuditLog(t *testing.T) {
+	s := open(t)
+	id, _ := s.CreateUserWithRole("admin@example.com", "Admin", "hash", RoleAdmin)
+
+	if err := s.InsertAuditLog(id, "admin@example.com", "app.deploy", "myapp", "image=nginx:latest"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAuditLog(0, "", "auth.login", "unknown@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListAuditLog(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	// Newest first.
+	if entries[0].Action != "auth.login" || entries[1].Action != "app.deploy" {
+		t.Fatalf("expected newest-first order, got %+v", entries)
+	}
+	if entries[0].ActorID != 0 {
+		t.Fatalf("unauthenticated-actor entry's ActorID = %d, want 0", entries[0].ActorID)
+	}
+	if entries[1].ActorID != id {
+		t.Fatalf("entries[1].ActorID = %d, want %d", entries[1].ActorID, id)
+	}
+}
+
+func TestAuditLogLimit(t *testing.T) {
+	s := open(t)
+	for i := 0; i < 5; i++ {
+		if err := s.InsertAuditLog(0, "", "test.action", "x", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := s.ListAuditLog(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries (limit), got %d", len(entries))
 	}
 }

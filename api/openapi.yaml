@@ -58,6 +58,8 @@ tags:
   - name: webhooks
   - name: compose
   - name: streaming
+  - name: users
+  - name: audit
   - name: meta
 
 paths:
@@ -212,6 +214,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/App" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409": { description: "Slug already in use", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422": { $ref: "#/components/responses/Validation" }
 
@@ -259,6 +262,7 @@ paths:
       responses:
         "204": { description: Deleted }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /apps/{slug}/deployments/{number}:
@@ -315,6 +319,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Deployment" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "422": { $ref: "#/components/responses/Validation" }
         "502": { description: "Deploy failed (pull/health-check failure)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
@@ -436,6 +441,7 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/EnvVar" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "422": { $ref: "#/components/responses/Validation" }
 
@@ -809,6 +815,201 @@ paths:
         "502": { description: "stats_failed", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/TooManyStreams" }
 
+  /users:
+    get:
+      operationId: listUsers
+      tags: [users]
+      summary: List every user on the instance
+      description: Requires the `users:read` capability (admin floor — see internal/authz).
+      responses:
+        "200":
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/UserSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /users/invite:
+    post:
+      operationId: inviteUser
+      tags: [users]
+      summary: Create a single-use, expiring invitation
+      description: |
+        Requires the `users:invite` capability (admin floor). The caller
+        may only invite a role at or below their own rank — an admin can
+        invite a viewer/member/admin but never an owner. The response's
+        `token` is shown in plaintext exactly once; only its hash is
+        persisted (mirrors session/stream tokens) — the caller is
+        responsible for delivering it to the invitee out of band (e.g.
+        `basepod users invite` prints it).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InviteUserRequest" }
+      responses:
+        "201":
+          description: Invitation created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InviteUserResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "user_exists — a user with this email already exists", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /users/{email}/role:
+    parameters:
+      - $ref: "#/components/parameters/UserEmail"
+    patch:
+      operationId: changeUserRole
+      tags: [users]
+      summary: Change a user's role
+      description: |
+        Requires the `users:role_change` capability (owner floor — the
+        one role-management operation admins do NOT get). Returns 409
+        `last_owner` if the target is the last remaining active owner —
+        see the owner-protection rules in internal/store's SetUserRole.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChangeUserRoleRequest" }
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "last_owner — cannot change the role of the last remaining owner", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /users/{email}/disable:
+    parameters:
+      - $ref: "#/components/parameters/UserEmail"
+    post:
+      operationId: disableUser
+      tags: [users]
+      summary: Disable a user, revoking their sessions immediately
+      description: |
+        Requires the `users:disable` capability (admin floor). Every live
+        session belonging to the target is revoked as part of this same
+        call — a disabled user with a live session is a hole. Returns 409
+        `last_owner` if the target is the last remaining active owner.
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "last_owner — cannot disable the last remaining owner", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /users/{email}/enable:
+    parameters:
+      - $ref: "#/components/parameters/UserEmail"
+    post:
+      operationId: enableUser
+      tags: [users]
+      summary: Re-enable a previously disabled user
+      description: |
+        Requires the `users:disable` capability (admin floor). Does not
+        restore any session revoked at disable time — the user must log
+        in again.
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /users/{email}:
+    parameters:
+      - $ref: "#/components/parameters/UserEmail"
+    delete:
+      operationId: deleteUser
+      tags: [users]
+      summary: Permanently delete a user
+      description: |
+        Requires the `users:remove` capability (owner floor). The
+        target's sessions cascade-delete with it. Returns 409
+        `last_owner` if the target is the last remaining active owner.
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "last_owner — cannot delete the last remaining owner", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /invitations/accept:
+    post:
+      operationId: acceptInvite
+      tags: [users]
+      summary: Redeem an invitation, creating the invited user and logging them in
+      description: |
+        Deliberately unauthenticated — like the git webhook receiver,
+        this route's security model is its own token (single-use,
+        expiring), not a session. Sets the invitee's name and password
+        and creates them at the role the inviting admin chose, then
+        immediately mints a session (same response shape as
+        `POST /auth/login`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AcceptInviteRequest" }
+      responses:
+        "201":
+          description: User created and logged in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginResponse" }
+        "404": { description: "invite_not_found", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409":
+          description: "invite_already_used or invite_expired or user_exists"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /audit:
+    get:
+      operationId: listAudit
+      tags: [audit]
+      summary: List the most recent audit log entries, newest first
+      description: |
+        Requires the `audit:read` capability (admin floor). Records
+        every mutating operation (deploys, app create/delete, env
+        changes, user/role changes, logins) — never a secret value.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100 }
+          description: "Capped at 1000."
+      responses:
+        "200":
+          description: Audit log entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AuditEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Validation" }
+
   /openapi.yaml:
     get:
       operationId: getOpenAPISpec
@@ -856,10 +1057,21 @@ components:
       required: true
       schema: { type: integer }
       description: 1-based deployment number, scoped to the app.
+    UserEmail:
+      name: email
+      in: path
+      required: true
+      schema: { type: string, format: email }
+      description: The target user's email — identifies a user the same way {slug} identifies an app.
 
   responses:
     Unauthorized:
       description: Missing, malformed, or expired credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Authenticated, but the caller's role does not have this capability
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -906,8 +1118,60 @@ components:
     User:
       type: object
       properties:
+        id: { type: integer, format: int64 }
         email: { type: string, format: email }
         name: { type: string }
+        role: { type: string, enum: [viewer, member, admin, owner] }
+
+    UserSummary:
+      type: object
+      description: One user, as listed by GET /users and returned by the user-management mutation endpoints.
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string, format: email }
+        name: { type: string }
+        role: { type: string, enum: [viewer, member, admin, owner] }
+        disabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    InviteUserRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string, format: email }
+        role: { type: string, enum: [viewer, member, admin, owner] }
+
+    InviteUserResponse:
+      type: object
+      properties:
+        email: { type: string, format: email }
+        role: { type: string, enum: [viewer, member, admin, owner] }
+        token: { type: string, description: "Shown once, in plaintext — only its hash is persisted." }
+        expires_at: { type: string, format: date-time }
+
+    ChangeUserRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [viewer, member, admin, owner] }
+
+    AcceptInviteRequest:
+      type: object
+      required: [token, name, password]
+      properties:
+        token: { type: string }
+        name: { type: string }
+        password: { type: string, format: password, writeOnly: true }
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        actor_email: { type: string, description: "\"\" for an unauthenticated actor (there is none in this API today)." }
+        action: { type: string, description: "e.g. \"app.deploy\", \"user.role_change\", \"auth.login\"." }
+        target: { type: string }
+        detail: { type: string, description: "Short, human-readable. Never a secret value." }
+        created_at: { type: string, format: date-time }
 
     LoginResponse:
       type: object

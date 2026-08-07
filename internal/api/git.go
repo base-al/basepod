@@ -501,6 +501,8 @@ func (a *api) handleDeployGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.audit(r, "app.deploy", app.Slug, "source=git sha="+headSHA)
+
 	writeJSON(w, http.StatusAccepted, toDeploymentResponse(*dep))
 }
 

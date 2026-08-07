@@ -626,6 +626,120 @@ func (c *Client) DeploymentLog(ctx context.Context, slug string, number int) (st
 	return string(body), nil
 }
 
+// UserSummary is the wire shape of one user, as returned by ListUsers and
+// every user-management mutation (see internal/api/users.go's own
+// userSummary).
+type UserSummary struct {
+	ID        int64  `json:"id"`
+	Email     string `json:"email"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	Disabled  bool   `json:"disabled"`
+	CreatedAt string `json:"created_at"`
+}
+
+// InviteResult is the wire shape of a successful POST /users/invite —
+// Token is shown in plaintext exactly once (see
+// internal/api/users.go's inviteUserResponse).
+type InviteResult struct {
+	Email     string `json:"email"`
+	Role      string `json:"role"`
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// ListUsers returns every user on the instance (GET /users). Requires
+// the users:read capability (admin floor) server-side; an
+// under-privileged caller gets a 403 *ApiError.
+func (c *Client) ListUsers(ctx context.Context) ([]UserSummary, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/users", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []UserSummary
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// InviteUser creates a single-use, expiring invitation for email at role
+// (POST /users/invite). Requires the users:invite capability (admin
+// floor); the caller may only invite a role at or below their own rank.
+func (c *Client) InviteUser(ctx context.Context, email, role string) (*InviteResult, error) {
+	body, err := json.Marshal(map[string]string{"email": email, "role": role})
+	if err != nil {
+		return nil, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/users/invite", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var out InviteResult
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ChangeUserRole changes a user's role (PATCH /users/{email}/role).
+// Requires the users:role_change capability (owner floor).
+func (c *Client) ChangeUserRole(ctx context.Context, email, role string) (*UserSummary, error) {
+	body, err := json.Marshal(map[string]string{"role": role})
+	if err != nil {
+		return nil, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPatch, "/users/"+url.PathEscape(email)+"/role", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var out UserSummary
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DisableUser disables a user, immediately revoking their live sessions
+// (POST /users/{email}/disable). Requires the users:disable capability
+// (admin floor).
+func (c *Client) DisableUser(ctx context.Context, email string) (*UserSummary, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/users/"+url.PathEscape(email)+"/disable", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out UserSummary
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// EnableUser re-enables a previously disabled user (POST
+// /users/{email}/enable). Requires the users:disable capability (admin
+// floor).
+func (c *Client) EnableUser(ctx context.Context, email string) (*UserSummary, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/users/"+url.PathEscape(email)+"/enable", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out UserSummary
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RemoveUser permanently deletes a user (DELETE /users/{email}).
+// Requires the users:remove capability (owner floor).
+func (c *Client) RemoveUser(ctx context.Context, email string) error {
+	req, err := c.newRequest(ctx, http.MethodDelete, "/users/"+url.PathEscape(email), "", nil)
+	if err != nil {
+		return err
+	}
+	return c.do(req, nil)
+}
+
 // LogsStream opens GET .../logs as a live request, returning the raw
 // response body for the caller to read as Server-Sent Events (see sse.go).
 // Unlike a browser's EventSource, this sets a real Authorization header —
