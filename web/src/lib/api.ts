@@ -295,10 +295,13 @@ export interface PasswordChangeRequest {
  * streamTokenRequest). scope "app_logs" streams a running app's container
  * logs (GET .../logs) and must NOT carry deployment_number; scope
  * "build_log" streams one deployment's build log (GET
- * .../deployments/{number}/log) and MUST carry deployment_number — see
- * sse.ts's connect(), the only caller. */
+ * .../deployments/{number}/log) and MUST carry deployment_number; scope
+ * "all_stats" streams every running app's stats (GET /stats — the
+ * apps-list sparklines' batch route, see Apps.vue) and must carry slug ""
+ * (it names no single app) and no deployment_number — see sse.ts's
+ * connect(), the only caller. */
 export interface StreamTokenRequest {
-  scope: 'app_logs' | 'build_log'
+  scope: 'app_logs' | 'build_log' | 'all_stats'
   slug: string
   deployment_number?: number
 }
@@ -310,6 +313,34 @@ export interface StreamTokenRequest {
 export interface StreamTokenResponse {
   token: string
   expires_at: string
+}
+
+// --- Batch stats stream (GET /stats) — apps-list sparklines ---------------
+// Added alongside Apps.vue/CpuSparkline.vue; kept in this one block so a
+// merge with unrelated api.ts changes stays easy to reason about. See
+// internal/api/allstats.go's allStatsEventPayload for the exact Go source
+// of this shape, and lib/statsBuffer.ts for how Apps.vue folds a stream of
+// these into a per-app rolling window.
+
+/** One `event: stats` message's JSON body on the batch-stats stream (GET
+ * /stats) — the same fields the per-app stats stream would carry (see
+ * internal/api/stats.go's statsEventPayload; there is no TS type for that
+ * one yet, since no page consumes it this milestone) plus `slug`,
+ * identifying which app the sample is for, since one connection here
+ * carries every running app's samples interleaved. cpu_percent is 0-100
+ * per core (a container fully using 2 cores reads 200) — normalized onto
+ * that scale server-side; see internal/podman.StreamBulkStats' doc
+ * comment for why that normalization is necessary at all. */
+export interface AllStatsSample {
+  slug: string
+  cpu_percent: number
+  mem_used_bytes: number
+  mem_limit_bytes: number
+  pids: number
+  net_rx_bytes: number
+  net_tx_bytes: number
+  block_read_bytes: number
+  block_write_bytes: number
 }
 
 /** Typed error thrown for any non-2xx response, parsed from BasePod's

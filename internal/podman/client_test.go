@@ -1136,6 +1136,57 @@ func TestVersionErrorStatus(t *testing.T) {
 	}
 }
 
+// TestHostCPUs proves HostCPUs reads host.cpus out of libpod's GET /info
+// response, requesting the correct versioned libpod path. The response
+// shape here is a byte-for-byte trim of a live capture (2026-08-07,
+// podman 6.0.1 client / 5.7.1 server) — see Client.HostCPUs' doc comment
+// for the full verification trail, including the live cross-check
+// against the per-container compat endpoint's online_cpus for the same
+// host at the same moment.
+func TestHostCPUs(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/info", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		io.WriteString(w, `{"host":{"arch":"arm64","cpus":5,"hostname":"localhost.localdomain"},"store":{}}`)
+	})
+	c := fakeDaemon(t, mux)
+	got, err := c.HostCPUs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 5 {
+		t.Fatalf("HostCPUs() = %d, want 5", got)
+	}
+}
+
+func TestHostCPUsErrorStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/info", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"message": "boom"})
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.HostCPUs(context.Background()); err == nil {
+		t.Fatal("expected an error for a non-200 /info response")
+	}
+}
+
+// TestHostCPUsZeroIsError proves a decoded host.cpus of 0 (never actually
+// observed live, but a caller multiplying by this must not silently treat
+// it as "correction factor of 0") is reported as an error rather than
+// returned as a valid CPU count.
+func TestHostCPUsZeroIsError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v5.0.0/libpod/info", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		io.WriteString(w, `{"host":{"cpus":0}}`)
+	})
+	c := fakeDaemon(t, mux)
+	if _, err := c.HostCPUs(context.Background()); err == nil {
+		t.Fatal("expected an error for host.cpus = 0")
+	}
+}
+
 // TestContainerLogsQueryAndRawBody proves ContainerLogs sends the expected
 // query parameters and returns the response body completely unparsed
 // (raw multiplex bytes, not JSON-decoded) for the caller to stream.

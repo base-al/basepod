@@ -303,6 +303,52 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 	return v.Version, nil
 }
 
+// infoResponse is the subset of libpod's GET /info payload HostCPUs cares
+// about. Field name/nesting verified two ways (2026-08-07, same drill as
+// ContainerStats' doc comment): a read-only `curl --unix-socket` against
+// the live podman 6.0.1 client / 5.7.1 server returned
+// `{"host":{...,"cpus":5,...},...}` — cross-checked live against the
+// SAME container's online_cpus as reported by the per-container compat
+// stats endpoint (GET .../containers/{name}/stats), which read 5 too, for
+// a container BasePod never cpuset-restricts. HostCPUs relies on that
+// equivalence (see its own doc comment) to normalize the bulk stats
+// endpoint's CPU% (see StreamBulkStats).
+type infoResponse struct {
+	Host struct {
+		CPUs int `json:"cpus"`
+	} `json:"host"`
+}
+
+// HostCPUs reports the number of CPUs the podman host has online, read
+// from libpod's GET /info endpoint. It exists for exactly one caller,
+// StreamBulkStats: the bulk (multi-container) stats endpoint's raw CPU
+// field is NOT normalized by core count the way the per-container
+// endpoint's is (see StreamBulkStats' doc comment for the wire-format
+// discrepancy and its live-verification trail) — this is the missing
+// factor that puts the two endpoints' cpu_percent back on the same
+// scale.
+func (c *Client) HostCPUs(ctx context.Context) (int, error) {
+	status, data, err := c.request(ctx, http.MethodGet, "/info", nil)
+	if err != nil {
+		return 0, fmt.Errorf("podman: info: %w", err)
+	}
+	if status != http.StatusOK {
+		return 0, apiError(status, data)
+	}
+	var v infoResponse
+	if err := json.Unmarshal(data, &v); err != nil {
+		return 0, fmt.Errorf("podman: decoding info response: %w", err)
+	}
+	if v.Host.CPUs <= 0 {
+		// Never actually observed live (a real host always reports at
+		// least 1), but a caller dividing/multiplying by this must not
+		// silently work with 0 — treat it as a decode/compat problem
+		// rather than "this host has 0 CPUs".
+		return 0, fmt.Errorf("podman: info response reported host.cpus = %d", v.Host.CPUs)
+	}
+	return v.Host.CPUs, nil
+}
+
 // pullStreamLine is one line of the newline-delimited JSON stream libpod
 // sends back from POST /images/pull. Errors that occur mid-pull (e.g. a
 // missing manifest) are reported *inside* this stream with a 200 status,

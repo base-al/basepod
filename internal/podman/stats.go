@@ -257,3 +257,263 @@ func StreamStats(r io.Reader, emit func(ContainerStatsSample)) error {
 		emit(decodeStatsSample(w))
 	}
 }
+
+// BulkContainerStats streams every currently-running container's
+// resource-usage stats from libpod's GET .../libpod/containers/stats
+// (no {name} segment) — the batch stats route (v0.5 plan's follow-up
+// milestone) driving GET /api/v1/stats: ONE connection to podman covering
+// every running app, instead of one per-container connection the way the
+// per-app route (ContainerStats above) necessarily works.
+//
+// Wire shape and behavior verified three ways against a live podman
+// 6.0.1 client / 5.7.1 server (2026-08-07), each cross-checked against
+// podman's own source at the matching v5.7.1 tag:
+//
+//  1. Route registration. pkg/api/server/register_containers.go registers
+//     this exact path ("/libpod/containers/stats", no {name}) as
+//     `r.HandleFunc(VersionedPath("/libpod/containers/stats"),
+//     s.APIHandler(libpod.StatsContainer))` — the libpod-NATIVE handler
+//     this time (unlike the per-{name} route, which — see ContainerStats'
+//     doc comment — is actually served by the docker-compat handler
+//     despite living under "/libpod/..."). Confirmed via
+//     pkg/api/handlers/libpod/containers_stats.go: it decodes `containers`
+//     (query array of names/IDs, optional), `stream` (bool, default
+//     true), `interval` (int seconds, default 5), and `all` (bool,
+//     default false) — and streams `entities.ContainerStatsReport`
+//     (`{Error error, Stats []define.ContainerStats}`) values one per
+//     tick via `json.Encoder.Encode` (which appends '\n' after each
+//     value — confirmed newline-delimited framing in a live capture, but
+//     StreamBulkStats' decode loop below doesn't depend on that: like
+//     StreamStats, it decodes successive values with encoding/json's own
+//     Decoder, which tolerates any whitespace, none, between them).
+//     define.ContainerStats (libpod/define/containerstate.go) has NO
+//     json tags, so the wire keys are its bare Go field names —
+//     confirmed byte-for-byte against a live capture: `{"Error":null,
+//     "Stats":[{"AvgCPU":...,"ContainerID":"...",  "Name":"...",
+//     "PerCPU":null,"CPU":...,"CPUNano":...,"CPUSystemNano":...,
+//     "SystemNano":...,"MemUsage":...,"MemLimit":...,"MemPerc":...,
+//     "Network":{"eth0":{"RxBytes":...,"TxBytes":...,...}},
+//     "BlockInput":...,"BlockOutput":...,"PIDs":...,"UpTime":...,
+//     "Duration":...}]}`.
+//
+//  2. Default enumeration scope. pkg/domain/infra/abi/containers.go's
+//     ContainerEngine.ContainerStats: with no `containers=` query values
+//     and `all=false` (this client's chosen mode — see below), the
+//     container set comes from `ic.Libpod.GetRunningContainers` — i.e.
+//     omitting `containers=` already scopes to exactly "every running
+//     container", matching this client's contract with no client-side
+//     filtering needed for that part. Per-container errors while
+//     collecting that set (a container stopped between listing and
+//     reading its stats) are silently skipped in this mode
+//     (`queryAll` — the container-vanished-mid-tick case a live,
+//     ever-changing app fleet hits routinely) rather than failing the
+//     whole tick — confirmed live: sending `curl
+//     .../containers/stats?containers=<a-name-that-does-not-exist>`
+//     returns a clean top-level 404 for the WHOLE request instead
+//     (verified live), because passing explicit `containers=` names
+//     switches the abi code to a DIFFERENT, non-skipping path
+//     (`GetContainersByList`) — this is exactly why
+//     BulkContainerStats deliberately never passes `containers=`: doing
+//     so would make one vanished container able to kill the entire
+//     stream. This client also verified live that `containers=`, when
+//     used, filters correctly by exact name/ID — but that a `filters=`
+//     query param (the label-filter shape ListContainers itself uses) is
+//     NOT understood by this endpoint at all (silently ignored, still
+//     returns every running container) — so this client relies on
+//     ListContainers (labels) for BasePod-vs-foreign attribution
+//     entirely client-side, matching every other per-tick sample against
+//     the container-ID set deploy.Engine.RunningAppContainers returns,
+//     rather than ever trying to filter podman's response itself.
+//
+//  3. CPU-percent scale (the specific trap worth flagging loudly: three
+//     agents were burned this milestone by assuming libpod field names
+//     without checking their SCALE, not just their spelling).
+//     libpod/stats_linux.go's calculateCPUPercent — what actually
+//     computes define.ContainerStats.CPU — is
+//     `(cpuDelta/systemDelta)*100` with NO online-CPU-count factor
+//     (unlike this package's own calcCPUPercent for the per-container
+//     endpoint, which additionally multiplies by online_cpus to match
+//     `docker stats`/`podman stats` CLI convention). The bulk wire shape
+//     doesn't even expose online-CPU-count as a field. Concretely: a
+//     container fully saturating 1 of a 5-core host reads ~20 from this
+//     endpoint's raw CPU field but ~100 from the per-container endpoint's
+//     cpu_percent (BasePod's existing per-app SSE contract, statsWire's
+//     calcCPUPercent) — the SAME real usage, two different numbers, if
+//     naively wired straight through. Confirmed by direct comparison: a
+//     live sample from THIS endpoint (bp-caddy, CPU 0.0125) against the
+//     same container's per-container-endpoint online_cpus (5) and this
+//     host's GET /info host.cpus (5, see Client.HostCPUs) at the same
+//     moment — 0.0125*5 = 0.0625, in the same ballpark as this app's
+//     near-idle load, while 0.0125 alone would silently under-report by
+//     5x. onlineCPUs below is the caller-supplied correction: BulkStats
+//     Sample.CPUPercent is `wireCPU*onlineCPUs`, putting this endpoint's
+//     numbers on the exact same 0-100-per-core scale
+//     podman.ContainerStatsSample.CPUPercent already promises — so a
+//     dashboard sparkline fed by this endpoint reads consistently with
+//     any per-app view fed by the other one.
+//
+// The returned ReadCloser is the raw HTTP response body, same contract as
+// ContainerStats' (caller owns closing it; that's what ends the stream).
+// stream=true (the default the query omits, matching podman's own
+// default) keeps it open indefinitely at libpod's own ~5s cadence — not a
+// rate this client controls, mirroring ContainerStats.
+func (c *Client) BulkContainerStats(ctx context.Context) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/containers/stats?stream=true", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("podman: bulk stats: %w", err)
+	}
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, apiError(resp.StatusCode, data)
+	}
+	return resp.Body, nil
+}
+
+// BulkStatsSample is one container's resource-usage reading within a
+// single bulk-stats tick — BulkStatsSample's ContainerID/Name identify
+// which container it's for (the batch route's caller,
+// internal/api/allstats.go, maps ContainerID onto an app slug via
+// deploy.Engine.RunningAppContainers), the rest mirrors
+// ContainerStatsSample field-for-field (same units, same meaning) so both
+// endpoints' samples can share one downstream shape.
+type BulkStatsSample struct {
+	ContainerID string
+	Name        string
+
+	// CPUPercent is already normalized by onlineCPUs (see
+	// StreamBulkStats' onlineCPUs parameter and BulkContainerStats' doc
+	// comment point 3) — 0-100 per core, matching
+	// ContainerStatsSample.CPUPercent's scale exactly.
+	CPUPercent float64
+
+	MemUsedBytes  uint64
+	MemLimitBytes uint64
+	PIDs          uint64
+	NetRxBytes    uint64
+	NetTxBytes    uint64
+
+	BlockReadBytes  uint64
+	BlockWriteBytes uint64
+}
+
+// bulkNetworkEntry mirrors libpod/define.ContainerNetworkStats — no json
+// tags (see BulkContainerStats' doc comment point 1), only the two fields
+// this client sums.
+type bulkNetworkEntry struct {
+	RxBytes uint64
+	TxBytes uint64
+}
+
+// bulkStatsWire is the on-the-wire shape of one entry in a bulk-stats
+// tick's "Stats" array — libpod's define.ContainerStats (see
+// BulkContainerStats' doc comment point 1), trimmed to the sub-fields
+// BasePod actually consumes (AvgCPU/PerCPU/CPUNano/CPUSystemNano/
+// SystemNano/MemPerc/UpTime/Duration are intentionally dropped, mirroring
+// how statsWire already trims the per-container endpoint's shape).
+type bulkStatsWire struct {
+	ContainerID string
+	Name        string
+	CPU         float64
+	MemUsage    uint64
+	MemLimit    uint64
+	PIDs        uint64
+	Network     map[string]bulkNetworkEntry
+	BlockInput  uint64
+	BlockOutput uint64
+}
+
+// bulkStatsFrame is the on-the-wire shape of one line StreamBulkStats
+// decodes — libpod's entities.ContainerStatsReport (see
+// BulkContainerStats' doc comment point 1): `{Error error, Stats
+// []define.ContainerStats}`. Error is decoded as raw JSON rather than a
+// typed field: Go's `error` interface has no exported fields, so a
+// non-nil error value with an unexported-only concrete type (e.g.
+// *errors.errorString from errors.New/fmt.Errorf — the common case)
+// marshals to `{}`, not a string — there is no reconstructable message,
+// only a null-vs-non-null signal, which is all StreamBulkStats needs
+// (see its doc comment for when this can actually happen).
+type bulkStatsFrame struct {
+	Error json.RawMessage `json:"Error"`
+	Stats []bulkStatsWire `json:"Stats"`
+}
+
+// frameHasError reports whether a decoded bulkStatsFrame's Error field is
+// present and non-null — `{}` (an error with no recoverable message,
+// the common case) and any other non-null JSON value both count; a
+// missing key or literal `null` (the overwhelmingly common per-tick case
+// — see BulkContainerStats' doc comment point 2) does not.
+func frameHasError(f bulkStatsFrame) bool {
+	return len(f.Error) > 0 && string(f.Error) != "null"
+}
+
+// decodeBulkStatsSample converts one bulkStatsWire entry into a
+// BulkStatsSample, applying onlineCPUs' CPU-percent correction (see
+// BulkContainerStats' doc comment point 3) and summing Network/BlockIO
+// exactly like decodeStatsSample does for the per-container endpoint.
+func decodeBulkStatsSample(w bulkStatsWire, onlineCPUs int) BulkStatsSample {
+	var netRx, netTx uint64
+	for _, n := range w.Network {
+		netRx += n.RxBytes
+		netTx += n.TxBytes
+	}
+	return BulkStatsSample{
+		ContainerID:     w.ContainerID,
+		Name:            w.Name,
+		CPUPercent:      w.CPU * float64(onlineCPUs),
+		MemUsedBytes:    w.MemUsage,
+		MemLimitBytes:   w.MemLimit,
+		PIDs:            w.PIDs,
+		NetRxBytes:      netRx,
+		NetTxBytes:      netTx,
+		BlockReadBytes:  w.BlockInput,
+		BlockWriteBytes: w.BlockOutput,
+	}
+}
+
+// StreamBulkStats reads r (the ReadCloser BulkContainerStats returns) as
+// a sequence of JSON "tick" objects (see BulkContainerStats' doc comment
+// point 1 for the exact framing/decode-tolerance reasoning, identical to
+// StreamStats'), calling emit once per tick with that tick's full sample
+// slice — one entry per container libpod reported stats for at that
+// moment (every currently-running container on the host; see
+// BulkContainerStats' doc comment point 2 — filtering down to BasePod's
+// own apps is the caller's job, not this decoder's). onlineCPUs is
+// applied to every sample's CPU% (see BulkContainerStats' doc comment
+// point 3) — callers get it once via Client.HostCPUs before starting the
+// stream, since a host's core count never changes mid-process.
+//
+// Mirrors StreamStats' EOF handling: a clean end of stream (io.EOF) or
+// one truncated mid-object (io.ErrUnexpectedEOF) returns nil. A tick
+// whose "Error" field is non-null (see frameHasError — libpod's own
+// signal that container enumeration itself failed, e.g. a runtime-level
+// failure rather than one container vanishing, which never surfaces this
+// way — see BulkContainerStats' doc comment point 2) returns a genuine
+// error and stops: libpod itself closes the stream right after emitting
+// that tick (pkg/api/handlers/libpod/containers_stats.go's
+// StatsContainer returns as soon as it forwards a report with a non-nil
+// Error), so there is nothing further to read regardless.
+func StreamBulkStats(r io.Reader, onlineCPUs int, emit func([]BulkStatsSample)) error {
+	dec := json.NewDecoder(r)
+	for {
+		var f bulkStatsFrame
+		if err := dec.Decode(&f); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return err
+		}
+		if frameHasError(f) {
+			return fmt.Errorf("podman: bulk stats tick reported an error: %s", f.Error)
+		}
+		samples := make([]BulkStatsSample, len(f.Stats))
+		for i, w := range f.Stats {
+			samples[i] = decodeBulkStatsSample(w, onlineCPUs)
+		}
+		emit(samples)
+	}
+}

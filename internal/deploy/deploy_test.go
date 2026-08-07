@@ -34,6 +34,11 @@ type fakeRuntime struct {
 	containers map[string]podman.ContainerInfo
 	nextID     int
 
+	// listErr, if set, is returned by ListContainers instead of the
+	// normal filtered scan — used by RunningAppContainers' error-
+	// propagation test.
+	listErr error
+
 	pullErr   error
 	createErr error
 	startErr  error
@@ -89,6 +94,17 @@ type fakeRuntime struct {
 	statsReader io.ReadCloser
 	statsErr    error
 	statsCalls  []string
+
+	// bulkStatsReader/bulkStatsErr script BulkContainerStats;
+	// bulkStatsCalls counts how many times it was called — mirrors
+	// statsReader/statsErr/statsCalls above.
+	bulkStatsReader io.ReadCloser
+	bulkStatsErr    error
+	bulkStatsCalls  int
+
+	// hostCPUs/hostCPUsErr script HostCPUs.
+	hostCPUs    int
+	hostCPUsErr error
 }
 
 // loggedCall records one ContainerLogs invocation.
@@ -280,6 +296,9 @@ func (f *fakeRuntime) ListContainers(ctx context.Context, labelFilters map[strin
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	var out []podman.ContainerInfo
 	for _, c := range f.containers {
 		match := true
@@ -323,6 +342,33 @@ func (f *fakeRuntime) ContainerStats(ctx context.Context, nameOrID string) (io.R
 		return f.statsReader, nil
 	}
 	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (f *fakeRuntime) BulkContainerStats(ctx context.Context) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.bulkStatsCalls++
+	if f.bulkStatsErr != nil {
+		return nil, f.bulkStatsErr
+	}
+	if f.bulkStatsReader != nil {
+		return f.bulkStatsReader, nil
+	}
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (f *fakeRuntime) HostCPUs(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if f.hostCPUsErr != nil {
+		return 0, f.hostCPUsErr
+	}
+	if f.hostCPUs == 0 {
+		return 1, nil
+	}
+	return f.hostCPUs, nil
 }
 
 // fakeRouter is a test double for Router.
@@ -2078,6 +2124,154 @@ func TestAppStatsPropagatesRuntimeError(t *testing.T) {
 	_, err = eng.AppStats(ctx, "blog")
 	if err == nil || !strings.Contains(err.Error(), "stats boom") {
 		t.Fatalf("err = %v, want it to wrap %q", err, "stats boom")
+	}
+}
+
+// TestAllStatsReturnsRuntimeReader proves AllStats is a thin pass-through
+// to Runtime.BulkContainerStats — no slug, no not-found/not-running
+// failure mode (see AllStats' doc comment: nothing running is still a
+// valid, if silent, stream).
+func TestAllStatsReturnsRuntimeReader(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+
+	wantReader := io.NopCloser(strings.NewReader("scripted bulk stats data"))
+	rt.bulkStatsReader = wantReader
+
+	rc, err := eng.AllStats(context.Background())
+	if err != nil {
+		t.Fatalf("AllStats: %v", err)
+	}
+	if rc != wantReader {
+		t.Errorf("AllStats returned a different reader than Runtime.BulkContainerStats supplied")
+	}
+	if rt.bulkStatsCalls != 1 {
+		t.Errorf("bulkStatsCalls = %d, want 1", rt.bulkStatsCalls)
+	}
+}
+
+// TestAllStatsPropagatesRuntimeError proves a Runtime.BulkContainerStats
+// error surfaces from AllStats rather than being swallowed — mirrors
+// TestAppStatsPropagatesRuntimeError.
+func TestAllStatsPropagatesRuntimeError(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	rt.bulkStatsErr = errors.New("bulk stats boom")
+
+	_, err := eng.AllStats(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "bulk stats boom") {
+		t.Fatalf("err = %v, want it to wrap %q", err, "bulk stats boom")
+	}
+}
+
+// TestHostCPUsReturnsRuntimeValue proves HostCPUs is a thin pass-through
+// to Runtime.HostCPUs.
+func TestHostCPUsReturnsRuntimeValue(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	rt.hostCPUs = 8
+
+	got, err := eng.HostCPUs(context.Background())
+	if err != nil {
+		t.Fatalf("HostCPUs: %v", err)
+	}
+	if got != 8 {
+		t.Errorf("HostCPUs() = %d, want 8", got)
+	}
+}
+
+// TestHostCPUsPropagatesRuntimeError proves a Runtime.HostCPUs error
+// surfaces from HostCPUs rather than being swallowed.
+func TestHostCPUsPropagatesRuntimeError(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	rt.hostCPUsErr = errors.New("host cpus boom")
+
+	_, err := eng.HostCPUs(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "host cpus boom") {
+		t.Fatalf("err = %v, want it to wrap %q", err, "host cpus boom")
+	}
+}
+
+// TestRunningAppContainers proves RunningAppContainers maps each
+// currently-running, this-instance BasePod-managed container's ID onto
+// its owning app's slug — the attribution table handleAllStats needs
+// since podman.BulkStatsSample carries no label of its own.
+func TestRunningAppContainers(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	ctx := context.Background()
+
+	blog, err := st.CreateApp("blog", "nginx:v1", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, blog, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy blog: %v", err)
+	}
+	shop, err := st.CreateApp("shop", "nginx:v1", 81)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Deploy(ctx, shop, "nginx:v1"); err != nil {
+		t.Fatalf("Deploy shop: %v", err)
+	}
+
+	// A stopped BasePod-managed container must not appear — it isn't
+	// currently running, so the batch stats route has no live data for it
+	// anyway (podman's bulk endpoint only reports running containers by
+	// default — see podman.BulkContainerStats' doc comment).
+	rt.containers["stopped-1"] = podman.ContainerInfo{
+		ID: "stopped-1", Name: "bp-blog-2", State: "exited",
+		Labels: map[string]string{"basepod.managed": "true", "basepod.app": "blog", "basepod.deployment": "2"},
+	}
+	// A foreign instance's running, otherwise-identical-looking container
+	// must not appear either (issue #10 — see isForeignInstance).
+	rt.containers["foreign-1"] = podman.ContainerInfo{
+		ID: "foreign-1", Name: "bp-other-1", State: "running",
+		Labels: map[string]string{
+			"basepod.managed": "true", "basepod.app": "other", "basepod.deployment": "1",
+			"basepod.instance": "some-other-instance",
+		},
+	}
+	// A container with no basepod.managed label at all (e.g. something
+	// unrelated sharing the same podman socket) must not appear.
+	rt.containers["unrelated-1"] = podman.ContainerInfo{
+		ID: "unrelated-1", Name: "not-basepod", State: "running",
+	}
+
+	got, err := eng.RunningAppContainers(ctx)
+	if err != nil {
+		t.Fatalf("RunningAppContainers: %v", err)
+	}
+
+	var blogID, shopID string
+	for id, c := range rt.containers {
+		switch c.Name {
+		case "bp-blog-1":
+			blogID = id
+		case "bp-shop-1":
+			shopID = id
+		}
+	}
+
+	want := map[string]string{blogID: "blog", shopID: "shop"}
+	if len(got) != len(want) || got[blogID] != "blog" || got[shopID] != "shop" {
+		t.Fatalf("RunningAppContainers() = %+v, want %+v", got, want)
+	}
+}
+
+// TestRunningAppContainersPropagatesRuntimeError proves a
+// Runtime.ListContainers error surfaces from RunningAppContainers rather
+// than being swallowed.
+func TestRunningAppContainersPropagatesRuntimeError(t *testing.T) {
+	st := openStore(t)
+	eng, rt, _, _, _ := newTestEngine(t, st)
+	rt.listErr = errors.New("list boom")
+
+	_, err := eng.RunningAppContainers(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "list boom") {
+		t.Fatalf("err = %v, want it to wrap %q", err, "list boom")
 	}
 }
 

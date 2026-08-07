@@ -37,6 +37,11 @@ var _ LogSource = (*deploy.Engine)(nil).AppLogs
 // StatsSource func type this package defines and consumes.
 var _ StatsSource = (*deploy.Engine)(nil).AppStats
 
+// Compile-time assertion that *deploy.Engine satisfies the
+// AllStatsProvider interface this package defines and consumes (the
+// batch-stats route's AllStats/HostCPUs/RunningAppContainers trio).
+var _ AllStatsProvider = (*deploy.Engine)(nil)
+
 const testPassword = "correct-password"
 
 // testKey is a fixed 32-byte encryption key used by testSeal/testOpen so
@@ -399,11 +404,21 @@ func newTestServerWithGit(t *testing.T, st *store.Store, dep Deployer, routes Ro
 	return newTestServerWithStats(t, st, dep, routes, logs, builder, gitFetcher, unusedStatsSource)
 }
 
-// newTestServerWithStats is the fullest-control constructor, for
-// stats_test.go's tests that need to script GET .../apps/{slug}/stats.
+// newTestServerWithStats is a constructor for stats_test.go's tests that
+// need to script GET .../apps/{slug}/stats, passing a default
+// unusedAllStatsProvider through for the batch route — tests that
+// exercise GET .../stats use newTestServerWithAllStats instead.
 func newTestServerWithStats(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder, gitFetcher, stats))
+	return newTestServerWithAllStats(t, st, dep, routes, logs, builder, gitFetcher, stats, unusedAllStatsProvider)
+}
+
+// newTestServerWithAllStats is the fullest-control constructor, for
+// allstats_test.go's tests that need to script GET .../stats (the
+// batch-stats route the apps-list sparklines subscribe to).
+func newTestServerWithAllStats(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource, allStats AllStatsProvider) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder, gitFetcher, stats, allStats))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -420,6 +435,26 @@ func unusedLogSource(ctx context.Context, slug string, follow bool, tail int) (i
 func unusedStatsSource(ctx context.Context, slug string) (io.ReadCloser, error) {
 	return nil, errors.New("unusedStatsSource: this test's StatsSource was not expected to be called")
 }
+
+// unusedAllStatsProviderType is unusedStatsSource's twin for tests that
+// don't exercise GET .../stats (the batch route) — an interface, unlike
+// StatsSource's bare func type, so it needs a named type to hang three
+// loudly-failing methods off rather than a single func var.
+type unusedAllStatsProviderType struct{}
+
+func (unusedAllStatsProviderType) AllStats(ctx context.Context) (io.ReadCloser, error) {
+	return nil, errors.New("unusedAllStatsProvider.AllStats: this test's AllStatsProvider was not expected to be called")
+}
+
+func (unusedAllStatsProviderType) HostCPUs(ctx context.Context) (int, error) {
+	return 0, errors.New("unusedAllStatsProvider.HostCPUs: this test's AllStatsProvider was not expected to be called")
+}
+
+func (unusedAllStatsProviderType) RunningAppContainers(ctx context.Context) (map[string]string, error) {
+	return nil, errors.New("unusedAllStatsProvider.RunningAppContainers: this test's AllStatsProvider was not expected to be called")
+}
+
+var unusedAllStatsProvider AllStatsProvider = unusedAllStatsProviderType{}
 
 // decodeInto JSON-decodes resp's body into out, failing the test on a
 // decode error. Shared by doJSON and tests (e.g. deploy_tarball_test.go)

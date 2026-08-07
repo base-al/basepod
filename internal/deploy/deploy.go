@@ -1597,6 +1597,78 @@ func (e *Engine) AppStats(ctx context.Context, slug string) (io.ReadCloser, erro
 	return rc, nil
 }
 
+// AllStats streams EVERY currently-running container's resource-usage
+// stats over one connection — the batch-stats route's substrate (GET
+// /api/v1/stats). Unlike AppStats, it takes no slug and has no
+// not-found/not-running failure mode of its own: with nothing running at
+// all it's still a valid (if silent) stream, matching the batch route's
+// contract that an app with no running container simply never emits
+// rather than the whole connection erroring. The returned ReadCloser is
+// the raw, still-wire-format stream straight from the runtime (see
+// podman.StreamBulkStats for decoding it) — the caller owns closing it.
+func (e *Engine) AllStats(ctx context.Context) (io.ReadCloser, error) {
+	rc, err := e.rt.BulkContainerStats(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: bulk stats: %w", err)
+	}
+	return rc, nil
+}
+
+// HostCPUs reports the podman host's online CPU count — see
+// podman.Client.HostCPUs' doc comment for why the batch-stats route needs
+// this (normalizing podman.StreamBulkStats' raw CPU% onto the same scale
+// AppStats' already promises).
+func (e *Engine) HostCPUs(ctx context.Context) (int, error) {
+	n, err := e.rt.HostCPUs(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("deploy: host cpus: %w", err)
+	}
+	return n, nil
+}
+
+// RunningAppContainers reports, for every currently-running
+// BasePod-managed container belonging to THIS instance (issue #10 — see
+// isForeignInstance), which app slug owns it: containerID -> slug. The
+// batch-stats route (internal/api/allstats.go's handleAllStats) uses this
+// to attribute each podman.BulkStatsSample (identified only by container
+// ID/name, carrying no label of its own — bulk stats' wire shape has no
+// room for one) to the app whose SSE row it should update; a container ID
+// with no entry here (a foreign instance's container, or simply not
+// BasePod-managed at all — see the live evidence in the batch-stats
+// report for a real example: a host can easily be running unrelated
+// containers BasePod never created) is silently skipped rather than
+// guessed at.
+//
+// Unlike AppLogs/AppStats/AllStats above, a lookup failure here (the
+// underlying ListContainers call erroring) is NOT wrapped with
+// store.ErrNotFound/deploy.ErrNotRunning semantics — there is no single
+// app or container this call is "about", so any error is just passed
+// through wrapped with context, for the caller to treat as "skip this
+// tick's attribution, try again next tick" rather than a fatal stream
+// error (see handleAllStats' doc comment).
+func (e *Engine) RunningAppContainers(ctx context.Context) (map[string]string, error) {
+	containers, err := e.rt.ListContainers(ctx, map[string]string{"basepod.managed": "true"})
+	if err != nil {
+		return nil, fmt.Errorf("deploy: list running app containers: %w", err)
+	}
+
+	out := make(map[string]string, len(containers))
+	for _, c := range containers {
+		if c.State != "running" {
+			continue
+		}
+		if e.isForeignInstance(c) {
+			continue
+		}
+		slug, ok := c.Labels["basepod.app"]
+		if !ok || slug == "" {
+			continue
+		}
+		out[c.ID] = slug
+	}
+	return out, nil
+}
+
 // orphanCleanupTimeout bounds CleanupOrphans's stop/remove work — it runs
 // once at boot (see server.Run), detached from the caller's ctx like
 // fail's/removeOldContainers's cleanupCtx (a slow boot racing a shutdown

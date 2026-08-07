@@ -122,6 +122,36 @@ type LogSource func(ctx context.Context, slug string, follow bool, tail int) (io
 // maps both to the documented HTTP status/error codes.
 type StatsSource func(ctx context.Context, slug string) (io.ReadCloser, error)
 
+// AllStatsProvider is the subset of *deploy.Engine handleAllStats needs
+// for the batch-stats SSE route (GET /api/v1/stats — the
+// sparklines-on-the-apps-list milestone): one connection carrying every
+// currently-running app's stats, rather than StatsSource's one-connection-
+// per-app. Bundled as an interface (rather than three separate func-typed
+// fields, the way LogSource/StatsSource are) because all three methods
+// serve exactly one handler and are always used together — see
+// deploy.Engine.AllStats/HostCPUs/RunningAppContainers' doc comments for
+// what each does and why the handler needs all three.
+type AllStatsProvider interface {
+	// AllStats streams every running container's raw (still-wire-format)
+	// bulk stats — see podman.StreamBulkStats for decoding it, and
+	// deploy.Engine.AllStats' doc comment for why (unlike StatsSource)
+	// there's no not-found/not-running failure mode: nothing running is
+	// still a valid, if silent, stream.
+	AllStats(ctx context.Context) (io.ReadCloser, error)
+	// HostCPUs reports the podman host's online CPU count, needed to
+	// normalize podman.StreamBulkStats' raw CPU% onto the same scale
+	// StatsSource's already promises — fetched once per connection,
+	// before entering the stream loop (a host's core count never changes
+	// mid-process).
+	HostCPUs(ctx context.Context) (int, error)
+	// RunningAppContainers reports containerID -> app slug for every
+	// currently-running, this-instance BasePod-managed container —
+	// refreshed once per tick so handleAllStats can attribute each
+	// podman.BulkStatsSample (identified only by container ID/name) to
+	// the app whose SSE row it should update.
+	RunningAppContainers(ctx context.Context) (map[string]string, error)
+}
+
 // deployTimeout bounds a single deploy request. v0.1 deploys run
 // synchronously inside the HTTP handler (no SSE build-log streaming until
 // v0.2's real builds), so a stuck pull or health-probe loop must not hang
@@ -235,6 +265,10 @@ type api struct {
 	// handleAppStats to decode into SSE events (v0.5 plan Task 11).
 	stats StatsSource
 
+	// allStats backs handleAllStats — GET /api/v1/stats, the batch-stats
+	// route the apps-list sparklines subscribe to.
+	allStats AllStatsProvider
+
 	// builder is the shared tarball-build pipeline, passed straight
 	// through to every Deployer.DeployBuild call by handleDeployTarball —
 	// see the Deployer.DeployBuild doc comment for why it's threaded
@@ -265,7 +299,7 @@ type api struct {
 // production caller (internal/server.Run) always passes a real
 // *gitsource.Cloner, itself gracefully degraded (not nil) when the git
 // binary isn't installed.
-func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource) http.Handler {
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource, allStats AllStatsProvider) http.Handler {
 	a := &api{
 		st:             st,
 		dep:            dep,
@@ -282,6 +316,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(a
 		builder:        builder,
 		gitFetcher:     gitFetcher,
 		stats:          stats,
+		allStats:       allStats,
 	}
 	return newRouter(a)
 }
@@ -379,6 +414,14 @@ func newRouter(a *api) http.Handler {
 		// session Authorization header or a stream token scoped "stats" for
 		// this exact slug via ?access_token=.
 		r.With(a.requireAuthStats).Get("/apps/{slug}/stats", a.handleAppStats)
+		// GET /api/v1/stats (the sparklines-on-the-apps-list milestone):
+		// one SSE connection carrying every running app's stats, gated by
+		// a stream token minted with scope "all_stats" — see
+		// requireAuthAllStats and streamScopeAllStats' doc comment for why
+		// this is a separate scope from the per-app "stats" one above,
+		// even though a session Authorization header authenticates both
+		// identically (requireAuthSSE's header path is unscoped).
+		r.With(a.requireAuthAllStats).Get("/stats", a.handleAllStats)
 
 		// The OpenAPI spec is served publicly (no auth) — it documents the
 		// route table itself, so gating it behind a login would be
