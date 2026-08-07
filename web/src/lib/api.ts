@@ -10,19 +10,88 @@
 import { useAuthStore } from '../stores/auth'
 import { router } from '../router'
 import type { AppStatus, DeploymentStatus } from '../theme'
+import type { Role } from './roles'
 
 // Exported (not just module-local) so sse.ts / LogViewer.vue can build the
 // live-stream URL from the same root rather than duplicating it.
 export const BASE_URL = '/api/v1'
 
+/** The authenticated user, as returned by GET /auth/me and POST
+ * /auth/login (openapi.yaml's User schema). `role` landed alongside the
+ * users/roles backend (feat/users-roles) — every caller that gates a
+ * control on the current user's permissions (Users.vue, Audit.vue) reads
+ * it from here, via a fresh GET /auth/me rather than trusting a
+ * possibly-stale copy in the auth store, since a role change takes
+ * effect on the target's *next* request, not retroactively. */
 export interface User {
   email: string
   name: string
+  role: Role
 }
 
 export interface LoginResponse {
   token: string
   user: User
+}
+
+/** One user as listed by GET /users and returned by every user-
+ * management mutation (openapi.yaml's UserSummary schema) — a superset
+ * of User with `disabled` and `created_at`, since those only make sense
+ * describing *another* user from an admin's point of view, never "the
+ * user this request is authenticated as". */
+export interface UserSummary {
+  email: string
+  name: string
+  role: Role
+  disabled: boolean
+  created_at: string
+}
+
+/** Body for POST /users/invite (openapi.yaml's InviteUserRequest). */
+export interface InviteUserRequest {
+  email: string
+  role: Role
+}
+
+/** Response of POST /users/invite (openapi.yaml's InviteUserResponse).
+ * `token` is shown in plaintext exactly once — this response is the only
+ * place it ever appears; nothing re-fetches it later (mirrors the
+ * webhook secret's write-once treatment in GitPanel.vue). There is no
+ * endpoint to list or revoke a pending invitation — it lives until
+ * `expires_at` or until it's redeemed, whichever comes first. */
+export interface InviteUserResponse {
+  email: string
+  role: Role
+  token: string
+  expires_at: string
+}
+
+/** Body for PATCH /users/{email}/role (openapi.yaml's
+ * ChangeUserRoleRequest). */
+export interface ChangeUserRoleRequest {
+  role: Role
+}
+
+/** Body for POST /invitations/accept (openapi.yaml's
+ * AcceptInviteRequest). */
+export interface AcceptInviteRequest {
+  token: string
+  name: string
+  password: string
+}
+
+/** One audit log entry, newest first from GET /audit (openapi.yaml's
+ * AuditEntry schema). `actor_email` is "" for an unauthenticated actor —
+ * there is none in this API today, per the schema's own doc comment, but
+ * AuditPanel/Audit.vue still renders that case rather than assuming it
+ * can't happen. */
+export interface AuditEntry {
+  id: number
+  actor_email: string
+  action: string
+  target: string
+  detail: string
+  created_at: string
 }
 
 /** deploy_strategy values (v0.5 Task 6) — see store.App.DeployStrategy's
@@ -819,4 +888,65 @@ export const api = {
   deployGit: (slug: string) => request<Deployment>(`/apps/${slug}/deploy/git`, { method: 'POST' }),
 
   uploadCompose,
+
+  // --- Users & roles (feat/users-ui) --------------------------------------
+  // Backed by internal/api's users/invitations handlers — see
+  // api/openapi.yaml's `users`/`audit` tags for the full capability-floor
+  // breakdown each of these requires (mirrored client-side by
+  // lib/roles.ts's predicates, purely so Users.vue/Audit.vue can render
+  // the right controls without a doomed round trip; the server is what
+  // actually enforces every one of these with 403 `forbidden` or 409
+  // `last_owner`).
+
+  /** Requires `users:read` (admin+). */
+  listUsers: () => request<UserSummary[]>('/users'),
+
+  /** Requires `users:invite` (admin+); the target role must be at or
+   * below the caller's own rank (see lib/roles.ts's assignableRoles).
+   * Throws ApiError code "user_exists" (409) if the email already
+   * belongs to a user. */
+  inviteUser: (payload: InviteUserRequest) =>
+    request<InviteUserResponse>('/users/invite', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /** Requires `users:role_change` (owner floor). Throws ApiError code
+   * "last_owner" (409) if `email` is the last remaining active owner. */
+  changeUserRole: (email: string, role: Role) =>
+    request<UserSummary>(`/users/${encodeURIComponent(email)}/role`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role } satisfies ChangeUserRoleRequest),
+    }),
+
+  /** Requires `users:disable` (admin+). Revokes every one of the
+   * target's live sessions as part of this same call. Throws ApiError
+   * code "last_owner" (409) if `email` is the last remaining active
+   * owner. */
+  disableUser: (email: string) => request<UserSummary>(`/users/${encodeURIComponent(email)}/disable`, { method: 'POST' }),
+
+  /** Requires `users:disable` (admin+). Does not restore any session
+   * revoked at disable time. */
+  enableUser: (email: string) => request<UserSummary>(`/users/${encodeURIComponent(email)}/enable`, { method: 'POST' }),
+
+  /** Requires `users:remove` (owner floor). Throws ApiError code
+   * "last_owner" (409) if `email` is the last remaining active owner. */
+  deleteUser: (email: string) => request<void>(`/users/${encodeURIComponent(email)}`, { method: 'DELETE' }),
+
+  /** Deliberately unauthenticated (security model is the single-use
+   * token itself, like the git webhook receiver) — redeems an invite,
+   * creating the user and logging them in immediately with the same
+   * response shape as POST /auth/login. Throws ApiError code
+   * "invite_not_found" (404), or "invite_already_used" /
+   * "invite_expired" / "user_exists" (409) — AcceptInvite.vue shows a
+   * distinct message for each rather than one generic failure. */
+  acceptInvite: (payload: AcceptInviteRequest) =>
+    request<LoginResponse>('/invitations/accept', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /** Requires `audit:read` (admin+). Newest first; capped at 1000
+   * server-side regardless of `limit`. */
+  listAudit: (limit = 100) => request<AuditEntry[]>(`/audit?limit=${limit}`),
 }

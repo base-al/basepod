@@ -36,6 +36,17 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  /** Adopts an already-minted session without calling POST /auth/login —
+   * used by AcceptInvite.vue, whose own POST /invitations/accept returns
+   * the exact same {token, user} shape a login would (openapi.yaml's
+   * LoginResponse), since redeeming an invite logs the new user in
+   * immediately rather than requiring a separate sign-in step right
+   * after. */
+  function setSession(res: { token: string; user: User }) {
+    setToken(res.token)
+    user.value = res.user
+  }
+
   /** Revokes the session server-side (best-effort — a failed/expired call
    * is ignored, since the local session is cleared either way) before
    * clearing local state. */
@@ -63,5 +74,5 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  return { token, user, pending, login, logout, me, clearSession }
+  return { token, user, pending, login, logout, me, clearSession, setSession }
 })

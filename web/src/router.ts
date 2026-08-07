@@ -17,6 +17,18 @@ export const router = createRouter({
       component: () => import('./pages/Login.vue'),
       meta: { public: true },
     },
+    // Public — an invited user has no session yet (they may never have
+    // seen BasePod before). Security model is the single-use token in
+    // the `?token=` query param, not auth, exactly like POST
+    // /invitations/accept itself (see lib/api.ts's acceptInvite). The
+    // token is built into this path by lib/inviteUrl.ts's
+    // buildInviteAcceptUrl, which Users.vue's invite flow shows once.
+    {
+      path: '/accept-invite',
+      name: 'accept-invite',
+      component: () => import('./pages/AcceptInvite.vue'),
+      meta: { public: true },
+    },
     {
       path: '/',
       name: 'apps',
@@ -58,6 +70,17 @@ export const router = createRouter({
       path: '/settings/users',
       name: 'settings-users',
       component: () => import('./pages/settings/Users.vue'),
+    },
+    // Audit log (admin+, same floor as Users — api/openapi.yaml's
+    // `audit:read` capability). A fourth settings sub-page rather than a
+    // tab inside Users.vue: it's a different question ("what happened")
+    // from "who has access", and giving it its own linkable URL matches
+    // every other settings sub-page's own reasoning (SettingsShell.vue's
+    // doc comment).
+    {
+      path: '/settings/audit',
+      name: 'settings-audit',
+      component: () => import('./pages/settings/Audit.vue'),
     },
   ],
 })
