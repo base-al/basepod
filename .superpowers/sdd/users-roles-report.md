@@ -134,13 +134,14 @@ pre-existing `web/` files, which I did not touch).
 
 ## CI conclusion
 
-Pushed to `origin/feat/users-roles`; CI run
-`https://github.com/base-al/basepod/actions/runs/31177555682` launched
-immediately after push and was still running as this report was
-written (watched via `gh run watch` in the background — local
-verification above already covers everything CI runs). Check
-`gh run list --branch feat/users-roles` for the final conclusion before
-merging if it isn't visible yet.
+**Green.** Two runs on `origin/feat/users-roles`, both `success`:
+- `31177555682` (commit `e45e287`, the implementation) — `test` and
+  `e2e` jobs both passed.
+- `31177790043` (commit `128a7d1`, this report) — `test` (including
+  `govulncheck`) and `e2e` jobs both passed.
+
+`gh run view 31177790043 --json status,conclusion` →
+`{"conclusion":"success","status":"completed"}`.
 
 ## What the web agent needs (exact endpoint shapes)
 
