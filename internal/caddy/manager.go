@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/base-al/basepod/internal/podman"
@@ -146,6 +147,27 @@ type Manager struct {
 	// value to compare a container image's architecture against on both
 	// bare Linux and macOS/Apple-Silicon.
 	expectedArch string
+
+	// healthMu guards healthCachedAt/healthCachedErr below, and — since
+	// Health holds it across the ENTIRE check, not just the map/field
+	// writes — also single-flights concurrent Health callers into one
+	// probe: see Health's doc comment for why (measured production cost:
+	// ~200-250ms of podman-exec per call, times every open dashboard
+	// tab's 5s poll of GET /system, was ~4.4% of a core sustained —
+	// issue #16 review feedback).
+	healthMu sync.Mutex
+	// healthCachedAt is the wall-clock time (per now, below) of the last
+	// completed probe; the zero Time means "never probed yet" (always
+	// stale). healthCachedErr is that probe's result, reported verbatim
+	// by every Health call that lands within caddyHealthCacheTTL of it.
+	healthCachedAt  time.Time
+	healthCachedErr error
+
+	// now is Health's clock — a field (not a bare time.Now() call) so
+	// TestManagerHealthCaching can advance time deterministically past
+	// caddyHealthCacheTTL without a real sleep. Defaults to time.Now in
+	// NewManager; only ever overridden by tests.
+	now func() time.Time
 }
 
 // NewManager builds a Manager. configDir is the host directory bind-mounted
@@ -163,6 +185,7 @@ func NewManager(rt Runtime, exec Execer, configDir string, httpPort, httpsPort i
 		httpsPort:    httpsPort,
 		instanceID:   instanceID,
 		expectedArch: runtime.GOARCH,
+		now:          time.Now,
 	}
 }
 
@@ -635,6 +658,17 @@ var (
 // Health could otherwise hand its own context deadline to directly.
 const caddyHealthTimeoutSeconds = "3"
 
+// caddyHealthCacheTTL bounds how long Health serves a cached result
+// before re-probing — see Health's doc comment for the production
+// measurement this exists to fix (issue #16 review feedback). A
+// stale-by-up-to-this-long health chip is an acceptable tradeoff: the
+// failure it reports isn't a fast-moving signal (an operator isn't
+// racing to notice Caddy going down within single-digit seconds), and
+// it's well inside AppShell/Instance.vue's own 5s poll interval — a
+// caller polling every 5s still gets a real (if not brand-new) answer
+// every single call, just not a freshly-probed one every time.
+const caddyHealthCacheTTL = 12 * time.Second
+
 // Health reports whether Caddy is actually up, by asking it — replacing
 // the previous, circular signal ("the dashboard loaded at all", which
 // proves nothing if the dashboard route itself is disabled or unbound;
@@ -643,17 +677,34 @@ const caddyHealthTimeoutSeconds = "3"
 // ErrCaddyAdminUnreachable — see their doc comments for what each means
 // and why an operator needs them told apart (issue #16).
 //
-// Checked in two steps: first, whether the bp-caddy container itself is
-// running at all (m.rt.InspectContainer, the same check Ensure already
-// makes); only if so, whether its admin API answers over its own unix
-// socket (AdminSocketPath) — reusing exactly the path Apply already uses
-// for reload (m.exec, a podman-exec call into the running container) but
-// running `curl --unix-socket <AdminSocketPath> http://localhost/config/`
-// instead of `caddy reload`. GET /config/ (https://caddyserver.com/docs/api)
-// is a plain read that reports Caddy's live config without mutating
-// anything, unlike reload — appropriate for a check that's expected to
-// run on every /system request rather than only when routes actually
-// change.
+// Cached for caddyHealthCacheTTL: GET /system (this method's only
+// caller) is polled every 5s by every open dashboard tab
+// (AppShell.vue/Instance.vue), and the underlying probe — a podman-exec
+// call, checked below — measured ~200-250ms and ~4.4% of a CPU core
+// sustained per continuously-open tab on a real production box if run on
+// every poll uncached. Health holds healthMu across the ENTIRE check
+// (not just the cache read/write), which — beyond guarding the cache
+// fields — also single-flights concurrent callers that land during a
+// stale window into one real probe: the second and later callers simply
+// block on the same mutex until the first's result is cached, rather
+// than each firing their own podman-exec (see
+// TestManagerHealthConcurrentRequestsShareOneProbe). Acceptable because
+// a health probe isn't latency-sensitive the way, say, a deploy is: a
+// caller blocking for up to one probe's duration (bounded by
+// caddyHealthTimeoutSeconds) behind another in-flight one is a fine
+// tradeoff for guaranteeing at most one probe in flight at a time.
+//
+// The check itself, once the cache is stale, is two steps: first,
+// whether the bp-caddy container itself is running at all
+// (m.rt.InspectContainer, the same check Ensure already makes — cheap,
+// a single podman API call, not re-measured but not the cost this cache
+// exists to amortize); only if so, whether its admin API answers over
+// its own unix socket (AdminSocketPath) — reusing exactly the path
+// Apply already uses for reload (m.exec, a podman-exec call into the
+// running container) but running `curl --unix-socket <AdminSocketPath>
+// http://localhost/config/` instead of `caddy reload`. GET /config/
+// (https://caddyserver.com/docs/api) is a plain read that reports
+// Caddy's live config without mutating anything, unlike reload.
 //
 // curl, not wget (unlike CaddyProber in internal/deploy, which probes an
 // app's plain TCP upstream with wget --spider): only curl, of the two,
@@ -666,6 +717,25 @@ const caddyHealthTimeoutSeconds = "3"
 // 400 as failure (nonzero exit); --max-time bounds how long a wedged
 // Caddy process can block this call.
 func (m *Manager) Health(ctx context.Context) error {
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
+
+	now := m.now()
+	if !m.healthCachedAt.IsZero() && now.Sub(m.healthCachedAt) < caddyHealthCacheTTL {
+		return m.healthCachedErr
+	}
+
+	err := m.probeHealth(ctx)
+	m.healthCachedAt = now
+	m.healthCachedErr = err
+	return err
+}
+
+// probeHealth is Health's uncached body — the actual container-state
+// check plus admin-API exec probe, split out so Health itself only
+// carries the cache/single-flight bookkeeping (see Health's doc
+// comment). Always called with healthMu already held.
+func (m *Manager) probeHealth(ctx context.Context) error {
 	info, err := m.rt.InspectContainer(ctx, ContainerName)
 	if err != nil {
 		if errors.Is(err, podman.ErrNotFound) {

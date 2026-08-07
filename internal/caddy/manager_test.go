@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -922,5 +924,105 @@ func TestManagerHealth(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestManagerHealthCaching proves Health's caching (issue #16 review
+// feedback: an uncached podman-exec probe on every GET /system poll
+// measured ~200-250ms and ~4.4% of a CPU core sustained per open
+// dashboard tab in production): a call within caddyHealthCacheTTL of the
+// last probe returns the cached result without re-probing; a call after
+// the TTL has elapsed re-probes. Drives Health's clock via mgr.now
+// (overridden here) rather than a real sleep, so this test doesn't
+// itself take caddyHealthCacheTTL to run.
+func TestManagerHealthCaching(t *testing.T) {
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{State: "running"}}
+	fe := &fakeExecer{}
+	mgr := NewManager(fr, fe.Exec, t.TempDir(), 8080, 8443, testInstanceID)
+
+	now := time.Now()
+	mgr.now = func() time.Time { return now }
+
+	if err := mgr.Health(context.Background()); err != nil {
+		t.Fatalf("Health (first call): %v", err)
+	}
+	if len(fe.calls) != 1 {
+		t.Fatalf("exec called %d time(s) after first Health call, want 1", len(fe.calls))
+	}
+
+	// Still within the TTL (clock hasn't moved): must be a cache hit, not
+	// a second probe.
+	if err := mgr.Health(context.Background()); err != nil {
+		t.Fatalf("Health (cached call): %v", err)
+	}
+	if len(fe.calls) != 1 {
+		t.Fatalf("exec called %d time(s) after a cached Health call, want still 1 (cache hit, no re-probe)", len(fe.calls))
+	}
+	if len(fr.calls) != 1 {
+		t.Fatalf("InspectContainer called %d time(s) after a cached Health call, want still 1 (cache hit skips the whole probe)", len(fr.calls))
+	}
+
+	// Advance past the TTL: the next call must re-probe.
+	now = now.Add(caddyHealthCacheTTL + time.Second)
+	if err := mgr.Health(context.Background()); err != nil {
+		t.Fatalf("Health (after TTL expiry): %v", err)
+	}
+	if len(fe.calls) != 2 {
+		t.Fatalf("exec called %d time(s) after TTL expiry, want 2 (re-probed)", len(fe.calls))
+	}
+}
+
+// TestManagerHealthConcurrentRequestsShareOneProbe proves Health
+// single-flights concurrent callers landing during a cache-miss window
+// into exactly one real probe (issue #16 review feedback's "make sure
+// concurrent /system requests don't each fire their own probe"), rather
+// than each firing its own podman-exec. Deterministic, no sleep-based
+// race: the fake exec signals (via closing `entered`) the instant it's
+// actually running, so the second Health call is only started once the
+// first is confirmed to be inside the probe — meaning the second call is
+// guaranteed to block on Health's mutex, not race to also start probing.
+func TestManagerHealthConcurrentRequestsShareOneProbe(t *testing.T) {
+	fr := &fakeRuntime{inspectInfo: &podman.ContainerInfo{State: "running"}}
+
+	var execCalls int32
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
+	release := make(chan struct{})
+	exec := func(ctx context.Context, container string, cmd ...string) error {
+		atomic.AddInt32(&execCalls, 1)
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return nil
+	}
+	mgr := NewManager(fr, exec, t.TempDir(), 8080, 8443, testInstanceID)
+
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results <- mgr.Health(context.Background())
+	}()
+
+	<-entered // the first call is now inside the (locked) probe, blocked on release
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results <- mgr.Health(context.Background())
+	}()
+
+	close(release) // let both proceed: the second only ever gets past the mutex after the first finishes and caches
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			t.Errorf("Health() = %v, want nil", err)
+		}
+	}
+	if got := atomic.LoadInt32(&execCalls); got != 1 {
+		t.Fatalf("exec called %d time(s) for 2 concurrent Health calls, want 1 (single-flighted)", got)
 	}
 }
