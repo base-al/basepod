@@ -23,14 +23,58 @@ var ErrNotFound = errors.New("not found")
 // timeFormat is the RFC3339 layout used to store timestamps (UTC).
 const timeFormat = time.RFC3339
 
-// User is a BasePod account.
+// User is a BasePod account. Role is one of RoleViewer/RoleMember/
+// RoleAdmin/RoleOwner (see those constants and migration
+// 00010_user_roles.sql) — the single axis internal/authz's capability
+// table authorizes against; IsSuperadmin predates roles (v0.1) and is no
+// longer read by any authorization decision, kept only so the column
+// isn't silently orphaned. DisabledAt is "" for an active user, or the
+// RFC3339 UTC timestamp a disable took effect (see DisableUser) — a
+// disabled user's sessions are revoked immediately and
+// UserBySessionTokenHash excludes them as defense in depth, so a
+// disabled user can never authenticate regardless of role. CreatedAt is
+// RFC3339 UTC, set at insert time.
 type User struct {
 	ID           int64
 	Email        string
 	Name         string
 	PasswordHash string
 	IsSuperadmin bool
+	Role         string
+	DisabledAt   string
+	CreatedAt    string
 }
+
+// RoleViewer, RoleMember, RoleAdmin, and RoleOwner are the four values
+// User.Role (and the users.role column) can hold, in ascending order of
+// privilege — see internal/authz's capability table for what each may
+// do. RoleOwner is the schema default (see migration
+// 00010_user_roles.sql) so an existing pre-roles database's one admin
+// account comes out of that migration able to administer the instance,
+// not locked out of it.
+const (
+	RoleViewer = "viewer"
+	RoleMember = "member"
+	RoleAdmin  = "admin"
+	RoleOwner  = "owner"
+)
+
+// ValidRole reports whether s is one of the four recognized User.Role
+// values.
+func ValidRole(s string) bool {
+	switch s {
+	case RoleViewer, RoleMember, RoleAdmin, RoleOwner:
+		return true
+	}
+	return false
+}
+
+// ErrLastOwner is returned by SetUserRole, DisableUser, and DeleteUser
+// when the target user is the last remaining active (non-disabled) owner
+// — demoting, disabling, or deleting them would leave the instance with
+// no owner able to administer it (change roles, remove users) ever
+// again. See countActiveOwners.
+var ErrLastOwner = errors.New("cannot modify the last remaining owner")
 
 // App is a deployed application. MemoryLimitMB, CPULimit (in cores, e.g.
 // 1.5), and PidsLimit are the container resource limits applied to every
@@ -254,10 +298,37 @@ func (s *Store) Setting(key string) (string, error) {
 	return value, nil
 }
 
-// CreateUser inserts a new user and returns its ID.
+// userColumns is the column list (in scan order) shared by every user
+// SELECT — see scanUser. userColumnsPrefixed is the same list qualified
+// with the "u." alias, for the one query (UserBySessionTokenHash) that
+// joins users against another table also carrying an "id" column, where
+// an unqualified "id" would be ambiguous.
+const userColumns = `id, email, name, password_hash, is_superadmin, role, disabled_at, created_at`
+const userColumnsPrefixed = `u.id, u.email, u.name, u.password_hash, u.is_superadmin, u.role, u.disabled_at, u.created_at`
+
+// CreateUser inserts a new user with role RoleOwner if super, else
+// RoleMember, and returns its ID. Kept for the pre-roles call sites
+// (internal/server/setup.go's initial admin, and every test that only
+// needs "a superadmin" or "some other user" without caring about the
+// exact role) — see CreateUserWithRole for a caller that needs to pick
+// the role explicitly (e.g. the accept-invite handler, which must honor
+// whatever role the inviting admin chose).
 func (s *Store) CreateUser(email, name, hash string, super bool) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO users(email, name, password_hash, is_superadmin) VALUES(?, ?, ?, ?)`,
-		email, name, hash, super)
+	role := RoleMember
+	if super {
+		role = RoleOwner
+	}
+	return s.CreateUserWithRole(email, name, hash, role)
+}
+
+// CreateUserWithRole inserts a new user with an explicit role (must be one
+// of the ValidRole values — the caller owns validating that before calling
+// this) and returns its ID. is_superadmin is derived as role == RoleOwner
+// purely to keep that legacy column populated consistently; nothing reads
+// it for an authorization decision anymore (see User's doc comment).
+func (s *Store) CreateUserWithRole(email, name, hash, role string) (int64, error) {
+	res, err := s.db.Exec(`INSERT INTO users(email, name, password_hash, is_superadmin, role) VALUES(?, ?, ?, ?, ?)`,
+		email, name, hash, role == RoleOwner, role)
 	if err != nil {
 		return 0, err
 	}
@@ -267,7 +338,8 @@ func (s *Store) CreateUser(email, name, hash string, super bool) (int64, error) 
 func scanUser(row *sql.Row) (*User, error) {
 	var u User
 	var isSuper int
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.PasswordHash, &isSuper)
+	var disabledAt sql.NullString
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.PasswordHash, &isSuper, &u.Role, &disabledAt, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -275,12 +347,14 @@ func scanUser(row *sql.Row) (*User, error) {
 		return nil, err
 	}
 	u.IsSuperadmin = isSuper != 0
+	u.DisabledAt = disabledAt.String
 	return &u, nil
 }
 
-// UserByEmail looks up a user by email. Returns ErrNotFound if none exists.
+// UserByEmail looks up a user by email (case-sensitive exact match, like
+// login's own lookup). Returns ErrNotFound if none exists.
 func (s *Store) UserByEmail(email string) (*User, error) {
-	row := s.db.QueryRow(`SELECT id, email, name, password_hash, is_superadmin FROM users WHERE email = ?`, email)
+	row := s.db.QueryRow(`SELECT `+userColumns+` FROM users WHERE email = ?`, email)
 	return scanUser(row)
 }
 
@@ -290,7 +364,7 @@ func (s *Store) UserByEmail(email string) (*User, error) {
 // the way UserBySessionTokenHash resolves a session's in one query — a
 // stream token row only carries user_id, not the joined user columns.
 func (s *Store) UserByID(id int64) (*User, error) {
-	row := s.db.QueryRow(`SELECT id, email, name, password_hash, is_superadmin FROM users WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT `+userColumns+` FROM users WHERE id = ?`, id)
 	return scanUser(row)
 }
 
@@ -299,6 +373,127 @@ func (s *Store) CountUsers() (int, error) {
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count)
 	return count, err
+}
+
+// ListUsers returns every user, ordered by ID.
+func (s *Store) ListUsers() ([]User, error) {
+	rows, err := s.db.Query(`SELECT ` + userColumns + ` FROM users ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var u User
+		var isSuper int
+		var disabledAt sql.NullString
+		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.PasswordHash, &isSuper, &u.Role, &disabledAt, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		u.IsSuperadmin = isSuper != 0
+		u.DisabledAt = disabledAt.String
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
+// countActiveOwners returns how many users currently hold RoleOwner and
+// are not disabled — the "at least one must always remain" invariant
+// SetUserRole/DisableUser/DeleteUser enforce. Single-writer discipline
+// (Store.db.SetMaxOpenConns(1) — see Open) makes the count-then-write
+// each of those methods does effectively atomic: no concurrent write can
+// interleave between this count and the mutation that follows it, since
+// they share the one connection.
+func (s *Store) countActiveOwners() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = ? AND disabled_at IS NULL`, RoleOwner).Scan(&n)
+	return n, err
+}
+
+// SetUserRole changes id's role. Returns ErrLastOwner (without making any
+// change) if id is currently the last remaining active owner and role is
+// anything else — see ErrLastOwner. Returns ErrNotFound if id doesn't
+// exist.
+func (s *Store) SetUserRole(id int64, role string) error {
+	u, err := s.UserByID(id)
+	if err != nil {
+		return err
+	}
+	if u.Role == RoleOwner && role != RoleOwner {
+		n, err := s.countActiveOwners()
+		if err != nil {
+			return err
+		}
+		if n <= 1 {
+			return ErrLastOwner
+		}
+	}
+	_, err = s.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, role, id)
+	return err
+}
+
+// DisableUser marks id disabled (disabled_at = now) and immediately
+// revokes every one of its live sessions, so a token issued before the
+// disable can never authenticate another request — "a disabled user with
+// a live session is a hole". Returns ErrLastOwner (without disabling
+// anything) if id is the last remaining active owner. Returns
+// ErrNotFound if id doesn't exist.
+func (s *Store) DisableUser(id int64) error {
+	u, err := s.UserByID(id)
+	if err != nil {
+		return err
+	}
+	if u.Role == RoleOwner {
+		n, err := s.countActiveOwners()
+		if err != nil {
+			return err
+		}
+		if n <= 1 {
+			return ErrLastOwner
+		}
+	}
+	now := time.Now().UTC().Format(timeFormat)
+	if _, err := s.db.Exec(`UPDATE users SET disabled_at = ? WHERE id = ?`, now, id); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, id)
+	return err
+}
+
+// EnableUser clears id's disabled_at, restoring its ability to log in and
+// authenticate (existing sessions from before the disable were already
+// revoked by DisableUser and are not restored — the user must log in
+// again). Not an error if id was already enabled.
+func (s *Store) EnableUser(id int64) error {
+	_, err := s.db.Exec(`UPDATE users SET disabled_at = NULL WHERE id = ?`, id)
+	return err
+}
+
+// DeleteUser removes user id. Its sessions cascade-delete automatically
+// (sessions.user_id REFERENCES users(id) ON DELETE CASCADE — see
+// migration 00001_init.sql — with foreign_keys pragma ON, see Open), so
+// no separate session revocation is needed the way DisableUser requires
+// one (a DELETE doesn't leave a disabled-but-still-present row a stray
+// session could still join against). Returns ErrLastOwner (without
+// deleting anything) if id is the last remaining active owner. Returns
+// ErrNotFound if id doesn't exist.
+func (s *Store) DeleteUser(id int64) error {
+	u, err := s.UserByID(id)
+	if err != nil {
+		return err
+	}
+	if u.Role == RoleOwner {
+		n, err := s.countActiveOwners()
+		if err != nil {
+			return err
+		}
+		if n <= 1 {
+			return ErrLastOwner
+		}
+	}
+	_, err = s.db.Exec(`DELETE FROM users WHERE id = ?`, id)
+	return err
 }
 
 // CreateSession inserts a new session for userID with the given token hash
@@ -310,11 +505,17 @@ func (s *Store) CreateSession(userID int64, tokenHash string, expires time.Time)
 }
 
 // UserBySessionTokenHash looks up the user owning a non-expired session with
-// the given token hash. Returns ErrNotFound if the session is missing or expired.
+// the given token hash. Returns ErrNotFound if the session is missing or
+// expired, OR if it belongs to a disabled user — this is the primary
+// enforcement of "disabling a user must revoke their sessions
+// immediately" (DisableUser's explicit `DELETE FROM sessions` is the
+// fast path; this WHERE clause is defense in depth so the invariant
+// holds even for a session created in the same instant a disable ran, or
+// any future code path that forgets the explicit revoke).
 func (s *Store) UserBySessionTokenHash(hash string) (*User, error) {
-	row := s.db.QueryRow(`SELECT u.id, u.email, u.name, u.password_hash, u.is_superadmin
+	row := s.db.QueryRow(`SELECT `+userColumnsPrefixed+`
 		FROM sessions se JOIN users u ON u.id = se.user_id
-		WHERE se.token_hash = ? AND se.expires_at > ?`, hash, time.Now().UTC().Format(timeFormat))
+		WHERE se.token_hash = ? AND se.expires_at > ? AND u.disabled_at IS NULL`, hash, time.Now().UTC().Format(timeFormat))
 	return scanUser(row)
 }
 
@@ -1385,4 +1586,167 @@ func (s *Store) ListComposeApps() ([]App, error) {
 		apps = append(apps, a)
 	}
 	return apps, rows.Err()
+}
+
+// ---------------------------------------------------------------------
+// Users + roles milestone: invitations and the audit log (migration
+// 00010_user_roles.sql) — kept in its own block for the same reason as
+// the blocks above it.
+// ---------------------------------------------------------------------
+
+// Invitation is a single-use, expiring, tokenized invite an admin
+// creates for a new user (see internal/api's invite/accept-invite
+// handlers). TokenHash is the sha256 hex digest of the raw token — like
+// sessions.token_hash, the raw token is only ever shown once, in the
+// invite-creation response; it is never persisted. AcceptedAt is "" until
+// the invite is redeemed (see AcceptInvitation); a non-empty AcceptedAt
+// makes the invite permanently unusable even if ExpiresAt hasn't passed
+// yet — the caller (handleAcceptInvite) must check both.
+type Invitation struct {
+	ID         int64
+	TokenHash  string
+	Email      string
+	Role       string
+	CreatedBy  int64
+	CreatedAt  string
+	ExpiresAt  string
+	AcceptedAt string
+}
+
+const invitationColumns = `id, token_hash, email, role, created_by, created_at, expires_at, accepted_at`
+
+func scanInvitation(scan func(...any) error) (Invitation, error) {
+	var inv Invitation
+	var acceptedAt sql.NullString
+	err := scan(&inv.ID, &inv.TokenHash, &inv.Email, &inv.Role, &inv.CreatedBy, &inv.CreatedAt, &inv.ExpiresAt, &acceptedAt)
+	if err != nil {
+		return Invitation{}, err
+	}
+	inv.AcceptedAt = acceptedAt.String
+	return inv, nil
+}
+
+// CreateInvitation inserts a new invitation and returns it as stored.
+func (s *Store) CreateInvitation(tokenHash, email, role string, createdBy int64, expires time.Time) (*Invitation, error) {
+	now := time.Now().UTC().Format(timeFormat)
+	res, err := s.db.Exec(`INSERT INTO invitations(token_hash, email, role, created_by, created_at, expires_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		tokenHash, email, role, createdBy, now, expires.UTC().Format(timeFormat))
+	if err != nil {
+		return nil, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &Invitation{ID: id, TokenHash: tokenHash, Email: email, Role: role, CreatedBy: createdBy, CreatedAt: now, ExpiresAt: expires.UTC().Format(timeFormat)}, nil
+}
+
+// InvitationByTokenHash looks up an invitation by its token hash,
+// regardless of whether it has expired or already been accepted — the
+// caller (handleAcceptInvite) checks ExpiresAt/AcceptedAt itself so it
+// can report a specific "expired" or "already used" error rather than a
+// generic not-found. Returns ErrNotFound if no invitation has this hash
+// at all.
+func (s *Store) InvitationByTokenHash(hash string) (*Invitation, error) {
+	row := s.db.QueryRow(`SELECT `+invitationColumns+` FROM invitations WHERE token_hash = ?`, hash)
+	inv, err := scanInvitation(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &inv, nil
+}
+
+// ListInvitations returns every invitation, newest first.
+func (s *Store) ListInvitations() ([]Invitation, error) {
+	rows, err := s.db.Query(`SELECT ` + invitationColumns + ` FROM invitations ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invitations []Invitation
+	for rows.Next() {
+		inv, err := scanInvitation(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		invitations = append(invitations, inv)
+	}
+	return invitations, rows.Err()
+}
+
+// AcceptInvitation marks invitation id accepted (accepted_at = now),
+// making it permanently unusable — called by handleAcceptInvite only
+// after it has already verified the invite is neither expired nor
+// already accepted, and only in the same request that creates the
+// invited user, so a crash between "user created" and "invite marked
+// accepted" is the only way this could ever be replayed (a crash-recovery
+// gap smaller than this milestone's scope; the invite's own expiry
+// bounds how long that window can be exploited for).
+func (s *Store) AcceptInvitation(id int64) error {
+	_, err := s.db.Exec(`UPDATE invitations SET accepted_at = ? WHERE id = ?`, time.Now().UTC().Format(timeFormat), id)
+	return err
+}
+
+// AuditEntry is one append-only row recording a mutating operation:
+// actor, action, target, and timestamp (see migration
+// 00010_user_roles.sql's doc comment for why ActorID may go NULL —
+// scanned into 0 here — while ActorEmail stays populated regardless).
+// Detail is a short human-readable string only — NEVER a secret value
+// (env var values, passwords, tokens) — mirroring GitDelivery.Detail's
+// same rule.
+type AuditEntry struct {
+	ID         int64
+	ActorID    int64
+	ActorEmail string
+	Action     string
+	Target     string
+	Detail     string
+	CreatedAt  string
+}
+
+// InsertAuditLog records one audit entry. actorID may be 0 for an
+// unauthenticated actor (there is none yet in this API — every mutating
+// route requires a session — but the column allows it for a future one,
+// e.g. the webhook receiver).
+func (s *Store) InsertAuditLog(actorID int64, actorEmail, action, target, detail string) error {
+	_, err := s.db.Exec(`INSERT INTO audit_log(actor_id, actor_email, action, target, detail, created_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		nullableActorID(actorID), actorEmail, action, target, detail, time.Now().UTC().Format(timeFormat))
+	return err
+}
+
+// nullableActorID converts a 0 actor id into SQL NULL (matching
+// audit_log.actor_id's nullability — see AuditEntry's doc comment),
+// otherwise the id itself.
+func nullableActorID(id int64) any {
+	if id == 0 {
+		return nil
+	}
+	return id
+}
+
+// ListAuditLog returns the limit most recent audit entries, newest
+// first.
+func (s *Store) ListAuditLog(limit int) ([]AuditEntry, error) {
+	rows, err := s.db.Query(`SELECT id, actor_id, actor_email, action, target, detail, created_at
+		FROM audit_log ORDER BY created_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		var actorID sql.NullInt64
+		if err := rows.Scan(&e.ID, &actorID, &e.ActorEmail, &e.Action, &e.Target, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.ActorID = actorID.Int64
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
 }

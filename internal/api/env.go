@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/base-al/basepod/internal/store"
 )
@@ -196,6 +197,18 @@ func (a *api) handlePutEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	changed := !envSetsEqual(before, after)
+	if changed {
+		// Keys only — NEVER values, secret or not (see store.AuditEntry's
+		// doc comment and audit's own). req (not `out`/`after`) is the
+		// right source for this: it's the caller's own requested key set,
+		// with no decryption or masking round-trip needed just to log
+		// which keys changed.
+		keys := make([]string, 0, len(req))
+		for _, ev := range req {
+			keys = append(keys, ev.Key)
+		}
+		a.audit(r, "env.update", app.Slug, "keys="+strings.Join(keys, ","))
+	}
 	w.Header().Set(redeployRequiredHeader, strconv.FormatBool(changed))
 	writeJSON(w, http.StatusOK, out)
 }

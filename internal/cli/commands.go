@@ -45,6 +45,7 @@ func Commands() []*cobra.Command {
 		newRollbackCmd(),
 		newStatusCmd(),
 		newGitCmd(),
+		newUsersCmd(),
 	}
 }
 
@@ -1224,6 +1225,185 @@ func newGitDisconnectCmd() *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "disconnected %s\n", args[0])
+			return nil
+		},
+	}
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newUsersCmd builds `basepod users` and its subcommands: list, invite,
+// role, disable, enable, remove — CLI parity for the users + roles
+// milestone's API (internal/api/users.go). "enable" is not named in the
+// task brief's `list|invite|role|disable|remove` but is included anyway:
+// disable without a way back would leave an admin with no CLI path to
+// undo an accidental disable short of calling the API directly.
+func newUsersCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "users",
+		Short: "Manage instance users and roles",
+	}
+	cmd.AddCommand(newUsersListCmd(), newUsersInviteCmd(), newUsersRoleCmd(), newUsersDisableCmd(), newUsersEnableCmd(), newUsersRemoveCmd())
+	return cmd
+}
+
+// newUsersListCmd builds `basepod users list [--json]`.
+func newUsersListCmd() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:          "list",
+		Short:        "List every user on the instance",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			users, err := client.ListUsers(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return printJSON(cmd.OutOrStdout(), users)
+			}
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
+			fmt.Fprintln(tw, "EMAIL\tNAME\tROLE\tDISABLED\tCREATED")
+			for _, u := range users {
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\n", u.Email, u.Name, u.Role, u.Disabled, u.CreatedAt)
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "output raw JSON instead of a table")
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newUsersInviteCmd builds `basepod users invite <email> --role <role>`.
+// The minted invite token is printed once — see InviteResult's doc
+// comment — with a reminder that this is the only time it's shown; the
+// operator is responsible for delivering it (or a link embedding it) to
+// the invitee out of band.
+func newUsersInviteCmd() *cobra.Command {
+	var role string
+	cmd := &cobra.Command{
+		Use:          "invite <email>",
+		Short:        "Create a single-use, expiring invitation",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if role == "" {
+				return fmt.Errorf("--role is required (one of viewer, member, admin, owner)")
+			}
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			result, err := client.InviteUser(cmd.Context(), args[0], role)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "invited %s as %s (expires %s)\n", result.Email, result.Role, result.ExpiresAt)
+			fmt.Fprintf(out, "token (copy this now — it will not be shown again): %s\n", result.Token)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&role, "role", "", "role to invite as: viewer, member, admin, or owner")
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newUsersRoleCmd builds `basepod users role <email> <role>`.
+func newUsersRoleCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "role <email> <role>",
+		Short:        "Change a user's role",
+		Args:         cobra.ExactArgs(2),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			u, err := client.ChangeUserRole(cmd.Context(), args[0], args[1])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s is now %s\n", u.Email, u.Role)
+			return nil
+		},
+	}
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newUsersDisableCmd builds `basepod users disable <email>`.
+func newUsersDisableCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "disable <email>",
+		Short:        "Disable a user, revoking their sessions immediately",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			u, err := client.DisableUser(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "disabled %s\n", u.Email)
+			return nil
+		},
+	}
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newUsersEnableCmd builds `basepod users enable <email>` — see
+// newUsersCmd's doc comment for why this exists alongside the task
+// brief's literal `list|invite|role|disable|remove` set.
+func newUsersEnableCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "enable <email>",
+		Short:        "Re-enable a previously disabled user",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			u, err := client.EnableUser(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "enabled %s\n", u.Email)
+			return nil
+		},
+	}
+	addContextFlag(cmd)
+	return cmd
+}
+
+// newUsersRemoveCmd builds `basepod users remove <email>`.
+func newUsersRemoveCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "remove <email>",
+		Short:        "Permanently delete a user",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := resolveClient(cmd)
+			if err != nil {
+				return err
+			}
+			if err := client.RemoveUser(cmd.Context(), args[0]); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "removed %s\n", args[0])
 			return nil
 		},
 	}

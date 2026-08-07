@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/base-al/basepod/internal/auth"
+	"github.com/base-al/basepod/internal/authz"
 	"github.com/base-al/basepod/internal/store"
 )
 
@@ -224,28 +225,42 @@ func sameDeploymentNumber(a, b *int64) bool {
 // ever looks a query token up in the stream_tokens table (via
 // validateStreamToken), and a session token's hash will never appear
 // there.
-func (a *api) requireAuthSSE(streamAuth func(r *http.Request, token string) (*store.User, bool)) func(http.Handler) http.Handler {
+//
+// Once a user is resolved (by either path), it is authorized against
+// capability exactly like requireCapability does for every other route —
+// an SSE route is no less capability-gated than a normal JSON one just
+// because it also accepts a stream token; a viewer-floor capability here
+// (every SSE route's is — see router.go) means this is in practice a
+// no-op beyond "not disabled", but it keeps every capability check
+// routing through the same authz.Authorize call rather than SSE routes
+// being a scope-check-only, role-check-free exception.
+func (a *api) requireAuthSSE(capability authz.Capability, streamAuth func(r *http.Request, token string) (*store.User, bool)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var user *store.User
 			if token, ok := bearerToken(r.Header.Get("Authorization")); ok && token != "" {
-				user, ok := a.validateToken(token)
+				u, ok := a.validateToken(token)
 				if !ok {
 					writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired session")
 					return
 				}
-				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
-				return
+				user = u
+			} else {
+				token := r.URL.Query().Get("access_token")
+				if token == "" {
+					writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization")
+					return
+				}
+				u, ok := streamAuth(r, token)
+				if !ok {
+					writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
+					return
+				}
+				user = u
 			}
 
-			token := r.URL.Query().Get("access_token")
-			if token == "" {
-				writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed authorization")
-				return
-			}
-
-			user, ok := streamAuth(r, token)
-			if !ok {
-				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or expired token")
+			if err := authz.Authorize(user, capability); err != nil {
+				writeError(w, http.StatusForbidden, "forbidden", err.Error())
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
@@ -260,7 +275,7 @@ func (a *api) requireAuthSSE(streamAuth func(r *http.Request, token string) (*st
 // (see requireAuthSSE's doc comment for the header-vs-query split, and
 // handleCreateStreamToken for how that token is minted).
 func (a *api) requireAuthAppLogs(next http.Handler) http.Handler {
-	return a.requireAuthSSE(func(r *http.Request, token string) (*store.User, bool) {
+	return a.requireAuthSSE(authz.CapLogsRead, func(r *http.Request, token string) (*store.User, bool) {
 		return a.validateStreamToken(token, streamScopeAppLogs, chi.URLParam(r, "slug"), nil)
 	})(next)
 }
@@ -275,7 +290,7 @@ func (a *api) requireAuthAppLogs(next http.Handler) http.Handler {
 // since that's a request-shape problem, not an auth one, once a session
 // token is what authenticated the request.
 func (a *api) requireAuthBuildLog(next http.Handler) http.Handler {
-	return a.requireAuthSSE(func(r *http.Request, token string) (*store.User, bool) {
+	return a.requireAuthSSE(authz.CapLogsRead, func(r *http.Request, token string) (*store.User, bool) {
 		number, err := strconv.ParseInt(chi.URLParam(r, "number"), 10, 64)
 		if err != nil {
 			return nil, false
@@ -292,7 +307,7 @@ func (a *api) requireAuthBuildLog(next http.Handler) http.Handler {
 // route's stream token is its own separate credential (see
 // handleCreateStreamToken and validateStreamToken).
 func (a *api) requireAuthStats(next http.Handler) http.Handler {
-	return a.requireAuthSSE(func(r *http.Request, token string) (*store.User, bool) {
+	return a.requireAuthSSE(authz.CapStatsRead, func(r *http.Request, token string) (*store.User, bool) {
 		return a.validateStreamToken(token, streamScopeStats, chi.URLParam(r, "slug"), nil)
 	})(next)
 }
@@ -307,7 +322,7 @@ func (a *api) requireAuthStats(next http.Handler) http.Handler {
 // already compares scope/slug/deploymentNumber as a fixed triple for
 // every other SSE route.
 func (a *api) requireAuthAllStats(next http.Handler) http.Handler {
-	return a.requireAuthSSE(func(r *http.Request, token string) (*store.User, bool) {
+	return a.requireAuthSSE(authz.CapStatsRead, func(r *http.Request, token string) (*store.User, bool) {
 		return a.validateStreamToken(token, streamScopeAllStats, "", nil)
 	})(next)
 }

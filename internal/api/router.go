@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/base-al/basepod/internal/auth"
+	"github.com/base-al/basepod/internal/authz"
 	"github.com/base-al/basepod/internal/build"
 	"github.com/base-al/basepod/internal/store"
 )
@@ -339,39 +340,70 @@ func newRouter(a *api) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(bodyLimit)
 			r.Use(a.requireAuth)
+			// Self-scoped: a caller managing their own session/password/
+			// stream access. No role distinction applies — a viewer and an
+			// owner both need to be able to log out, see their own
+			// sessions, and change their own password — so these are left
+			// at requireAuth alone rather than wrapped in requireCapability
+			// (see authz.Capability's doc comment).
 			r.Get("/auth/me", a.handleMe)
 			r.Post("/auth/logout", a.handleLogout)
 			r.Get("/auth/sessions", a.handleListSessions)
 			r.Delete("/auth/sessions/{id}", a.handleDeleteSession)
 			r.Post("/auth/password", a.handleChangePassword)
 			r.Post("/stream-token", a.handleCreateStreamToken)
-			r.Get("/system", a.handleSystem)
-			r.Post("/apps", a.handleCreateApp)
-			r.Get("/apps", a.handleListApps)
-			r.Get("/apps/{slug}", a.handleGetApp)
-			r.Patch("/apps/{slug}", a.handlePatchApp)
-			r.Get("/apps/{slug}/deployments/{number}", a.handleGetDeployment)
-			r.Get("/apps/{slug}/volumes", a.handleListAppVolumes)
-			r.Post("/apps/{slug}/deploy", a.handleDeploy)
-			r.Post("/apps/{slug}/rollback", a.handleRollback)
-			r.Delete("/apps/{slug}", a.handleDeleteApp)
-			r.Get("/apps/{slug}/env", a.handleGetEnv)
-			r.Put("/apps/{slug}/env", a.handlePutEnv)
-			r.Get("/apps/{slug}/domains", a.handleListDomains)
-			r.Post("/apps/{slug}/domains", a.handleAddDomain)
-			r.Delete("/apps/{slug}/domains/{id}", a.handleDeleteDomain)
+
+			r.With(a.requireCapability(authz.CapSystemRead)).Get("/system", a.handleSystem)
+			r.With(a.requireCapability(authz.CapAppsWrite)).Post("/apps", a.handleCreateApp)
+			r.With(a.requireCapability(authz.CapAppsRead)).Get("/apps", a.handleListApps)
+			r.With(a.requireCapability(authz.CapAppsRead)).Get("/apps/{slug}", a.handleGetApp)
+			r.With(a.requireCapability(authz.CapAppsWrite)).Patch("/apps/{slug}", a.handlePatchApp)
+			r.With(a.requireCapability(authz.CapAppsRead)).Get("/apps/{slug}/deployments/{number}", a.handleGetDeployment)
+			r.With(a.requireCapability(authz.CapAppsRead)).Get("/apps/{slug}/volumes", a.handleListAppVolumes)
+			r.With(a.requireCapability(authz.CapDeploy)).Post("/apps/{slug}/deploy", a.handleDeploy)
+			r.With(a.requireCapability(authz.CapDeploy)).Post("/apps/{slug}/rollback", a.handleRollback)
+			r.With(a.requireCapability(authz.CapAppsWrite)).Delete("/apps/{slug}", a.handleDeleteApp)
+			r.With(a.requireCapability(authz.CapEnvRead)).Get("/apps/{slug}/env", a.handleGetEnv)
+			r.With(a.requireCapability(authz.CapEnvWrite)).Put("/apps/{slug}/env", a.handlePutEnv)
+			r.With(a.requireCapability(authz.CapDomainsRead)).Get("/apps/{slug}/domains", a.handleListDomains)
+			r.With(a.requireCapability(authz.CapDomainsWrite)).Post("/apps/{slug}/domains", a.handleAddDomain)
+			r.With(a.requireCapability(authz.CapDomainsWrite)).Delete("/apps/{slug}/domains/{id}", a.handleDeleteDomain)
 
 			// Git config CRUD + manual deploy-from-git (v0.5 plan Task 4) —
 			// authenticated like every other app-scoped route above; the
-			// ONLY unauthenticated route in the whole API is the webhook
-			// receiver registered below, outside this group.
-			r.Put("/apps/{slug}/git", a.handlePutGitSource)
-			r.Get("/apps/{slug}/git", a.handleGetGitSource)
-			r.Delete("/apps/{slug}/git", a.handleDeleteGitSource)
-			r.Post("/apps/{slug}/git/rotate-secret", a.handleRotateGitSecret)
-			r.Get("/apps/{slug}/git/deliveries", a.handleListGitDeliveries)
-			r.Post("/apps/{slug}/deploy/git", a.handleDeployGit)
+			// ONLY unauthenticated routes in the whole API are the webhook
+			// receiver and the invite-accept route, registered below,
+			// outside this group.
+			r.With(a.requireCapability(authz.CapGitWrite)).Put("/apps/{slug}/git", a.handlePutGitSource)
+			r.With(a.requireCapability(authz.CapGitRead)).Get("/apps/{slug}/git", a.handleGetGitSource)
+			r.With(a.requireCapability(authz.CapGitWrite)).Delete("/apps/{slug}/git", a.handleDeleteGitSource)
+			r.With(a.requireCapability(authz.CapGitWrite)).Post("/apps/{slug}/git/rotate-secret", a.handleRotateGitSecret)
+			r.With(a.requireCapability(authz.CapGitRead)).Get("/apps/{slug}/git/deliveries", a.handleListGitDeliveries)
+			r.With(a.requireCapability(authz.CapDeploy)).Post("/apps/{slug}/deploy/git", a.handleDeployGit)
+
+			// User management + audit log (users + roles milestone). See
+			// internal/authz's Capability doc comment for exactly which
+			// role floor each of these requires; PATCH .../role and DELETE
+			// are deliberately owner-only (CapUsersRoleChange/
+			// CapUsersRemove) — see the owner-protection enforcement in
+			// internal/store's SetUserRole/DisableUser/DeleteUser.
+			r.With(a.requireCapability(authz.CapUsersRead)).Get("/users", a.handleListUsers)
+			r.With(a.requireCapability(authz.CapUsersInvite)).Post("/users/invite", a.handleInviteUser)
+			r.With(a.requireCapability(authz.CapUsersRoleChange)).Patch("/users/{email}/role", a.handleChangeUserRole)
+			r.With(a.requireCapability(authz.CapUsersDisable)).Post("/users/{email}/disable", a.handleDisableUser)
+			r.With(a.requireCapability(authz.CapUsersDisable)).Post("/users/{email}/enable", a.handleEnableUser)
+			r.With(a.requireCapability(authz.CapUsersRemove)).Delete("/users/{email}", a.handleDeleteUser)
+			r.With(a.requireCapability(authz.CapAuditRead)).Get("/audit", a.handleListAudit)
 		})
+
+		// POST /invitations/accept is deliberately unauthenticated (like
+		// the git webhook receiver below): the whole point of an
+		// invitation is that its recipient doesn't have a session yet. Its
+		// own security model is the invite token itself (see
+		// handleAcceptInvite) — single-use, expiring, delivered
+		// out-of-band by whoever ran the invite command — not a session or
+		// capability check.
+		r.With(bodyLimit).Post("/invitations/accept", a.handleAcceptInvite)
 
 		// The git webhook receiver (v0.5 plan Task 5) is deliberately the
 		// only unauthenticated route in this API: a forge (GitHub/GitLab/
@@ -390,13 +422,13 @@ func newRouter(a *api) http.Handler {
 		// in its own group with only requireAuth, not bodyLimit.
 		r.Group(func(r chi.Router) {
 			r.Use(a.requireAuth)
-			r.Post("/apps/{slug}/deploy/tarball", a.handleDeployTarball)
+			r.With(a.requireCapability(authz.CapDeploy)).Post("/apps/{slug}/deploy/tarball", a.handleDeployTarball)
 			// Compose apply (v0.5 Task 8) needs the same large, non-JSON
 			// body cap as the tarball upload above — the request body is
 			// a gzipped tar carrying compose.yaml plus any per-service
 			// build contexts — so it's registered in this same
 			// requireAuth-only group rather than bodyLimit's 1 MiB one.
-			r.Post("/compose/up", a.handleComposeUp)
+			r.With(a.requireCapability(authz.CapDeploy)).Post("/compose/up", a.handleComposeUp)
 		})
 
 		// The two SSE routes get their own, route-specific auth
@@ -422,6 +454,9 @@ func newRouter(a *api) http.Handler {
 		// even though a session Authorization header authenticates both
 		// identically (requireAuthSSE's header path is unscoped).
 		r.With(a.requireAuthAllStats).Get("/stats", a.handleAllStats)
+		// Every SSE route above requires at least authz.CapLogsRead/
+		// CapStatsRead (the viewer floor) — see requireAuthSSE, which both
+		// the header-token and stream-token paths run through.
 
 		// The OpenAPI spec is served publicly (no auth) — it documents the
 		// route table itself, so gating it behind a login would be
@@ -500,6 +535,29 @@ func (a *api) requireAuth(next http.Handler) http.Handler {
 func userFromContext(ctx context.Context) *store.User {
 	u, _ := ctx.Value(userContextKey{}).(*store.User)
 	return u
+}
+
+// requireCapability builds middleware that authorizes the already-
+// authenticated caller (attached to the request context by requireAuth or
+// requireAuthSSE, which must run first — see router.go's route table)
+// against capability via authz.Authorize, failing the request with 403
+// "forbidden" if it's denied. This is the ONLY place any handler's role
+// check happens: every capability-gated route in router.go's table is
+// wrapped in this rather than a handler comparing user.Role itself, so
+// the capability→role mapping stays centralized in internal/authz's
+// table (see that package's doc comment) instead of scattering role
+// comparisons across handlers.
+func (a *api) requireCapability(capability authz.Capability) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user := userFromContext(r.Context())
+			if err := authz.Authorize(user, capability); err != nil {
+				writeError(w, http.StatusForbidden, "forbidden", err.Error())
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // errorResponse is the wire shape of every error BasePod's API returns:
