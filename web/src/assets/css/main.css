@@ -281,6 +281,34 @@
   --ui-warning: var(--bp-status-deploying);
   --ui-error: var(--bp-status-error);
   --ui-info: var(--bp-accent);
+
+  /* Nuxt UI picks its border and text colors by position on the neutral
+     ramp (border = neutral-800 in dark, neutral-200 in light, and so on).
+     Our ink ramp isn't a plain lightness ladder — its stops are assigned
+     by role (ink-700 is "line", ink-800 is "raised", ink-900 is
+     "ground") — so those positional picks land on the wrong role and
+     miss the contrast targets the palette was built around:
+
+       --ui-border      dark  ink-800  1.07:1  (invisible; "line" is 1.34:1)
+       --ui-text-dimmed dark  ink-500  3.78:1  (below AA)
+       --ui-text-dimmed light ink-400  3.41:1  (below AA)
+       --ui-text-muted  light ink-500  4.40:1  (below AA)
+
+     Binding them to the --bp-* roles instead gets the calibrated value in
+     both themes from one declaration, since --bp-* is what the theme
+     switch redefines. --ui-border-accented gets --bp-line-strong because
+     Nuxt UI uses it for interactive edges (inputs, buttons), which owe
+     WCAG 1.4.11's 3:1 for non-text UI, not the decorative 1.34:1.
+
+     These must stay unlayered: Nuxt UI declares its own values inside
+     @layer theme, and unlayered declarations outrank any layer. */
+  --ui-border: var(--bp-line);
+  --ui-border-muted: var(--bp-line);
+  --ui-border-accented: var(--bp-line-strong);
+  --ui-text: var(--bp-content-primary);
+  --ui-text-toned: var(--bp-content-secondary);
+  --ui-text-muted: var(--bp-content-muted);
+  --ui-text-dimmed: var(--bp-content-muted);
 }
 
 /* --- Semantic tokens: light ------------------------------------------ */
