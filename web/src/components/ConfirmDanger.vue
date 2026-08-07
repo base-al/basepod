@@ -47,9 +47,9 @@ function onConfirm() {
   <UModal :open="open" :title="title" :dismissible="!loading" @update:open="(value: boolean) => emit('update:open', value)">
     <template #body>
       <div class="flex flex-col gap-4">
-        <p v-if="description" class="text-sm text-slate-400">{{ description }}</p>
-        <p class="text-sm text-slate-400">
-          Type <span class="font-mono text-slate-200">{{ confirmText }}</span> to confirm.
+        <p v-if="description" class="text-sm text-content-secondary">{{ description }}</p>
+        <p class="text-sm text-content-secondary">
+          Type <span class="font-mono text-content-primary">{{ confirmText }}</span> to confirm.
         </p>
         <UInput
           v-model="typed"

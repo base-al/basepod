@@ -1,18 +1,250 @@
 @import "tailwindcss";
 @import "@nuxt/ui";
 
-/* BasePod visual system — dense-but-calm ops dashboard, dark by default. */
+/* Self-hosted type: JetBrains Mono only. The approved identity concept
+ * (docs/design/identity-concept.html) is mono-led — headings, labels,
+ * slugs, image refs, hostnames, and all numeric data render in mono
+ * (with tabular figures so columns line up); running prose stays in
+ * the platform's own system-sans stack, which needs no webfont at all.
+ * That means there's exactly one face to self-host, not two. It's
+ * OFL-1.1 licensed and bundled from node_modules by Vite, so it's
+ * served same-origin: this dashboard runs under a strict
+ * `default-src 'self'` CSP, and a CDN font would silently 404 under
+ * that policy. Only the Latin subset of each weight ships — the
+ * product has no i18n today.
+ */
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-500.css";
+@import "@fontsource/jetbrains-mono/latin-600.css";
+
+/**
+ * BasePod visual system — see theme.ts for the full rationale behind
+ * every scale and token below; this file is where they become CSS.
+ * Tokens follow the user-approved identity concept
+ * (docs/design/identity-concept.html, commit 505c382): copper on warm
+ * graphite, deliberately not another neon-green-on-black self-hosting
+ * tool. Every value below was independently measured against the WCAG
+ * relative-luminance formula (not eyeballed) and several were nudged
+ * from the concept's exact hex to clear 4.5:1 for their actual use as
+ * text — see the inline ratios and design-identity-report.md for the
+ * full before/after table.
+ *
+ * Structure:
+ *   1. Type — self-hosted mono stack; sans is system-only.
+ *   2. Numeric color ramps (ink/copper/moss/ember/crimson) — the
+ *      deliberate palette, theme-invariant.
+ *   3. Semantic tokens (--bp-*) — what each ramp step MEANS in a given
+ *      theme. `:root` is dark (default); `:root.light` overrides. The
+ *      names here (surface/content-primary/accent/status-*) are this
+ *      codebase's own vocabulary; the concept's own names (ground/ink/
+ *      copper/steady) map 1:1 — see the comments below.
+ *   4. Tailwind theme wiring — expose the semantic tokens as regular
+ *      utility classes (bg-surface, text-content-primary, ...) and
+ *      recalibrate radii so `rounded-md` etc. carry the brand's
+ *      proportions everywhere for free.
+ *   5. Motion — durations/easings, and the prefers-reduced-motion gate.
+ */
 @theme {
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* ink — neutral graphite ramp with a deliberate WARM bias (hue ~25,
+     low chroma), matching the concept's ground/raised/sunken/ink family
+     — not the cool blue-gray every "terminal" self-hosting tool uses.
+     This raw ramp isn't a single light->dark gradient the way the
+     copper/moss/ember/crimson ramps are — it's a flat lookup of the
+     concept's own named roles, since almost everything reads it
+     through the theme-adaptive --bp-* / bg-surface / text-content-*
+     tokens below instead (the two exceptions, the "Closed" connection
+     dot and the "created/stopped" status dot, just need *a* quiet
+     neutral, not a specific step). */
+  --color-ink-50: #f5f2ee;  /* concept "ground", light */
+  --color-ink-100: #ebe6e0; /* concept "sunken", light */
+  --color-ink-200: #d9d2c9; /* concept "line", light */
+  --color-ink-300: #a8a39b; /* concept "ink-2", dark */
+  --color-ink-400: #8b8179; /* concept "ink-3", dark — nudged for AA, see --bp-content-muted */
+  --color-ink-500: #757069; /* concept "ink-3", dark — raw/unadjusted, decorative dots only */
+  --color-ink-600: #4a463f; /* concept "ink-2", light */
+  --color-ink-700: #2c2c33; /* concept "line", dark */
+  --color-ink-800: #1a1a1e; /* concept "raised", dark */
+  --color-ink-900: #131316; /* concept "ground", dark */
+  --color-ink-950: #0e0e11; /* concept "sunken", dark */
+
+  /* copper — brand accent, hue ~21-24 (the concept's own copper). Kept
+     out of the status hue family entirely (steady/moving/broken below)
+     so a primary action never reads as a health signal. Full 50-950
+     ramp defined (not just the two text-critical steps) because
+     @nuxt/ui's runtime color resolution for a mapped role (primary,
+     success, ...) isn't guaranteed to only ever touch the steps this
+     app happens to use directly — an incomplete ramp risks a silently
+     unstyled control rather than a build error. 400/500/600/900/100
+     are the exact, independently-contrast-checked values (see
+     --bp-accent* below and design-identity-report.md); the rest are
+     the same hue/saturation interpolated smoothly between them. */
+  --color-copper-50: #fcf3ed;
+  --color-copper-100: #f0dfd3;  /* concept copper-soft, light */
+  --color-copper-200: #f1c1a7;
+  --color-copper-300: #e89c73;
+  --color-copper-400: #e2743c;  /* concept copper, dark — 6.00:1 on ground(dark) */
+  --color-copper-500: #b4531f;  /* concept copper, light — button/swatch fill */
+  --color-copper-600: #ab4e1c;  /* nudged from #b4531f for reliable 4.5:1 as TEXT on light ground (was 4.48:1) */
+  --color-copper-700: #8c4017;
+  --color-copper-800: #693011;
+  --color-copper-900: #352115;  /* concept copper-soft, dark */
+  --color-copper-950: #2c1407;
+
+  /* moss/steady — running/success, hue ~155 (concept's "steady"). Same
+     full-ramp rationale as copper above. */
+  --color-moss-50: #f0f9f6;
+  --color-moss-100: #daf1e7;
+  --color-moss-200: #b5e3d0;
+  --color-moss-300: #81cfaf;
+  --color-moss-400: #45b08f; /* concept "steady", dark — 6.94:1 */
+  --color-moss-500: #3b9b73;
+  --color-moss-600: #1f6f5c; /* concept "steady", light — 5.40:1 */
+  --color-moss-700: #246047;
+  --color-moss-800: #1b4634;
+  --color-moss-900: #123024;
+  --color-moss-950: #0b1e16;
+
+  /* ember/moving — deploying/in-progress, hue ~40 (concept's "moving"). */
+  --color-ember-50: #fbf7ee;
+  --color-ember-100: #f6ebd5;
+  --color-ember-200: #edd7ab;
+  --color-ember-300: #e2bf78;
+  --color-ember-400: #d9a23b; /* concept "moving", dark — 8.11:1 */
+  --color-ember-500: #bd8c28;
+  --color-ember-600: #92650c; /* nudged from concept's #9a6b10 for 4.5:1 on ground, light (was 4.20:1) */
+  --color-ember-700: #725418;
+  --color-ember-800: #543e12;
+  --color-ember-900: #3b2b0c;
+  --color-ember-950: #261c08;
+
+  /* crimson/broken — error, hue ~345 (concept's "broken"). */
+  --color-crimson-50: #fcedf1;
+  --color-crimson-100: #f9d2dc;
+  --color-crimson-200: #f4afc0;
+  --color-crimson-300: #ed829d;
+  --color-crimson-400: #f0567b; /* concept "broken", dark — 5.58:1 */
+  --color-crimson-500: #e02957;
+  --color-crimson-600: #b32544; /* concept "broken", light — 5.76:1 */
+  --color-crimson-700: #931535;
+  --color-crimson-800: #6b0f26;
+  --color-crimson-900: #470a1a;
+  --color-crimson-950: #2d0610;
+
+  /* Semantic tokens, re-exposed as first-class Tailwind colors so
+     `bg-surface`, `text-content-secondary`, `border-line` etc. work
+     directly and repaint automatically on theme toggle (they resolve
+     the --bp-* custom properties defined below, per-theme). */
+  --color-surface: var(--bp-surface);
+  --color-surface-elevated: var(--bp-surface-elevated);
+  --color-surface-sunken: var(--bp-surface-sunken);
+  --color-line: var(--bp-line);
+  --color-line-strong: var(--bp-line-strong);
+  --color-content-primary: var(--bp-content-primary);
+  --color-content-secondary: var(--bp-content-secondary);
+  --color-content-muted: var(--bp-content-muted);
+  --color-accent: var(--bp-accent);
+  --color-accent-fg: var(--bp-accent-fg);
+
+  /* Status text/background — theme-adaptive so a status message or
+     danger-zone label always meets AA regardless of dark/light (see the
+     --bp-status-* stops above; raw moss/ember/crimson-400 dots are fine
+     used bare since they're always paired with a text label, but *text*
+     needs the per-theme-calibrated step, hence this indirection). */
+  --color-status-running: var(--bp-status-running);
+  --color-status-running-bg: var(--bp-status-running-bg);
+  --color-status-deploying: var(--bp-status-deploying);
+  --color-status-deploying-bg: var(--bp-status-deploying-bg);
+  --color-status-error: var(--bp-status-error);
+  --color-status-error-bg: var(--bp-status-error-bg);
+  --color-status-stopped: var(--bp-status-stopped);
+  --color-status-stopped-bg: var(--bp-status-stopped-bg);
+
+  /* Radii — small and squared-off (2-5px in the concept's own mock),
+     not the pill-happy rounding of a generic component-library
+     template. Matches the wordmark's own crisp, geometric character
+     better than a soft/bubbly radius would. */
+  --radius-sm: 0.1875rem;
+  --radius-md: 0.25rem;
+  --radius-lg: 0.375rem;
+  --radius-xl: 0.5rem;
+
+  /* Motion — see the "Motion" section of theme.ts for the rationale.
+     `ease-*` is a real Tailwind v4 theme namespace (its own defaults —
+     ease-in/-out/-in-out — are declared the same way), so this yields
+     real `ease-out-snap` / `ease-in-soft` utility classes. Duration has
+     no equivalent named-theme namespace in v4 (`duration-*` utilities
+     are generated straight from the number, e.g. `duration-180`), so
+     the three durations are applied as bare numerics at each call site
+     (120/180/280) rather than through a token name — 120/180/280 *are*
+     the token, spelled out in ms instead of a name. */
+  --ease-out-snap: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-soft: cubic-bezier(0.4, 0, 1, 1);
 }
 
+/* --- Semantic tokens: dark (default) ------------------------------- */
 :root {
   color-scheme: dark;
+
+  --bp-surface: #131316;          /* concept "ground" */
+  --bp-surface-elevated: #1a1a1e; /* concept "raised" */
+  --bp-surface-sunken: #0e0e11;   /* concept "sunken" */
+  /* Decorative dividers (table rows, card outlines) are intentionally
+     low-contrast — they're never the only cue for a boundary (spacing
+     and hover states carry that). Interactive edges (inputs, buttons,
+     focus-adjacent chrome) use --bp-line-strong instead, which is
+     calibrated to the WCAG 1.4.11 non-text 3:1 minimum. */
+  --bp-line: #2c2c33;             /* concept "line" — 1.34:1, decorative only */
+  --bp-line-strong: #6e655e;      /* 3.26:1 on ground — interactive borders */
+
+  --bp-content-primary: #edeae5;   /* concept "ink" — 15.45:1 on ground */
+  --bp-content-secondary: #a8a39b; /* concept "ink-2" — 7.40:1 */
+  --bp-content-muted: #8b8179;     /* concept "ink-3", nudged L44->L51 — 4.87:1 (was 3.78:1) */
+
+  --bp-accent: #e2743c;      /* concept "copper" — 6.00:1 on ground */
+  --bp-accent-strong: #ee9163;
+  --bp-accent-solid: #e2743c;
+  --bp-accent-fg: #131316;   /* near-black text on the copper button — 6.00:1 (white only hit 3.09:1) */
+
+  --bp-status-running: #45b08f;    /* concept "steady" — 6.94:1 */
+  --bp-status-running-bg: color-mix(in srgb, #45b08f 14%, var(--bp-surface));
+  --bp-status-deploying: #d9a23b;  /* concept "moving" — 8.11:1 */
+  --bp-status-deploying-bg: color-mix(in srgb, #d9a23b 14%, var(--bp-surface));
+  --bp-status-error: #f0567b;      /* concept "broken" — 5.58:1 */
+  --bp-status-error-bg: color-mix(in srgb, #f0567b 14%, var(--bp-surface));
+  --bp-status-stopped: #a8a39b;
+  --bp-status-stopped-bg: color-mix(in srgb, #a8a39b 14%, var(--bp-surface));
 }
 
+/* --- Semantic tokens: light ------------------------------------------ */
 :root.light {
   color-scheme: light;
+
+  --bp-surface: #f5f2ee;          /* concept "ground" */
+  --bp-surface-elevated: #ffffff; /* concept "raised" */
+  --bp-surface-sunken: #ebe6e0;   /* concept "sunken" */
+  --bp-line: #d9d2c9;             /* concept "line" — 1.34:1, decorative only */
+  --bp-line-strong: #95887e;      /* 3.08:1 on ground — interactive borders */
+
+  --bp-content-primary: #1b1a18;   /* concept "ink" — 15.58:1 on ground */
+  --bp-content-secondary: #4a463f; /* concept "ink-2" — 8.40:1 */
+  --bp-content-muted: #796c63;     /* concept "ink-3", nudged L46->L43 — 4.55:1 (was 4.19:1) */
+
+  --bp-accent: #ab4e1c;      /* concept "copper", nudged for text — 4.90:1 on ground, 5.47:1 on white */
+  --bp-accent-strong: #8f4118;
+  --bp-accent-solid: #b4531f; /* concept's own copper — used as a button FILL (not held to text contrast) */
+  --bp-accent-fg: #ffffff;    /* 5.00:1 on the copper button fill */
+
+  --bp-status-running: #1f6f5c;    /* concept "steady" — 5.40:1 */
+  --bp-status-running-bg: color-mix(in srgb, #1f6f5c 12%, var(--bp-surface));
+  --bp-status-deploying: #92650c;  /* concept "moving", nudged L34->L31 — 4.60:1 (was 4.20:1) */
+  --bp-status-deploying-bg: color-mix(in srgb, #92650c 12%, var(--bp-surface));
+  --bp-status-error: #b32544;      /* concept "broken" — 5.76:1 */
+  --bp-status-error-bg: color-mix(in srgb, #b32544 10%, var(--bp-surface));
+  --bp-status-stopped: #4a463f;
+  --bp-status-stopped-bg: color-mix(in srgb, #4a463f 10%, var(--bp-surface));
 }
 
 html,
@@ -22,7 +254,15 @@ body,
 }
 
 body {
-  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  background-color: var(--bp-surface);
+  color: var(--bp-content-primary);
+}
+
+/* Tabular figures wherever numbers appear in a row together (ports,
+   memory, CPU%, deployment numbers) so digits line up — the concept's
+   "voice of the type" section calls this out explicitly. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
 
 /* Slow, calm pulse for in-progress states (deploying) — not the frantic
@@ -39,4 +279,32 @@ body {
 
 .status-pulse {
   animation: status-pulse 1.8s ease-in-out infinite;
+}
+
+/* Login's backdrop: a faint schematic dot-grid rather than a flat fill —
+   a small, quiet nod to "precision instrument" that a generic admin
+   template wouldn't bother with. Built from --bp-line at low opacity, so
+   it's barely-there in both themes and never competes with the form. */
+.login-grid {
+  background-image: radial-gradient(circle, var(--bp-line) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-position: -11px -11px;
+}
+
+/* Safe-area padding for the mobile bottom nav (AppShell) — keeps its
+   touch targets clear of the home indicator / gesture bar on notched
+   phones instead of sitting flush under it. */
+.pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

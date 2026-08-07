@@ -281,27 +281,27 @@ function onSubmit() {
 </script>
 
 <template>
-  <div class="min-h-screen bg-slate-950">
-    <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+  <div class="min-h-screen bg-surface">
+    <header class="sticky top-0 z-10 border-b border-line bg-surface/90 backdrop-blur">
       <div class="mx-auto flex max-w-2xl items-center gap-3 px-6 py-3" :class="sourceMode === 'compose' && 'max-w-3xl'">
         <UButton to="/" color="neutral" variant="ghost" square size="sm" icon="i-lucide-arrow-left" aria-label="Back to apps" />
-        <span class="text-base font-semibold tracking-tight text-slate-100">New app</span>
+        <span class="text-base font-semibold tracking-tight text-content-primary">New app</span>
       </div>
     </header>
 
     <main class="mx-auto max-w-2xl px-6 py-8" :class="sourceMode === 'compose' && 'max-w-3xl'">
-      <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+      <UCard variant="subtle" :ui="{ root: 'ring-line' }">
         <!-- Image / upload sources: the original single-app flow. -->
         <form v-if="sourceMode !== 'compose'" class="flex flex-col gap-5" novalidate @submit.prevent="onSubmit">
           <UFormField label="Name" name="name" :error="fieldErrors.name || undefined">
             <UInput v-model="name" placeholder="My Blog" class="w-full" :disabled="submitting" autofocus />
             <template #hint>
-              <span class="font-mono text-xs" :class="name && !slugValid ? 'text-red-400' : 'text-slate-500'">
+              <span class="font-mono text-xs" :class="name && !slugValid ? 'text-status-error' : 'text-content-muted'">
                 {{ slug || 'slug' }}
               </span>
             </template>
           </UFormField>
-          <p v-if="name && !slugValid" class="-mt-3 text-xs text-slate-500">
+          <p v-if="name && !slugValid" class="-mt-3 text-xs text-content-muted">
             Slug must start with a letter and contain only lowercase letters, digits, and hyphens (max 32 characters).
           </p>
 
@@ -321,7 +321,7 @@ function onSubmit() {
           <UFormField v-else label="Build context">
             <UFileUpload v-model="uploadFile" accept=".tar.gz,.tgz,application/gzip" :disabled="submitting" icon="i-lucide-archive" />
             <template #hint>
-              <span class="text-xs text-slate-500">
+              <span class="text-xs text-content-muted">
                 A gzipped tarball with a Containerfile or Dockerfile at its root. Deploying a local folder directly (no
                 packaging step)? Use the <span class="font-mono">basepod deploy</span> CLI instead.
               </span>
@@ -330,7 +330,7 @@ function onSubmit() {
 
           <div v-if="sourceMode === 'upload' && uploading" class="flex flex-col gap-1.5">
             <UProgress :model-value="uploadProgress === null ? null : Math.round(uploadProgress * 100)" :max="100" />
-            <span class="text-xs text-slate-500">
+            <span class="text-xs text-content-muted">
               {{ uploadProgress === null ? 'Creating app…' : `Uploading… ${Math.round(uploadProgress * 100)}%` }}
             </span>
           </div>
@@ -372,7 +372,7 @@ function onSubmit() {
             <UFormField label="Project name" name="project">
               <UInput v-model="composeProject" placeholder="my-stack" class="w-full font-mono" :disabled="submitting" autofocus />
               <template #hint>
-                <span class="text-xs" :class="composeProject && !composeProjectValid ? 'text-red-400' : 'text-slate-500'">
+                <span class="text-xs" :class="composeProject && !composeProjectValid ? 'text-status-error' : 'text-content-muted'">
                   Groups this file's services on the Apps list; falls back to the file's own top-level
                   <span class="font-mono">name:</span> if left blank.
                 </span>
@@ -382,7 +382,7 @@ function onSubmit() {
             <UFormField label="Compose bundle">
               <UFileUpload v-model="composeFile" accept=".tar.gz,.tgz,application/gzip" :disabled="submitting" icon="i-lucide-archive" />
               <template #hint>
-                <span class="text-xs text-slate-500">
+                <span class="text-xs text-content-muted">
                   A gzipped tarball with <span class="font-mono">compose.yaml</span> at its root, plus any per-service build
                   contexts it references. Packaging a local folder? Use
                   <span class="font-mono">basepod compose up</span> from the CLI instead — it tars, previews, and applies in
@@ -393,7 +393,7 @@ function onSubmit() {
 
             <div v-if="composePhase === 'dry-running'" class="flex flex-col gap-1.5">
               <UProgress :model-value="composeUploadProgress === null ? null : Math.round(composeUploadProgress * 100)" :max="100" />
-              <span class="text-xs text-slate-500">
+              <span class="text-xs text-content-muted">
                 {{ composeUploadProgress === null ? 'Parsing…' : `Uploading… ${Math.round(composeUploadProgress * 100)}%` }}
               </span>
             </div>
@@ -415,7 +415,7 @@ function onSubmit() {
 
             <div v-if="composePhase === 'applying'" class="flex flex-col gap-1.5">
               <UProgress :model-value="composeUploadProgress === null ? null : Math.round(composeUploadProgress * 100)" :max="100" />
-              <span class="text-xs text-slate-500">Applying…</span>
+              <span class="text-xs text-content-muted">Applying…</span>
             </div>
 
             <div class="flex justify-end gap-2">

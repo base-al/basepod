@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 
 import { useAuthStore } from '../stores/auth'
 import { ApiError } from '../lib/api'
+import BasepodWordmark from '../components/BasepodWordmark.vue'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -33,15 +34,13 @@ async function onSubmit() {
 </script>
 
 <template>
-  <div class="flex min-h-screen items-center justify-center bg-slate-950 px-4">
-    <UCard variant="subtle" class="w-full max-w-sm" :ui="{ root: 'ring-slate-800' }">
-      <template #header>
-        <div class="flex items-center gap-2 py-1">
-          <span class="h-2.5 w-2.5 rounded-full bg-emerald-400" aria-hidden="true" />
-          <span class="text-lg font-semibold tracking-tight text-slate-100">BasePod</span>
-        </div>
-      </template>
+  <div class="login-grid flex min-h-screen flex-col items-center justify-center gap-8 bg-surface px-4">
+    <div class="flex flex-col items-center gap-2 text-center">
+      <BasepodWordmark :height="26" />
+      <p class="max-w-xs text-sm text-content-secondary">Your server. Your data. No vendor.</p>
+    </div>
 
+    <UCard variant="subtle" class="w-full max-w-sm" :ui="{ root: 'ring-line' }">
       <form class="flex flex-col gap-4" novalidate @submit.prevent="onSubmit">
         <UFormField label="Email" name="email">
           <UInput

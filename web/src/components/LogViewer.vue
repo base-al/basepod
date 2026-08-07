@@ -225,13 +225,13 @@ function downloadLog() {
 const connectionChip = computed(() => {
   switch (connectionState.value) {
     case 'connecting':
-      return { label: 'Connecting', dotClass: 'bg-amber-400', pulse: true }
+      return { label: 'Connecting', dotClass: 'bg-ember-400', pulse: true }
     case 'open':
-      return { label: 'Live', dotClass: 'bg-emerald-400', pulse: false }
+      return { label: 'Live', dotClass: 'bg-moss-400', pulse: false }
     case 'reconnecting':
-      return { label: 'Reconnecting', dotClass: 'bg-amber-400', pulse: true }
+      return { label: 'Reconnecting', dotClass: 'bg-ember-400', pulse: true }
     case 'closed':
-      return { label: 'Closed', dotClass: 'bg-slate-500', pulse: false }
+      return { label: 'Closed', dotClass: 'bg-ink-500', pulse: false }
   }
 })
 </script>
@@ -239,16 +239,16 @@ const connectionChip = computed(() => {
 <template>
   <div class="flex flex-col gap-3">
     <template v-if="phase === 'loading'">
-      <div class="flex items-center justify-center rounded-lg border border-slate-800 py-24 text-sm text-slate-500">
+      <div class="flex items-center justify-center rounded-lg border border-line py-24 text-sm text-content-muted">
         Checking app status…
       </div>
     </template>
 
     <template v-else-if="phase === 'not-running'">
-      <div class="flex flex-col items-center gap-3 rounded-lg border border-slate-800 py-24 text-center">
-        <UIcon name="i-lucide-power-off" class="h-6 w-6 text-slate-600" />
-        <p class="text-sm font-medium text-slate-300">App isn't running</p>
-        <p class="max-w-sm text-xs text-slate-500">Deploy it to start a container — logs will stream here once it's up.</p>
+      <div class="flex flex-col items-center gap-3 rounded-lg border border-line py-24 text-center">
+        <UIcon name="i-lucide-power-off" class="h-6 w-6 text-content-muted" />
+        <p class="text-sm font-medium text-content-secondary">App isn't running</p>
+        <p class="max-w-sm text-xs text-content-muted">Deploy it to start a container — logs will stream here once it's up.</p>
         <div class="mt-1 flex items-center gap-2">
           <UButton size="sm" color="primary" variant="soft" icon="i-lucide-rocket" @click="emit('deploy-hint')">
             Go to Overview to deploy
@@ -267,7 +267,7 @@ const connectionChip = computed(() => {
     </template>
 
     <template v-else>
-      <div class="flex flex-wrap items-center gap-3 rounded-lg border border-slate-800 px-3 py-2">
+      <div class="flex flex-wrap items-center gap-3 rounded-lg border border-line px-3 py-2">
         <UBadge :color="connectionState === 'open' ? 'success' : connectionState === 'closed' ? 'neutral' : 'warning'" variant="subtle" class="items-center gap-1.5">
           <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="[connectionChip?.dotClass, connectionChip?.pulse && 'status-pulse']" aria-hidden="true" />
           {{ connectionChip?.label }}
@@ -297,11 +297,11 @@ const connectionChip = computed(() => {
       <div class="relative">
         <div
           ref="logContainer"
-          class="h-[32rem] overflow-y-auto rounded-lg border border-slate-800 bg-slate-950 p-3 font-mono text-xs leading-relaxed"
+          class="h-[32rem] overflow-y-auto rounded-lg border border-line bg-surface p-3 font-mono text-xs leading-relaxed"
           @scroll="onLogScroll"
         >
-          <p v-if="!lines.length" class="text-slate-600">No log lines yet — waiting for output…</p>
-          <div v-for="(line, i) in lines" :key="i" class="whitespace-pre-wrap break-all select-text" :class="line.stream === 'stderr' ? 'text-red-400' : 'text-slate-300'">
+          <p v-if="!lines.length" class="text-content-muted">No log lines yet — waiting for output…</p>
+          <div v-for="(line, i) in lines" :key="i" class="whitespace-pre-wrap break-all select-text" :class="line.stream === 'stderr' ? 'text-status-error' : 'text-content-secondary'">
             {{ line.text }}
           </div>
         </div>

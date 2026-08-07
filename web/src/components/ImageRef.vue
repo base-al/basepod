@@ -34,13 +34,13 @@ const parts = computed(() => {
 <template>
   <span
     class="flex min-w-0 max-w-full items-center gap-1.5 font-mono text-xs"
-    :class="isPending ? 'text-slate-500' : 'text-slate-400'"
+    :class="isPending ? 'text-content-muted' : 'text-content-secondary'"
     :title="value"
   >
     <span class="flex min-w-0 shrink" :class="isPending && 'italic'">
       <span class="truncate">{{ parts.head }}</span>
       <span class="shrink-0">{{ parts.tail }}</span>
     </span>
-    <span v-if="isPending" class="shrink-0 not-italic text-amber-500/80">(no build yet)</span>
+    <span v-if="isPending" class="shrink-0 not-italic text-status-deploying">(no build yet)</span>
   </span>
 </template>

@@ -154,13 +154,13 @@ function confirmRollback(number: number) {
     class="w-full"
   >
     <template #number-cell="{ row }">
-      <span class="font-mono text-sm text-slate-400">#{{ row.original.number }}</span>
+      <span class="font-mono text-sm text-content-secondary">#{{ row.original.number }}</span>
     </template>
 
     <template #image-cell="{ row }">
       <div class="flex flex-col gap-0.5">
-        <span class="font-mono text-xs text-slate-300">{{ row.original.image }}</span>
-        <span class="text-[11px] text-slate-500">
+        <span class="font-mono text-xs text-content-secondary">{{ row.original.image }}</span>
+        <span class="text-[11px] text-content-muted">
           {{ row.original.source }} · {{ row.original.trigger }}
           <template v-if="row.original.source === 'git' && row.original.git_sha">
             · <span class="font-mono">{{ shortSha(row.original.git_sha) }}</span>
@@ -174,7 +174,7 @@ function confirmRollback(number: number) {
     </template>
 
     <template #started_at-cell="{ row }">
-      <span class="text-xs text-slate-400" :title="row.original.started_at">
+      <span class="text-xs text-content-secondary" :title="row.original.started_at">
         {{ relativeTime(row.original.started_at) }}
       </span>
     </template>
@@ -183,13 +183,13 @@ function confirmRollback(number: number) {
       <button
         v-if="row.original.error"
         type="button"
-        class="max-w-md text-left text-xs text-red-400 hover:underline"
+        class="max-w-md text-left text-xs text-status-error hover:underline"
         :title="row.original.error"
         @click="toggle(row.original.number)"
       >
         {{ displayError(row.original) }}
       </button>
-      <span v-else class="text-xs text-slate-600">—</span>
+      <span v-else class="text-xs text-content-muted">—</span>
     </template>
 
     <template #actions-cell="{ row }">
@@ -222,10 +222,10 @@ function confirmRollback(number: number) {
           </UButton>
           <template #content>
             <div class="flex flex-col gap-2 p-3">
-              <p class="text-xs text-slate-300">
+              <p class="text-xs text-content-secondary">
                 Roll back to deployment <span class="font-mono">#{{ row.original.number }}</span>?
               </p>
-              <p class="max-w-64 text-xs text-slate-500">This redeploys the image from that deployment as a new deployment.</p>
+              <p class="max-w-64 text-xs text-content-muted">This redeploys the image from that deployment as a new deployment.</p>
               <div class="flex justify-end gap-2">
                 <UButton size="xs" color="neutral" variant="ghost" @click="confirmOpenNumber = null">Cancel</UButton>
                 <UButton

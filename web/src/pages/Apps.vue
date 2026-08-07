@@ -142,8 +142,8 @@ const deleteProjectMutation = useMutation({
   <AppShell max-width="7xl">
     <div class="mb-6 flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold tracking-tight text-slate-100">Apps</h1>
-        <p class="mt-1 text-sm text-slate-400">
+        <h1 class="font-mono text-2xl font-semibold tracking-tight text-content-primary">Apps</h1>
+        <p class="mt-1 text-sm text-content-secondary">
           <template v-if="appsQuery.data.value">{{ apps.length }} app{{ apps.length === 1 ? '' : 's' }} deployed</template>
           <template v-else>&nbsp;</template>
         </p>
@@ -167,23 +167,23 @@ const deleteProjectMutation = useMutation({
       <div
         v-for="n in 4"
         :key="n"
-        class="flex items-center gap-4 rounded-lg border border-slate-800 px-4 py-4 sm:px-5"
+        class="flex items-center gap-4 rounded-lg border border-line px-4 py-4 sm:px-5"
       >
-        <div class="h-3.5 w-28 animate-pulse rounded bg-slate-800" />
-        <div class="h-5 w-20 animate-pulse rounded-full bg-slate-800" />
-        <div class="hidden h-3.5 flex-1 animate-pulse rounded bg-slate-800 md:block" />
-        <div class="hidden h-3.5 w-12 animate-pulse rounded bg-slate-800 sm:block" />
-        <div class="hidden h-3.5 w-24 animate-pulse rounded bg-slate-800 lg:block" />
+        <div class="h-3.5 w-28 animate-pulse rounded bg-line" />
+        <div class="h-5 w-20 animate-pulse rounded-full bg-line" />
+        <div class="hidden h-3.5 flex-1 animate-pulse rounded bg-line md:block" />
+        <div class="hidden h-3.5 w-12 animate-pulse rounded bg-line sm:block" />
+        <div class="hidden h-3.5 w-24 animate-pulse rounded bg-line lg:block" />
       </div>
     </div>
 
     <div
       v-else-if="apps.length === 0"
-      class="flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-slate-800 py-24 text-center"
+      class="flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-line py-24 text-center"
     >
-      <UIcon name="i-lucide-rocket" class="h-8 w-8 text-slate-600" aria-hidden="true" />
-      <p class="text-sm font-medium text-slate-300">No apps deployed yet</p>
-      <p class="max-w-sm text-sm text-slate-500">
+      <UIcon name="i-lucide-rocket" class="h-8 w-8 text-content-muted" aria-hidden="true" />
+      <p class="text-sm font-medium text-content-secondary">No apps deployed yet</p>
+      <p class="max-w-sm text-sm text-content-muted">
         Deploy a container image or upload a build context to get your first app running.
       </p>
       <UButton to="/apps/new" color="primary" icon="i-lucide-plus" class="mt-1">New app</UButton>
@@ -195,11 +195,11 @@ const deleteProjectMutation = useMutation({
           <div class="flex items-center gap-2">
             <UIcon
               :name="group.project ? 'i-lucide-boxes' : 'i-lucide-box'"
-              class="h-3.5 w-3.5 text-slate-500"
+              class="h-3.5 w-3.5 text-content-muted"
               aria-hidden="true"
             />
-            <h2 class="text-xs font-medium tracking-wide text-slate-400 uppercase">{{ groupHeading(group) }}</h2>
-            <span class="text-xs text-slate-600">{{ group.apps.length }}</span>
+            <h2 class="font-mono text-xs font-medium tracking-wide text-content-secondary uppercase">{{ groupHeading(group) }}</h2>
+            <span class="text-xs text-content-muted">{{ group.apps.length }}</span>
           </div>
           <UButton
             v-if="group.project"
@@ -216,9 +216,9 @@ const deleteProjectMutation = useMutation({
         <!-- Desktop / tablet: dense grid-row table. Every row gets the same
              border treatment (the old UI had exactly one stray <hr> between
              two rows) and the whole row is a link, not just the slug. -->
-        <div class="hidden overflow-hidden rounded-lg border border-slate-800 md:block">
+        <div class="hidden overflow-hidden rounded-lg border border-line md:block">
           <div
-            class="grid grid-cols-[minmax(0,1.1fr)_auto_minmax(0,1.6fr)_auto_auto] items-center gap-4 border-b border-slate-800 bg-slate-900/40 px-5 py-2.5 text-xs font-medium uppercase tracking-wide text-slate-500"
+            class="grid grid-cols-[minmax(0,1.1fr)_auto_minmax(0,1.6fr)_auto_auto] items-center gap-4 border-b border-line bg-surface-elevated/40 px-5 py-2.5 text-xs font-medium uppercase tracking-wide text-content-muted"
           >
             <span>App</span>
             <span>Status</span>
@@ -232,9 +232,9 @@ const deleteProjectMutation = useMutation({
             :key="app.slug"
             :to="{ name: 'app-detail', params: { slug: app.slug } }"
             :aria-label="`Open app ${app.slug}, ${statusStyles[app.status].label}${app.internal ? ', internal' : ''}`"
-            class="grid grid-cols-[minmax(0,1.1fr)_auto_minmax(0,1.6fr)_auto_auto] items-center gap-4 border-b border-slate-800 px-5 py-3.5 transition-colors last:border-b-0 hover:bg-slate-900/60 focus-visible:bg-slate-900/60 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-emerald-400"
+            class="grid grid-cols-[minmax(0,1.1fr)_auto_minmax(0,1.6fr)_auto_auto] items-center gap-4 border-b border-line px-5 py-3.5 transition-colors last:border-b-0 hover:bg-surface-elevated/60 focus-visible:bg-surface-elevated/60 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
           >
-            <span class="truncate font-mono text-sm font-medium text-slate-100">
+            <span class="truncate font-mono text-sm font-medium text-content-primary">
               {{ app.compose_project ? app.compose_service : app.slug }}
             </span>
             <div class="flex items-center gap-1.5">
@@ -245,8 +245,8 @@ const deleteProjectMutation = useMutation({
               </UBadge>
             </div>
             <ImageRef :value="app.image" class="min-w-0" />
-            <span class="font-mono text-sm text-slate-400">{{ app.internal ? '—' : app.port }}</span>
-            <span class="whitespace-nowrap font-mono text-xs text-slate-400">
+            <span class="font-mono text-sm text-content-secondary tabular-nums">{{ app.internal ? '—' : app.port }}</span>
+            <span class="whitespace-nowrap font-mono text-xs tabular-nums text-content-secondary">
               {{ formatLimitsSummary(app.memory_limit_mb, app.cpu_limit) }}
             </span>
           </RouterLink>
@@ -260,10 +260,10 @@ const deleteProjectMutation = useMutation({
             :key="app.slug"
             :to="{ name: 'app-detail', params: { slug: app.slug } }"
             :aria-label="`Open app ${app.slug}, ${statusStyles[app.status].label}${app.internal ? ', internal' : ''}`"
-            class="flex flex-col gap-3 rounded-lg border border-slate-800 p-4 transition-colors hover:bg-slate-900/60 focus-visible:bg-slate-900/60 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-emerald-400"
+            class="flex flex-col gap-3 rounded-lg border border-line p-4 transition-colors hover:bg-surface-elevated/60 focus-visible:bg-surface-elevated/60 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
           >
             <div class="flex items-center justify-between gap-3">
-              <span class="truncate font-mono text-sm font-medium text-slate-100">
+              <span class="truncate font-mono text-sm font-medium text-content-primary">
                 {{ app.compose_project ? app.compose_service : app.slug }}
               </span>
               <div class="flex items-center gap-1.5">
@@ -275,7 +275,7 @@ const deleteProjectMutation = useMutation({
               </div>
             </div>
             <ImageRef :value="app.image" />
-            <div class="flex items-center justify-between text-xs text-slate-500">
+            <div class="flex items-center justify-between text-xs text-content-muted">
               <span class="font-mono">{{ app.internal ? 'internal' : `port ${app.port}` }}</span>
               <span class="font-mono">{{ formatLimitsSummary(app.memory_limit_mb, app.cpu_limit) }}</span>
             </div>

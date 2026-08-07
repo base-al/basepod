@@ -71,9 +71,9 @@ function submit() {
 </script>
 
 <template>
-  <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+  <UCard variant="subtle" :ui="{ root: 'ring-line' }">
     <template #header>
-      <h2 class="text-sm font-medium text-slate-400">Change password</h2>
+      <h2 class="text-sm font-medium text-content-secondary">Change password</h2>
     </template>
 
     <form class="flex flex-col gap-4" novalidate @submit.prevent="submit">
@@ -102,7 +102,7 @@ function submit() {
           :disabled="changeMutation.isPending.value"
           required
         />
-        <p v-if="tooShort" class="mt-1 text-xs text-red-400">Must be at least {{ MIN_PASSWORD_LENGTH }} characters.</p>
+        <p v-if="tooShort" class="mt-1 text-xs text-status-error">Must be at least {{ MIN_PASSWORD_LENGTH }} characters.</p>
       </UFormField>
 
       <UFormField label="Confirm new password" name="confirm-password">
@@ -116,7 +116,7 @@ function submit() {
           :disabled="changeMutation.isPending.value"
           required
         />
-        <p v-if="mismatched" class="mt-1 text-xs text-red-400">Passwords don't match.</p>
+        <p v-if="mismatched" class="mt-1 text-xs text-status-error">Passwords don't match.</p>
       </UFormField>
 
       <div class="flex justify-end">
