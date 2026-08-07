@@ -296,12 +296,18 @@ export interface PasswordChangeRequest {
  * logs (GET .../logs) and must NOT carry deployment_number; scope
  * "build_log" streams one deployment's build log (GET
  * .../deployments/{number}/log) and MUST carry deployment_number; scope
- * "all_stats" streams every running app's stats (GET /stats — the
- * apps-list sparklines' batch route, see Apps.vue) and must carry slug ""
- * (it names no single app) and no deployment_number — see sse.ts's
- * connect(), the only caller. */
+ * "stats" streams ONE app's own resource-usage stats (GET
+ * .../apps/{slug}/stats — AppDetail's Overview live-resources card, see
+ * AppStatsSample below) and must NOT carry deployment_number, mirroring
+ * "app_logs"; scope "all_stats" streams every running app's stats (GET
+ * /stats — the apps-list sparklines' batch route, see Apps.vue) and must
+ * carry slug "" (it names no single app) and no deployment_number — see
+ * sse.ts's connect(), the only caller. "stats" and "all_stats" are
+ * deliberately separate scopes server-side (internal/api/stream_token.go)
+ * even though they stream the same sample shape — a token minted for one
+ * cannot open the other's route. */
 export interface StreamTokenRequest {
-  scope: 'app_logs' | 'build_log' | 'all_stats'
+  scope: 'app_logs' | 'build_log' | 'stats' | 'all_stats'
   slug: string
   deployment_number?: number
 }
@@ -342,6 +348,23 @@ export interface AllStatsSample {
   block_read_bytes: number
   block_write_bytes: number
 }
+
+// --- Per-app stats stream (GET /apps/{slug}/stats) — AppDetail Overview's
+// live-resources card ---------------------------------------------------
+// The route itself (internal/api/stats.go's handleAppStats) predates this
+// UI consumer — v0.5's plan had it wired for a future per-app view that no
+// page used yet (see AllStatsSample's own doc comment above). The IA
+// reorg's Overview tab is that consumer.
+
+/** One `event: stats` message's JSON body on the per-app stats stream (GET
+ * .../apps/{slug}/stats) — internal/api/stats.go's statsEventPayload
+ * exactly. Identical fields to AllStatsSample MINUS `slug`: this route is
+ * already scoped to one app by its URL, so the server never repeats the
+ * slug in the payload. AppDetail.vue folds a sample into lib/statsBuffer's
+ * same rolling-window shape by attaching the app's own (already-known)
+ * slug before handing it to pushStatsSample — that keeps this one small
+ * consumer from needing its own copy of statsBuffer's logic. */
+export type AppStatsSample = Omit<AllStatsSample, 'slug'>
 
 /** Typed error thrown for any non-2xx response, parsed from BasePod's
  * {"error":{"code","message"}} envelope. */

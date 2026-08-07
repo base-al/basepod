@@ -63,7 +63,15 @@ const podmanOk = computed(() => systemQuery.data.value?.podman === 'ok')
 
 const navItems = [
   { label: 'Apps', icon: 'i-lucide-boxes', to: { name: 'apps' }, matches: ['apps', 'new-app', 'app-detail'] },
-  { label: 'Settings', icon: 'i-lucide-settings', to: { name: 'settings' }, matches: ['settings'] },
+  {
+    label: 'Settings',
+    icon: 'i-lucide-settings',
+    to: { name: 'settings-account' },
+    // Every settings sub-route (IA reorg) still lights up this one rail/
+    // bottom-bar item — the sub-nav inside SettingsShell.vue is what
+    // distinguishes Account/Instance/Users from here.
+    matches: ['settings-account', 'settings-instance', 'settings-users'],
+  },
 ] as const
 
 function isActive(matches: readonly string[]) {

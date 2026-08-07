@@ -301,9 +301,17 @@ const connectionChip = computed(() => {
       </div>
 
       <div class="relative">
+        <!-- IA reorg: logs are a reading mode, not a cramped tab panel —
+             this pane now scales with the viewport instead of a flat
+             fixed 32rem (512px) box, since this is the view an operator
+             actually wants full-height in an incident. clamp()'s floor is
+             set to that exact old value (512px) so a short phone screen
+             never gets LESS room than before — only ever the same or
+             more; the ceiling (56rem) just keeps it from ballooning to an
+             absurd height on an ultra-tall monitor. -->
         <div
           ref="logContainer"
-          class="h-[32rem] overflow-y-auto rounded-lg border border-line bg-surface p-3 font-mono text-xs leading-relaxed"
+          class="h-[clamp(32rem,calc(100dvh_-_18rem),56rem)] overflow-y-auto rounded-lg border border-line bg-surface p-3 font-mono text-xs leading-relaxed"
           @scroll="onLogScroll"
         >
           <p v-if="!lines.length" class="text-content-muted">No log lines yet — waiting for output…</p>
