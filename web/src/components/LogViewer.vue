@@ -250,10 +250,10 @@ const connectionChip = computed(() => {
         <p class="text-sm font-medium text-content-secondary">App isn't running</p>
         <p class="max-w-sm text-xs text-content-muted">Deploy it to start a container — logs will stream here once it's up.</p>
         <div class="mt-1 flex items-center gap-2">
-          <UButton size="sm" color="primary" variant="soft" icon="i-lucide-rocket" @click="emit('deploy-hint')">
+          <UButton size="sm" color="primary" variant="soft" class="tap44" icon="i-lucide-rocket" @click="emit('deploy-hint')">
             Go to Overview to deploy
           </UButton>
-          <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" @click="retry">Retry</UButton>
+          <UButton size="sm" color="neutral" variant="ghost" class="tap44" icon="i-lucide-refresh-cw" @click="retry">Retry</UButton>
         </div>
       </div>
     </template>
@@ -261,7 +261,7 @@ const connectionChip = computed(() => {
     <template v-else-if="phase === 'error'">
       <UAlert color="error" variant="subtle" title="Couldn't load logs" :description="errorMessage" icon="i-lucide-alert-circle">
         <template #actions>
-          <UButton size="sm" color="error" variant="soft" icon="i-lucide-refresh-cw" @click="retry">Retry</UButton>
+          <UButton size="sm" color="error" variant="soft" class="tap44" icon="i-lucide-refresh-cw" @click="retry">Retry</UButton>
         </template>
       </UAlert>
     </template>
@@ -273,22 +273,28 @@ const connectionChip = computed(() => {
           {{ connectionChip?.label }}
         </UBadge>
 
-        <USwitch v-model="follow" label="Follow" />
+        <USwitch v-model="follow" label="Follow" class="tap44" />
 
-        <USelect v-model="tail" :items="TAIL_OPTIONS" class="w-36" />
+        <USelect v-model="tail" :items="TAIL_OPTIONS" class="tap44 w-36" />
 
-        <div class="ml-auto flex items-center gap-1.5">
+        <!-- ml-auto pushes this cluster to the far right, which on a
+             narrow phone viewport is exactly the zone a right-handed
+             thumb rests in when holding the device one-handed — Pause is
+             first (leftmost of the three) so it's reachable without a
+             stretch even before the others. -->
+        <div class="tap-row ml-auto flex items-center gap-1.5">
           <UButton
             size="sm"
             color="neutral"
             variant="ghost"
+            class="tap44"
             :icon="paused ? 'i-lucide-play' : 'i-lucide-pause'"
             @click="togglePause"
           >
             {{ paused ? `Resume${pending.length ? ` (${pending.length})` : ''}` : 'Pause' }}
           </UButton>
-          <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-eraser" @click="clearLogs">Clear</UButton>
-          <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-download" :disabled="!lines.length" @click="downloadLog">
+          <UButton size="sm" color="neutral" variant="ghost" class="tap44" icon="i-lucide-eraser" @click="clearLogs">Clear</UButton>
+          <UButton size="sm" color="neutral" variant="ghost" class="tap44" icon="i-lucide-download" :disabled="!lines.length" @click="downloadLog">
             Download
           </UButton>
         </div>
@@ -307,7 +313,7 @@ const connectionChip = computed(() => {
         </div>
 
         <div v-if="!autoScroll" class="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
-          <UButton class="pointer-events-auto" size="sm" color="primary" variant="solid" icon="i-lucide-arrow-down" @click="jumpToLatest">
+          <UButton class="tap44 pointer-events-auto" size="sm" color="primary" variant="solid" icon="i-lucide-arrow-down" @click="jumpToLatest">
             Jump to latest
           </UButton>
         </div>

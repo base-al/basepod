@@ -74,7 +74,7 @@ async function onSubmit() {
           icon="i-lucide-alert-circle"
         />
 
-        <UButton type="submit" color="primary" block :loading="auth.pending" :disabled="auth.pending">
+        <UButton type="submit" color="primary" block class="tap44" :loading="auth.pending" :disabled="auth.pending">
           Sign in
         </UButton>
       </form>

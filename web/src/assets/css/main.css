@@ -298,6 +298,54 @@ body {
   padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
 }
 
+/* ---- Touch-target expansion -----------------------------------------
+ * The dashboard's desktop density is deliberate — dozens of small icon
+ * buttons and table-row actions packed tight (see theme.ts's spacing
+ * rationale). Inflating every one of them to 44px would wreck that for
+ * every mouse/trackpad user just to serve the touch case. Instead, this
+ * expands the *hit area* past the visual box via an invisible ::after
+ * overlay, gated to `pointer: coarse` — the actual signal that the
+ * input device is a finger, not a guess based on viewport width (a
+ * touch laptop or an external-mouse-on-a-phone-sized-window shouldn't
+ * flip this). A mouse/trackpad user keeps the compact box at any
+ * window size; a touch user gets a real >=44px tappable region with no
+ * visual change at all.
+ *
+ * Apply `.tap44` to any interactive element (button, link, switch
+ * wrapper, select trigger) whose rendered box is smaller than 44x44 —
+ * safe to apply even to already-compliant elements, it only ever grows
+ * the hit area. Needs `position: relative` on the element itself (set
+ * here, scoped to the same media query so it never affects desktop
+ * layout/stacking).
+ */
+@media (pointer: coarse) {
+  .tap44 {
+    position: relative;
+  }
+  .tap44::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* Companion to .tap44: rows of adjacent small icon buttons (table row
+ * actions, the domain/env-row action clusters) sit close enough on
+ * desktop (gap-1/gap-1.5, 4-6px) that two neighboring .tap44 hit areas
+ * would overlap heavily under touch, making the wrong one easy to hit.
+ * Widening the gap only under a coarse pointer keeps the desktop
+ * row exactly as dense as designed while giving touch enough separation
+ * that mis-taps land on empty space, not the neighboring control. */
+@media (pointer: coarse) {
+  .tap-row {
+    gap: 0.5rem !important;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

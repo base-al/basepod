@@ -123,6 +123,7 @@ function submit() {
         <UButton
           type="submit"
           color="primary"
+          class="tap44"
           icon="i-lucide-key-round"
           :loading="changeMutation.isPending.value"
           :disabled="!canSubmit || changeMutation.isPending.value"

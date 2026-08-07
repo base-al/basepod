@@ -145,7 +145,7 @@ function statusFor(service: ComposeService): string {
     </div>
 
     <div v-if="plan.dry_run" class="flex justify-end">
-      <UButton color="primary" icon="i-lucide-rocket" :loading="confirming" :disabled="confirming" @click="emit('confirm')">
+      <UButton color="primary" icon="i-lucide-rocket" class="tap44" :loading="confirming" :disabled="confirming" @click="emit('confirm')">
         Confirm &amp; apply
       </UButton>
     </div>

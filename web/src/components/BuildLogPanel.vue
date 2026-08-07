@@ -175,7 +175,7 @@ const connectionChip = () => {
 
     <div v-else-if="phase === 'error'" class="flex flex-col items-center gap-2 py-10 text-xs">
       <span class="text-status-error">{{ errorMessage }}</span>
-      <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" @click="retry">Retry</UButton>
+      <UButton size="xs" color="neutral" variant="ghost" class="tap44" icon="i-lucide-refresh-cw" @click="retry">Retry</UButton>
     </div>
 
     <pre

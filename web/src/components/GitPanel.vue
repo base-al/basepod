@@ -327,11 +327,11 @@ const detectedAccordionValue = computed(() => {
 
           <UAlert v-if="formError" color="error" variant="subtle" :title="formError" icon="i-lucide-alert-circle" />
 
-          <div class="flex justify-end gap-2">
-            <UButton v-if="connected" color="neutral" variant="ghost" :disabled="connectMutation.isPending.value" @click="cancelEdit">
+          <div class="tap-row flex justify-end gap-2">
+            <UButton v-if="connected" color="neutral" variant="ghost" class="tap44" :disabled="connectMutation.isPending.value" @click="cancelEdit">
               Cancel
             </UButton>
-            <UButton type="submit" color="primary" icon="i-lucide-git-branch" :loading="connectMutation.isPending.value" :disabled="!formValid || connectMutation.isPending.value">
+            <UButton type="submit" color="primary" class="tap44" icon="i-lucide-git-branch" :loading="connectMutation.isPending.value" :disabled="!formValid || connectMutation.isPending.value">
               {{ connected ? 'Save changes' : 'Connect repo' }}
             </UButton>
           </div>
@@ -344,7 +344,7 @@ const detectedAccordionValue = computed(() => {
           <template #header>
             <div class="flex items-center justify-between">
               <h2 class="text-sm font-medium text-content-secondary">Connected repo</h2>
-              <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-pencil" @click="startEdit">Edit</UButton>
+              <UButton size="xs" color="neutral" variant="ghost" class="tap44" icon="i-lucide-pencil" @click="startEdit">Edit</UButton>
             </div>
           </template>
 
@@ -389,7 +389,7 @@ const detectedAccordionValue = computed(() => {
                 <span class="min-w-0 flex-1 truncate rounded-md border border-line bg-surface-elevated/50 px-3 py-1.5 font-mono text-sm text-content-primary">
                   {{ gitSource.webhook_url }}
                 </span>
-                <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy webhook URL" @click="copyText(gitSource.webhook_url, 'Webhook URL')" />
+                <UButton size="sm" color="neutral" variant="ghost" square class="tap44" icon="i-lucide-copy" aria-label="Copy webhook URL" @click="copyText(gitSource.webhook_url, 'Webhook URL')" />
               </div>
             </div>
 
@@ -409,30 +409,30 @@ const detectedAccordionValue = computed(() => {
                   <span class="min-w-0 flex-1 truncate rounded-md border border-line bg-surface-sunken px-3 py-1.5 font-mono text-sm text-content-primary">
                     {{ revealedSecret }}
                   </span>
-                  <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy secret" @click="copyText(revealedSecret, 'Webhook secret')" />
+                  <UButton size="sm" color="neutral" variant="ghost" square class="tap44" icon="i-lucide-copy" aria-label="Copy secret" @click="copyText(revealedSecret, 'Webhook secret')" />
                 </div>
                 <div class="flex justify-end">
-                  <UButton size="xs" color="neutral" variant="ghost" @click="dismissRevealedSecret">Done, hide it</UButton>
+                  <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="dismissRevealedSecret">Done, hide it</UButton>
                 </div>
               </div>
 
               <!-- Steady state: never readable again — rotate to see a new one. -->
-              <div v-else class="flex items-center gap-2">
+              <div v-else class="tap-row flex items-center gap-2">
                 <UBadge color="neutral" variant="subtle" class="gap-1">
                   <UIcon name="i-lucide-eye-off" class="size-3.5" />
                   Write-only — not shown
                 </UBadge>
                 <UPopover :open="rotateConfirmOpen" @update:open="(v: boolean) => (rotateConfirmOpen = v)">
-                  <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-rotate-cw">Rotate</UButton>
+                  <UButton size="sm" color="neutral" variant="ghost" class="tap44" icon="i-lucide-rotate-cw">Rotate</UButton>
                   <template #content>
                     <div class="flex max-w-64 flex-col gap-2 p-3">
                       <p class="text-xs text-content-secondary">
                         Rotate the webhook secret? Any webhook already configured on your forge will need updating with the
                         new value shown once here after rotating.
                       </p>
-                      <div class="flex justify-end gap-2">
-                        <UButton size="xs" color="neutral" variant="ghost" @click="rotateConfirmOpen = false">Cancel</UButton>
-                        <UButton size="xs" color="warning" :loading="rotateMutation.isPending.value" @click="rotateMutation.mutate()">Rotate</UButton>
+                      <div class="tap-row flex justify-end gap-2">
+                        <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="rotateConfirmOpen = false">Cancel</UButton>
+                        <UButton size="xs" color="warning" class="tap44" :loading="rotateMutation.isPending.value" @click="rotateMutation.mutate()">Rotate</UButton>
                       </div>
                     </div>
                   </template>
@@ -471,12 +471,12 @@ const detectedAccordionValue = computed(() => {
 
           <div class="flex flex-col gap-3">
             <UAlert v-if="deployError" color="error" variant="subtle" title="Deploy failed" :description="deployError" icon="i-lucide-alert-circle" />
-            <div class="flex items-center justify-between gap-4">
-              <p class="text-sm text-content-secondary">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p class="min-w-0 flex-1 text-sm break-words text-content-secondary">
                 Clones <span class="font-mono text-content-secondary">{{ gitSource.branch }}</span> right now and deploys it, without
                 waiting for a push.
               </p>
-              <UButton color="primary" variant="soft" icon="i-lucide-rocket" :loading="deployMutation.isPending.value" :disabled="deployMutation.isPending.value" @click="deployNow">
+              <UButton color="primary" variant="soft" class="tap44" icon="i-lucide-rocket" :loading="deployMutation.isPending.value" :disabled="deployMutation.isPending.value" @click="deployNow">
                 Deploy now
               </UButton>
             </div>
@@ -488,7 +488,7 @@ const detectedAccordionValue = computed(() => {
           <template #header>
             <div class="flex items-center justify-between">
               <h2 class="text-sm font-medium text-content-secondary">Recent deliveries</h2>
-              <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" :loading="deliveriesQuery.isFetching.value" @click="refreshDeliveries">
+              <UButton size="xs" color="neutral" variant="ghost" class="tap44" icon="i-lucide-refresh-cw" :loading="deliveriesQuery.isFetching.value" @click="refreshDeliveries">
                 Refresh
               </UButton>
             </div>
@@ -546,12 +546,12 @@ const detectedAccordionValue = computed(() => {
             <h2 class="text-sm font-medium text-status-error">Danger zone</h2>
           </template>
 
-          <div class="flex items-center justify-between gap-4">
-            <p class="text-sm text-content-secondary">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <p class="min-w-0 flex-1 text-sm break-words text-content-secondary">
               Disconnects this repo: the webhook stops accepting pushes and the stored secret/token are deleted. The app
               itself and its deployment history are untouched.
             </p>
-            <UButton color="error" variant="soft" icon="i-lucide-unlink" @click="disconnectOpen = true">Disconnect</UButton>
+            <UButton color="error" variant="soft" class="tap44" icon="i-lucide-unlink" @click="disconnectOpen = true">Disconnect</UButton>
           </div>
         </UCard>
       </template>

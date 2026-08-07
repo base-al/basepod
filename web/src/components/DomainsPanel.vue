@@ -136,15 +136,16 @@ function confirmDelete(id: number) {
           <h2 class="text-sm font-medium text-content-secondary">Generated domain</h2>
         </template>
 
-        <div class="flex flex-wrap items-center gap-2">
+        <div class="tap-row flex flex-wrap items-center gap-2">
           <span class="min-w-0 flex-1 truncate font-mono text-sm text-content-primary">{{ generated }}</span>
           <UBadge color="neutral" variant="subtle">Managed</UBadge>
-          <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy hostname" @click="copyGenerated" />
+          <UButton size="sm" color="neutral" variant="ghost" square class="tap44" icon="i-lucide-copy" aria-label="Copy hostname" @click="copyGenerated" />
           <UButton
             size="sm"
             color="neutral"
             variant="ghost"
             square
+            class="tap44"
             icon="i-lucide-external-link"
             :to="`https://${generated}`"
             target="_blank"
@@ -185,7 +186,7 @@ function confirmDelete(id: number) {
               </p>
               <p v-else-if="addError" class="mt-1 text-xs text-status-error">{{ addError }}</p>
             </div>
-            <UButton type="submit" color="primary" variant="soft" icon="i-lucide-plus" :loading="addMutation.isPending.value" :disabled="!hostnameValid || addMutation.isPending.value">
+            <UButton type="submit" color="primary" variant="soft" class="tap44" icon="i-lucide-plus" :loading="addMutation.isPending.value" :disabled="!hostnameValid || addMutation.isPending.value">
               Add domain
             </UButton>
           </form>
@@ -195,28 +196,30 @@ function confirmDelete(id: number) {
           </div>
 
           <ul v-else class="flex flex-col gap-2">
-            <li v-for="domain in custom" :key="domain.id" class="flex items-center gap-2 rounded-lg border border-line px-3 py-2">
+            <li v-for="domain in custom" :key="domain.id" class="tap-row flex items-center gap-2 rounded-lg border border-line px-3 py-2">
               <span class="min-w-0 flex-1 truncate font-mono text-sm text-content-primary">{{ domain.hostname }}</span>
               <UButton
                 size="sm"
                 color="neutral"
                 variant="ghost"
                 square
+                class="tap44"
                 icon="i-lucide-external-link"
                 :to="`https://${domain.hostname}`"
                 target="_blank"
                 :aria-label="`Open ${domain.hostname}`"
               />
               <UPopover :open="confirmOpenId === domain.id" @update:open="(v: boolean) => (confirmOpenId = v ? domain.id : null)">
-                <UButton size="sm" color="error" variant="ghost" square icon="i-lucide-trash-2" :aria-label="`Delete ${domain.hostname}`" />
+                <UButton size="sm" color="error" variant="ghost" square class="tap44" icon="i-lucide-trash-2" :aria-label="`Delete ${domain.hostname}`" />
                 <template #content>
                   <div class="flex flex-col gap-2 p-3">
                     <p class="text-xs text-content-secondary">Remove <span class="font-mono">{{ domain.hostname }}</span>?</p>
-                    <div class="flex justify-end gap-2">
-                      <UButton size="xs" color="neutral" variant="ghost" @click="confirmOpenId = null">Cancel</UButton>
+                    <div class="tap-row flex justify-end gap-2">
+                      <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="confirmOpenId = null">Cancel</UButton>
                       <UButton
                         size="xs"
                         color="error"
+                        class="tap44"
                         :loading="deleteMutation.isPending.value && deletingId === domain.id"
                         @click="confirmDelete(domain.id)"
                       >
