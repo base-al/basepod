@@ -206,6 +206,34 @@
   --ease-in-soft: cubic-bezier(0.4, 0, 1, 1);
 }
 
+/* Nuxt UI's neutral palette alias. The Vite plugin is told `neutral:
+   'ink'` (see theme.ts uiColors), but it emits the resulting
+   --ui-color-neutral-* aliases inside a prunable @theme block, and
+   Tailwind can't see them being "used" — nothing references them from
+   markup, only other custom properties do (--ui-border, --ui-bg,
+   --ui-text, ...), and a var() chain is opaque to the scanner. So the
+   aliases were dropped from the build while the rules depending on them
+   survived, leaving every Nuxt UI neutral token an unresolvable var():
+   borders fell back to `currentColor` (near-white text -> white borders
+   and dividers) and surfaces to transparent. Declaring them here, in
+   plain CSS outside @theme, puts them beyond the pruner's reach.
+   Theme-independent on purpose: light/dark switches one level up, by
+   picking a different stop (--ui-border is neutral-200 light,
+   neutral-800 dark). */
+:root {
+  --ui-color-neutral-50: var(--color-ink-50);
+  --ui-color-neutral-100: var(--color-ink-100);
+  --ui-color-neutral-200: var(--color-ink-200);
+  --ui-color-neutral-300: var(--color-ink-300);
+  --ui-color-neutral-400: var(--color-ink-400);
+  --ui-color-neutral-500: var(--color-ink-500);
+  --ui-color-neutral-600: var(--color-ink-600);
+  --ui-color-neutral-700: var(--color-ink-700);
+  --ui-color-neutral-800: var(--color-ink-800);
+  --ui-color-neutral-900: var(--color-ink-900);
+  --ui-color-neutral-950: var(--color-ink-950);
+}
+
 /* --- Semantic tokens: dark (default) ------------------------------- */
 :root {
   color-scheme: dark;
@@ -238,6 +266,21 @@
   --bp-status-error-bg: color-mix(in srgb, #f0567b 14%, var(--bp-surface));
   --bp-status-stopped: #a8a39b;
   --bp-status-stopped-bg: color-mix(in srgb, #a8a39b 14%, var(--bp-surface));
+
+  /* Nuxt UI's semantic color roles. Same pruning problem as the neutral
+     aliases above: the plugin emits these from the Nuxt-only `#build/ui.css`
+     virtual module, which the Vite integration leaves undefined here, so
+     `color="primary"` / `color="error"` components rendered with a
+     transparent fill and currentColor text. Pointed at the --bp-* stops
+     rather than a raw palette shade because those are the ones already
+     calibrated to AA against this theme's ground (see uiColors in
+     theme.ts for which palette each role is meant to be). */
+  --ui-primary: var(--bp-accent);
+  --ui-secondary: var(--bp-content-secondary);
+  --ui-success: var(--bp-status-running);
+  --ui-warning: var(--bp-status-deploying);
+  --ui-error: var(--bp-status-error);
+  --ui-info: var(--bp-accent);
 }
 
 /* --- Semantic tokens: light ------------------------------------------ */
