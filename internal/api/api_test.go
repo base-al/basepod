@@ -418,7 +418,7 @@ func newTestServerWithStats(t *testing.T, st *store.Store, dep Deployer, routes 
 // batch-stats route the apps-list sparklines subscribe to).
 func newTestServerWithAllStats(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource, allStats AllStatsProvider) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder, gitFetcher, stats, allStats))
+	srv := httptest.NewServer(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, logs, builder, gitFetcher, stats, allStats, SystemInfo{}))
 	t.Cleanup(srv.Close)
 	return srv
 }

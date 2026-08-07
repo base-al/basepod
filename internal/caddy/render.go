@@ -20,7 +20,18 @@ type DashboardRoute struct {
 	Upstream string
 }
 
-const AdminSocket = "unix//var/run/caddy/admin.sock"
+// AdminSocketPath is the absolute path, inside the bp-caddy container, of
+// Caddy's admin API unix socket — the container-local counterpart to
+// AdminSocket's Caddy-dial-string form below ("unix/" + this path,
+// mirroring DashboardSockDial's own "unix/" + path pattern). Manager.Health
+// probes this path directly via `curl --unix-socket` (through the same
+// podman-exec path Apply uses for reloads): the dial-string form is what
+// Caddy's own JSON config wants, but a plain filesystem path is what a
+// curl argument wants, so both forms are kept as named constants rather
+// than one being derived ad hoc from the other at each call site.
+const AdminSocketPath = "/var/run/caddy/admin.sock"
+
+const AdminSocket = "unix/" + AdminSocketPath
 
 // Typed structs for stable JSON field ordering
 type Admin struct {

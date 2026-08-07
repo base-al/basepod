@@ -175,7 +175,7 @@ paths:
     get:
       operationId: getSystemStatus
       tags: [system]
-      summary: Version, podman connectivity, and app count
+      summary: Version, podman/Caddy connectivity, app count, and domains
       responses:
         "200":
           description: System status
@@ -1214,8 +1214,24 @@ components:
       type: object
       properties:
         version: { type: string }
-        podman: { type: string, description: "podman daemon status/version, or an error string if unreachable." }
+        podman: { type: string, description: "podman daemon status: \"ok\", or the fixed string \"error\" (detail is redacted and logged server-side, never relayed to the client — it can carry infrastructure detail such as a local unix socket path)." }
         apps: { type: integer }
+        root_domain: { type: string, description: "The root domain this instance deploys apps under." }
+        dashboard_domain:
+          type: string
+          description: >-
+            Either the hostname Caddy is actually proxying to this instance's own dashboard right now, or one of two
+            sentinel strings that are never valid hostnames themselves: "off" (the operator disabled the dashboard
+            route) or "unbound" (a domain is configured, but the dashboard's listener failed to bind at boot —
+            expected on macOS). Never a configured-but-inactive hostname: this field always reflects what's actually
+            in effect, not just what's stored in settings.
+        caddy:
+          type: string
+          description: >-
+            Caddy reachability, checked over its admin API unix socket (not inferred from "the dashboard loaded at
+            all"): "ok", "error: container not running", "error: admin unreachable", the fixed string "error" for any
+            other failure shape, or "unknown" if no check is wired up. As with podman, error detail beyond the
+            category itself is logged server-side, never relayed to the client.
 
     Volume:
       type: object

@@ -185,6 +185,38 @@ func TestResolveDashboardDomain(t *testing.T) {
 	}
 }
 
+// TestSystemDashboardDomain proves GET /system's dashboard_domain field
+// (issue #16) never echoes a configured-but-inactive stored hostname —
+// the exact honesty gap the issue exists for. Table-driven over the
+// three cases systemDashboardDomain must distinguish: the route actually
+// live (the hostname, verbatim), the operator having disabled it
+// (dashboardDomain == "", from resolveDashboardDomain's own "off"
+// handling), and — the case a naive "just report the resolved domain"
+// implementation would get wrong — a domain configured but NOT live
+// (routeActive false despite a non-empty dashboardDomain, exactly what
+// happens when prepareDashboardListener fails to bind, e.g. macOS): this
+// must resolve to the "unbound" sentinel, not the hostname, or the field
+// would claim the dashboard is reachable somewhere it demonstrably isn't.
+func TestSystemDashboardDomain(t *testing.T) {
+	cases := []struct {
+		name            string
+		dashboardDomain string
+		routeActive     bool
+		want            string
+	}{
+		{"active: route is live", "basepod.apps.example.com", true, "basepod.apps.example.com"},
+		{"disabled: operator set dashboard_domain to off", "", false, "off"},
+		{"unbound: configured but listener failed to bind", "basepod.apps.example.com", false, "unbound"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := systemDashboardDomain(tc.dashboardDomain, tc.routeActive); got != tc.want {
+				t.Errorf("systemDashboardDomain(%q, %v) = %q, want %q", tc.dashboardDomain, tc.routeActive, got, tc.want)
+			}
+		})
+	}
+}
+
 // shortTempDir returns a freshly created temp directory with a short
 // path, cleaned up via t.Cleanup. Unlike t.TempDir() (which nests under
 // this package's test binary path plus the test's own name, easily
