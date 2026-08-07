@@ -837,3 +837,90 @@ func TestApplyFailsAfterExhaustingReloadRetries(t *testing.T) {
 		t.Fatalf("exec called %d times, want %d", len(fe.calls), reloadAttempts)
 	}
 }
+
+// TestManagerHealth is table-driven over the three states an operator
+// needs distinguished (issue #16): bp-caddy not running at all (missing,
+// or inspected but not in the "running" state), running but its admin
+// API unreachable over its own unix socket, and genuinely healthy. Each
+// case asserts BOTH the returned error (nil for healthy; wrapping the
+// named sentinel otherwise, via errors.Is) and — for the two failure
+// cases — that Health actually short-circuits or proceeds as intended:
+// "not running" must never reach the exec probe at all (asserting
+// fe.calls stays empty), while "admin unreachable" must have actually
+// attempted it (fe.calls non-empty) — the check the task's instructions
+// call out explicitly: a test that can't tell "the probe ran and failed"
+// apart from "the probe was never wired up" isn't proving the check is
+// real.
+func TestManagerHealth(t *testing.T) {
+	cases := []struct {
+		name string
+
+		inspectInfo *podman.ContainerInfo
+		inspectErr  error
+		execErr     error
+
+		wantErr      error // nil means Health must return nil
+		wantExecCall bool
+	}{
+		{
+			name:         "healthy: running and admin answers",
+			inspectInfo:  &podman.ContainerInfo{State: "running"},
+			wantErr:      nil,
+			wantExecCall: true,
+		},
+		{
+			name:         "container missing entirely",
+			inspectErr:   podman.ErrNotFound,
+			wantErr:      ErrCaddyNotRunning,
+			wantExecCall: false,
+		},
+		{
+			name:         "container inspected but not running",
+			inspectInfo:  &podman.ContainerInfo{State: "exited"},
+			wantErr:      ErrCaddyNotRunning,
+			wantExecCall: false,
+		},
+		{
+			name:         "container running but admin unreachable",
+			inspectInfo:  &podman.ContainerInfo{State: "running"},
+			execErr:      errors.New(`podman exec: exit status 7: curl: (7) Failed to connect to localhost port 80: Connection refused`),
+			wantErr:      ErrCaddyAdminUnreachable,
+			wantExecCall: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fr := &fakeRuntime{inspectInfo: tc.inspectInfo, inspectErr: tc.inspectErr}
+			fe := &fakeExecer{err: tc.execErr}
+			mgr := NewManager(fr, fe.Exec, t.TempDir(), 8080, 8443, testInstanceID)
+
+			err := mgr.Health(context.Background())
+
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Health() = %v, want nil", err)
+				}
+			} else {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Health() = %v, want it to wrap %v", err, tc.wantErr)
+				}
+			}
+
+			gotExecCall := len(fe.calls) > 0
+			if gotExecCall != tc.wantExecCall {
+				t.Fatalf("exec called = %v (calls: %v), want %v", gotExecCall, fe.calls, tc.wantExecCall)
+			}
+			if tc.wantExecCall {
+				call := fe.calls[0]
+				if call[0] != ContainerName {
+					t.Errorf("exec container = %q, want %q", call[0], ContainerName)
+				}
+				argv := strings.Join(call, " ")
+				if !strings.Contains(argv, "curl") || !strings.Contains(argv, AdminSocketPath) {
+					t.Errorf("exec argv = %v, want it to run curl against %q", call, AdminSocketPath)
+				}
+			}
+		})
+	}
+}

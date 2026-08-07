@@ -605,6 +605,90 @@ func (m *Manager) Apply(ctx context.Context, routes []AppRoute, dashboard *Dashb
 	return fmt.Errorf("caddy: reload: %w", reloadErr)
 }
 
+// ErrCaddyNotRunning and ErrCaddyAdminUnreachable are the two distinct
+// failure modes Health (below) can report, wrapped into its returned
+// error via %w so a caller can tell them apart with errors.Is without
+// Health itself deciding how much of the underlying detail — e.g. a raw
+// podman-exec error, which can carry infrastructure detail the same way
+// a podman ping failure can (see internal/api/system.go's
+// handleSystem doc comment, audit finding L5) — is safe to hand an API
+// client. That redaction call belongs to the caller, same as it already
+// does for podman ping failures.
+var (
+	// ErrCaddyNotRunning means the bp-caddy container itself isn't up —
+	// missing entirely, or inspected but not in the "running" state.
+	// This is the container-lifecycle problem: no amount of Caddy config
+	// or admin-API state matters if the container isn't running at all.
+	ErrCaddyNotRunning = errors.New("caddy: bp-caddy container is not running")
+	// ErrCaddyAdminUnreachable means the container is running but its
+	// admin API didn't answer over its own unix socket within
+	// caddyHealthTimeoutSeconds — Caddy is wedged, still starting, or the
+	// admin socket never came up. A different, container-is-fine problem
+	// from ErrCaddyNotRunning.
+	ErrCaddyAdminUnreachable = errors.New("caddy: admin API did not respond over its unix socket")
+)
+
+// caddyHealthTimeoutSeconds bounds how long Health's admin-API probe
+// waits for a response, expressed as whole seconds (curl's --max-time
+// flag takes a plain number, not a Go time.Duration) since the probe
+// runs through m.exec — a podman-exec call — rather than an http.Client
+// Health could otherwise hand its own context deadline to directly.
+const caddyHealthTimeoutSeconds = "3"
+
+// Health reports whether Caddy is actually up, by asking it — replacing
+// the previous, circular signal ("the dashboard loaded at all", which
+// proves nothing if the dashboard route itself is disabled or unbound;
+// see internal/server's dashboard_domain handling). nil means healthy;
+// otherwise the returned error wraps exactly one of ErrCaddyNotRunning or
+// ErrCaddyAdminUnreachable — see their doc comments for what each means
+// and why an operator needs them told apart (issue #16).
+//
+// Checked in two steps: first, whether the bp-caddy container itself is
+// running at all (m.rt.InspectContainer, the same check Ensure already
+// makes); only if so, whether its admin API answers over its own unix
+// socket (AdminSocketPath) — reusing exactly the path Apply already uses
+// for reload (m.exec, a podman-exec call into the running container) but
+// running `curl --unix-socket <AdminSocketPath> http://localhost/config/`
+// instead of `caddy reload`. GET /config/ (https://caddyserver.com/docs/api)
+// is a plain read that reports Caddy's live config without mutating
+// anything, unlike reload — appropriate for a check that's expected to
+// run on every /system request rather than only when routes actually
+// change.
+//
+// curl, not wget (unlike CaddyProber in internal/deploy, which probes an
+// app's plain TCP upstream with wget --spider): only curl, of the two,
+// supports --unix-socket, which this check needs since Caddy's admin API
+// here is reachable exclusively over AdminSocketPath, never a TCP port
+// (see render.go's Config.Admin.Listen) — confirmed present in the
+// caddy:2.10-alpine image (verified 2026-08-07 via `podman run --rm
+// docker.io/library/caddy:2.10-alpine which curl`, alongside busybox
+// wget, which lacks unix-socket support). -f treats any HTTP status >=
+// 400 as failure (nonzero exit); --max-time bounds how long a wedged
+// Caddy process can block this call.
+func (m *Manager) Health(ctx context.Context) error {
+	info, err := m.rt.InspectContainer(ctx, ContainerName)
+	if err != nil {
+		if errors.Is(err, podman.ErrNotFound) {
+			return fmt.Errorf("%w: no such container", ErrCaddyNotRunning)
+		}
+		// Any other inspect failure (e.g. podman itself unreachable) also
+		// means "can't confirm bp-caddy is running" from an operator's
+		// point of view — the "podman" field on the same /system response
+		// separately surfaces a broken podman connection itself, so this
+		// doesn't need its own fourth state to say the same thing twice.
+		return fmt.Errorf("%w: inspecting container: %v", ErrCaddyNotRunning, err)
+	}
+	if info.State != "running" {
+		return fmt.Errorf("%w: state=%s", ErrCaddyNotRunning, info.State)
+	}
+
+	if err := m.exec(ctx, ContainerName, "curl", "-fsS", "--max-time", caddyHealthTimeoutSeconds,
+		"--unix-socket", AdminSocketPath, "http://localhost/config/", "-o", "/dev/null"); err != nil {
+		return fmt.Errorf("%w: %v", ErrCaddyAdminUnreachable, err)
+	}
+	return nil
+}
+
 // writeFileAtomic writes data to path via a temp-file-then-rename so a
 // concurrent reader (Caddy reloading) never observes a partial write.
 func writeFileAtomic(path string, data []byte) error {

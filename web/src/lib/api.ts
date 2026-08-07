@@ -212,11 +212,34 @@ export interface PutEnvResult {
   redeployRequired: boolean
 }
 
+/** GET /system's response shape (internal/api/system.go's systemResponse).
+ *
+ * `dashboard_domain` is either the live hostname Caddy is actually
+ * proxying to this instance's own dashboard right now, or one of two
+ * sentinel strings that are never valid hostnames themselves: "off" (the
+ * operator disabled the dashboard route) or "unbound" (a domain is
+ * configured but the dashboard's listener failed to bind at boot —
+ * expected on macOS, where podman machine's virtiofs bind mounts don't
+ * carry unix sockets across the VM boundary). Never a configured-but-
+ * inactive hostname (issue #16) — see DASHBOARD_DOMAIN_SENTINELS below.
+ *
+ * `caddy` mirrors `podman`'s "ok" / fixed-string-on-error shape, extended
+ * to distinguish the three states an operator needs told apart: "ok",
+ * "error: container not running", "error: admin unreachable", the fixed
+ * string "error" for any other failure shape, or "unknown" if no check
+ * is wired up server-side. */
 export interface SystemInfo {
   version: string
   podman: string
   apps: number
+  root_domain: string
+  dashboard_domain: string
+  caddy: string
 }
+
+/** dashboard_domain's two non-hostname sentinel values — see SystemInfo's
+ * doc comment. Anything else is a live hostname. */
+export const DASHBOARD_DOMAIN_SENTINELS = { disabled: 'off', unbound: 'unbound' } as const
 
 /** An app's connected git repo config, in the exact wire shape
  * internal/api/git.go's gitSourceResponse returns from PUT, GET, and

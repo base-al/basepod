@@ -292,6 +292,12 @@ type api struct {
 	// to finish before asserting on its effects, rather than polling or
 	// sleeping.
 	composeWG sync.WaitGroup
+
+	// sysInfo bundles the instance-level facts GET /system reports beyond
+	// podman/app-count (root domain, dashboard domain/status, Caddy
+	// health) — see system.go's SystemInfo doc comment for why these
+	// travel together as one value rather than four more fields here.
+	sysInfo SystemInfo
 }
 
 // New builds the BasePod REST API v1 handler, mounted under /api/v1.
@@ -299,8 +305,10 @@ type api struct {
 // 503 "git_unavailable" (see the gitFetcher field's doc comment) — the
 // production caller (internal/server.Run) always passes a real
 // *gitsource.Cloner, itself gracefully degraded (not nil) when the git
-// binary isn't installed.
-func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource, allStats AllStatsProvider) http.Handler {
+// binary isn't installed. sysInfo is the instance-level facts bundle GET
+// /system reports beyond podman/app-count — see SystemInfo's doc comment
+// (system.go).
+func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(appID int64, key, value string) (string, error), open func(appID int64, key, sealed string) (string, error), routes RoutesApplier, logs LogSource, builder *build.Builder, gitFetcher GitFetcher, stats StatsSource, allStats AllStatsProvider, sysInfo SystemInfo) http.Handler {
 	a := &api{
 		st:             st,
 		dep:            dep,
@@ -318,6 +326,7 @@ func New(st *store.Store, dep Deployer, ping Pinger, version string, seal func(a
 		gitFetcher:     gitFetcher,
 		stats:          stats,
 		allStats:       allStats,
+		sysInfo:        sysInfo,
 	}
 	return newRouter(a)
 }

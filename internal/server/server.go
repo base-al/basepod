@@ -317,6 +317,20 @@ func Run(ctx context.Context, cfgPath string) error {
 		return fmt.Errorf("server: apply routes: %w", err)
 	}
 
+	// sysInfo bundles the instance-level facts GET /system reports beyond
+	// podman/app-count (issue #16): rootDomain (always set — Run refuses
+	// to boot without one, above), the dashboard domain as actually in
+	// effect right now (systemDashboardDomain — never the raw stored
+	// setting when it isn't live), and mgr itself as the Caddy health
+	// prober (mgr satisfies api.CaddyHealthChecker via its own Health
+	// method, which reuses the same podman-exec path Apply already uses
+	// for reloads — see caddy.Manager.Health's doc comment).
+	sysInfo := api.SystemInfo{
+		RootDomain:      rootDomain,
+		DashboardDomain: systemDashboardDomain(dashboardDomain, dashboardRoute != nil),
+		CaddyHealth:     mgr,
+	}
+
 	// handler is shared by both listeners. The public loopback listener
 	// (cfg.Listen) serves it as-is — untrusted. The dashboard's
 	// unix-socket listener, reachable only by bp-caddy's container (see
@@ -328,7 +342,7 @@ func Run(ctx context.Context, cfgPath string) error {
 	// there is no header or other client-controlled input that can spoof
 	// it, since a request reaching the loopback listener never touches
 	// TrustedProxyMiddleware at all.
-	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder, gitCloner, engine.AppStats, engine))
+	handler := rootHandler(api.New(st, engine, pc.Ping, Version, encrypt, decrypt, engine, engine.AppLogs, builder, gitCloner, engine.AppStats, engine, sysInfo))
 	srv := newHTTPServer(cfg.Listen, handler)
 
 	// dashboardSrv is a second *http.Server sharing every setting
@@ -499,6 +513,38 @@ func resolveDashboardDomain(current, rootDomain string) (domain string, writeDef
 		return "", false
 	default:
 		return current, false
+	}
+}
+
+// systemDashboardDomain resolves what GET /system's "dashboard_domain"
+// field reports (issue #16): the live hostname when the dashboard route
+// is actually up right now, or one of two sentinel strings — "off" (the
+// operator disabled it) or "unbound" (a domain is configured but the
+// unix-socket listener failed to bind, e.g. macOS — see
+// prepareDashboardListener's doc comment) — that are never valid
+// hostnames themselves, mirroring the dashboard_domain SETTING's own
+// pre-existing "off" sentinel (see resolveDashboardDomain above) rather
+// than inventing a second, parallel vocabulary or a separate status
+// field.
+//
+// dashboardDomain is resolveDashboardDomain's own result (""  when the
+// setting is "off", the resolved hostname otherwise); routeActive is
+// whether Run actually got as far as building a non-nil dashboardRoute
+// for that hostname (both the setting isn't "off" AND
+// prepareDashboardListener succeeded — see Run's dashboardRoute
+// construction). The critical case this function exists for: a
+// configured-but-unbound hostname must never be echoed back as if it
+// were live (routeActive false with a non-empty dashboardDomain resolves
+// to "unbound", not the hostname) — reporting it would tell an operator
+// their dashboard is reachable at a domain it demonstrably isn't.
+func systemDashboardDomain(dashboardDomain string, routeActive bool) string {
+	switch {
+	case dashboardDomain == "":
+		return "off"
+	case routeActive:
+		return dashboardDomain
+	default:
+		return "unbound"
 	}
 }
 
