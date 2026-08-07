@@ -90,12 +90,12 @@ async function handleLogout() {
         <BasepodWordmark :height="18" aria-hidden="true" />
       </RouterLink>
 
-      <nav class="flex flex-col px-2" aria-label="Primary">
+      <nav class="flex flex-col px-2 pointer-coarse:gap-1" aria-label="Primary">
         <RouterLink
           v-for="item in navItems"
           :key="item.label"
           :to="item.to"
-          class="flex items-center gap-2.5 rounded-md border-l-2 px-3 py-2 text-sm font-medium transition-colors duration-180 ease-out-snap focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          class="tap44 flex items-center gap-2.5 rounded-md border-l-2 px-3 py-2 text-sm font-medium transition-colors duration-180 ease-out-snap focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           :class="
             isActive(item.matches)
               ? 'border-accent bg-accent/10 text-content-primary'
@@ -126,17 +126,18 @@ async function handleLogout() {
           <span v-else class="text-content-muted">checking…</span>
         </div>
 
-        <div class="flex items-center gap-1">
+        <div class="tap-row flex items-center gap-1">
           <UButton
             color="neutral"
             variant="ghost"
             square
             size="sm"
+            class="tap44"
             :icon="mode === 'dark' ? 'i-lucide-sun' : 'i-lucide-moon'"
             :aria-label="mode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
             @click="toggle"
           />
-          <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-log-out" @click="handleLogout">
+          <UButton color="neutral" variant="ghost" size="sm" class="tap44" icon="i-lucide-log-out" @click="handleLogout">
             Logout
           </UButton>
         </div>
@@ -154,7 +155,7 @@ async function handleLogout() {
       <RouterLink
         :to="{ name: 'apps' }"
         aria-label="BasePod — home"
-        class="flex shrink-0 items-center gap-2 rounded-md py-1 transition-opacity duration-120 ease-out-snap hover:opacity-85 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        class="tap44 flex shrink-0 items-center gap-2 rounded-md py-1 transition-opacity duration-120 ease-out-snap hover:opacity-85 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
       >
         <BasepodMark :size="22" :tone="podmanOk ? 'accent' : 'error'" aria-hidden="true" />
         <span class="font-mono text-sm font-semibold text-content-primary">basepod</span>
@@ -167,12 +168,13 @@ async function handleLogout() {
         role="img"
       />
 
-      <div class="ml-auto flex items-center gap-1">
+      <div class="tap-row ml-auto flex items-center gap-1">
         <UButton
           color="neutral"
           variant="ghost"
           square
           size="sm"
+          class="tap44"
           :icon="mode === 'dark' ? 'i-lucide-sun' : 'i-lucide-moon'"
           :aria-label="mode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
           @click="toggle"
@@ -182,6 +184,7 @@ async function handleLogout() {
           variant="ghost"
           square
           size="sm"
+          class="tap44"
           icon="i-lucide-log-out"
           aria-label="Logout"
           @click="handleLogout"

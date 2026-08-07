@@ -284,7 +284,7 @@ function onSubmit() {
   <div class="min-h-screen bg-surface">
     <header class="sticky top-0 z-10 border-b border-line bg-surface/90 backdrop-blur">
       <div class="mx-auto flex max-w-2xl items-center gap-3 px-6 py-3" :class="sourceMode === 'compose' && 'max-w-3xl'">
-        <UButton to="/" color="neutral" variant="ghost" square size="sm" icon="i-lucide-arrow-left" aria-label="Back to apps" />
+        <UButton to="/" color="neutral" variant="ghost" square size="sm" class="tap44" icon="i-lucide-arrow-left" aria-label="Back to apps" />
         <span class="text-base font-semibold tracking-tight text-content-primary">New app</span>
       </div>
     </header>
@@ -306,7 +306,13 @@ function onSubmit() {
           </p>
 
           <UFormField label="Source">
-            <URadioGroup v-model="sourceMode" :items="sourceItems" orientation="horizontal" :disabled="submitting" />
+            <URadioGroup
+              v-model="sourceMode"
+              :items="sourceItems"
+              orientation="horizontal"
+              :disabled="submitting"
+              :ui="{ fieldset: 'pointer-coarse:gap-y-3', item: 'tap44' }"
+            />
           </UFormField>
 
           <UFormField v-if="sourceMode === 'image'" label="Image" name="image" :error="fieldErrors.image || undefined">
@@ -349,9 +355,9 @@ function onSubmit() {
 
           <UAlert v-if="generalError" color="error" variant="subtle" :title="generalError" icon="i-lucide-alert-circle" />
 
-          <div class="flex justify-end gap-2">
-            <UButton to="/" color="neutral" variant="ghost" :disabled="submitting">Cancel</UButton>
-            <UButton type="submit" color="primary" :loading="submitting" :disabled="!formValid || submitting">
+          <div class="tap-row flex justify-end gap-2">
+            <UButton to="/" color="neutral" variant="ghost" class="tap44" :disabled="submitting">Cancel</UButton>
+            <UButton type="submit" color="primary" class="tap44" :loading="submitting" :disabled="!formValid || submitting">
               {{ sourceMode === 'image' ? 'Create & deploy' : 'Upload & deploy' }}
             </UButton>
           </div>
@@ -365,7 +371,13 @@ function onSubmit() {
              plan below. -->
         <form v-else class="flex flex-col gap-5" novalidate @submit.prevent="onSubmit">
           <UFormField label="Source">
-            <URadioGroup v-model="sourceMode" :items="sourceItems" orientation="horizontal" :disabled="submitting" />
+            <URadioGroup
+              v-model="sourceMode"
+              :items="sourceItems"
+              orientation="horizontal"
+              :disabled="submitting"
+              :ui="{ fieldset: 'pointer-coarse:gap-y-3', item: 'tap44' }"
+            />
           </UFormField>
 
           <template v-if="composePhase === 'idle' || composePhase === 'dry-running'">
@@ -400,9 +412,9 @@ function onSubmit() {
 
             <UAlert v-if="composeError" color="error" variant="subtle" :title="composeError" icon="i-lucide-alert-circle" />
 
-            <div class="flex justify-end gap-2">
-              <UButton to="/" color="neutral" variant="ghost" :disabled="submitting">Cancel</UButton>
-              <UButton type="submit" color="primary" icon="i-lucide-eye" :loading="submitting" :disabled="!formValid || submitting">
+            <div class="tap-row flex justify-end gap-2">
+              <UButton to="/" color="neutral" variant="ghost" class="tap44" :disabled="submitting">Cancel</UButton>
+              <UButton type="submit" color="primary" class="tap44" icon="i-lucide-eye" :loading="submitting" :disabled="!formValid || submitting">
                 Preview plan
               </UButton>
             </div>
@@ -418,11 +430,11 @@ function onSubmit() {
               <span class="text-xs text-content-muted">Applying…</span>
             </div>
 
-            <div class="flex justify-end gap-2">
-              <UButton v-if="composePhase === 'preview'" color="neutral" variant="ghost" :disabled="submitting" @click="resetCompose">
+            <div class="tap-row flex justify-end gap-2">
+              <UButton v-if="composePhase === 'preview'" color="neutral" variant="ghost" class="tap44" :disabled="submitting" @click="resetCompose">
                 Back
               </UButton>
-              <UButton v-if="composePhase === 'applied'" color="primary" icon="i-lucide-check" to="/">Done</UButton>
+              <UButton v-if="composePhase === 'applied'" color="primary" class="tap44" icon="i-lucide-check" to="/">Done</UButton>
             </div>
           </template>
         </form>

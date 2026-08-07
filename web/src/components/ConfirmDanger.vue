@@ -65,11 +65,11 @@ function onConfirm() {
     </template>
 
     <template #footer>
-      <div class="flex w-full justify-end gap-2">
-        <UButton color="neutral" variant="ghost" :disabled="loading" @click="emit('update:open', false)">
+      <div class="tap-row flex w-full justify-end gap-2">
+        <UButton color="neutral" variant="ghost" class="tap44" :disabled="loading" @click="emit('update:open', false)">
           Cancel
         </UButton>
-        <UButton color="error" :disabled="typed !== confirmText" :loading="loading" @click="onConfirm">
+        <UButton color="error" class="tap44" :disabled="typed !== confirmText" :loading="loading" @click="onConfirm">
           {{ confirmLabel }}
         </UButton>
       </div>

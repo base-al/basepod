@@ -183,7 +183,7 @@ function confirmRollback(number: number) {
       <button
         v-if="row.original.error"
         type="button"
-        class="max-w-md text-left text-xs text-status-error hover:underline"
+        class="tap44 max-w-md rounded-xs text-left text-xs text-status-error hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         :title="row.original.error"
         @click="toggle(row.original.number)"
       >
@@ -193,12 +193,13 @@ function confirmRollback(number: number) {
     </template>
 
     <template #actions-cell="{ row }">
-      <div class="flex items-center justify-end gap-1.5">
+      <div class="tap-row flex items-center justify-end gap-1.5">
         <UButton
           v-if="row.original.has_build_log"
           size="xs"
           color="neutral"
           variant="ghost"
+          class="tap44"
           :icon="row.getIsExpanded() ? 'i-lucide-chevron-up' : 'i-lucide-terminal'"
           @click="toggleBuildLog(row.original.number)"
         >
@@ -214,6 +215,7 @@ function confirmRollback(number: number) {
             size="xs"
             color="neutral"
             variant="ghost"
+            class="tap44"
             icon="i-lucide-history"
             :loading="rollbackMutation.isPending.value && rollingBackToNumber === row.original.number"
             :disabled="rollbackMutation.isPending.value"
@@ -226,11 +228,12 @@ function confirmRollback(number: number) {
                 Roll back to deployment <span class="font-mono">#{{ row.original.number }}</span>?
               </p>
               <p class="max-w-64 text-xs text-content-muted">This redeploys the image from that deployment as a new deployment.</p>
-              <div class="flex justify-end gap-2">
-                <UButton size="xs" color="neutral" variant="ghost" @click="confirmOpenNumber = null">Cancel</UButton>
+              <div class="tap-row flex justify-end gap-2">
+                <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="confirmOpenNumber = null">Cancel</UButton>
                 <UButton
                   size="xs"
                   color="warning"
+                  class="tap44"
                   :loading="rollbackMutation.isPending.value && rollingBackToNumber === row.original.number"
                   @click="confirmRollback(row.original.number)"
                 >

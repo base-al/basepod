@@ -196,7 +196,7 @@ function save() {
             :color="memoryError ? 'error' : undefined"
             @update:model-value="(v: string | number) => { form!.memoryMB = Number(v); lastTyped.memoryMB = Number(v) }"
           />
-          <USwitch :model-value="form.memoryUnlimited" label="Unlimited" @update:model-value="(v: boolean) => onToggleUnlimited('memory', v)" />
+          <USwitch :model-value="form.memoryUnlimited" label="Unlimited" class="tap44" @update:model-value="(v: boolean) => onToggleUnlimited('memory', v)" />
           <p v-if="memoryError" class="text-xs text-status-error">{{ memoryError }}</p>
         </div>
 
@@ -212,7 +212,7 @@ function save() {
             :color="cpuError ? 'error' : undefined"
             @update:model-value="(v: string | number) => { form!.cpu = Number(v); lastTyped.cpu = Number(v) }"
           />
-          <USwitch :model-value="form.cpuUnlimited" label="Unlimited" @update:model-value="(v: boolean) => onToggleUnlimited('cpu', v)" />
+          <USwitch :model-value="form.cpuUnlimited" label="Unlimited" class="tap44" @update:model-value="(v: boolean) => onToggleUnlimited('cpu', v)" />
           <p v-if="cpuError" class="text-xs text-status-error">{{ cpuError }}</p>
         </div>
 
@@ -227,7 +227,7 @@ function save() {
             :color="pidsError ? 'error' : undefined"
             @update:model-value="(v: string | number) => { form!.pids = Number(v); lastTyped.pids = Number(v) }"
           />
-          <USwitch :model-value="form.pidsUnlimited" label="Unlimited" @update:model-value="(v: boolean) => onToggleUnlimited('pids', v)" />
+          <USwitch :model-value="form.pidsUnlimited" label="Unlimited" class="tap44" @update:model-value="(v: boolean) => onToggleUnlimited('pids', v)" />
           <p v-if="pidsError" class="text-xs text-status-error">{{ pidsError }}</p>
         </div>
       </div>
@@ -236,6 +236,7 @@ function save() {
         <UButton
           color="primary"
           icon="i-lucide-save"
+          class="tap44"
           :loading="saveMutation.isPending.value"
           :disabled="hasErrors || !isDirty || saveMutation.isPending.value"
           @click="save"

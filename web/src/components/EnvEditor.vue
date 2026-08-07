@@ -313,7 +313,7 @@ function save() {
       icon="i-lucide-alert-triangle"
     >
       <template #actions>
-        <UButton size="sm" color="warning" variant="solid" icon="i-lucide-rocket" :loading="props.deploying" :disabled="props.deploying" @click="emit('redeploy')">
+        <UButton size="sm" color="warning" variant="solid" class="tap44" icon="i-lucide-rocket" :loading="props.deploying" :disabled="props.deploying" @click="emit('redeploy')">
           Redeploy
         </UButton>
       </template>
@@ -344,6 +344,7 @@ function save() {
             size="sm"
             color="neutral"
             variant="ghost"
+            class="tap44"
             :icon="bulkMode ? 'i-lucide-table' : 'i-lucide-file-text'"
             @click="bulkMode ? cancelBulkMode() : enterBulkMode()"
           >
@@ -360,9 +361,9 @@ function save() {
           secret rows untouched unless you retype their key, which demotes them to a plain value.
         </p>
         <UTextarea v-model="bulkText" :rows="12" class="w-full font-mono text-xs" placeholder="DATABASE_URL=postgres://...&#10;# a comment&#10;FEATURE_FLAG=on" />
-        <div class="flex justify-end gap-2">
-          <UButton size="sm" color="neutral" variant="ghost" @click="cancelBulkMode">Cancel</UButton>
-          <UButton size="sm" color="primary" variant="soft" @click="applyBulk">Apply</UButton>
+        <div class="tap-row flex justify-end gap-2">
+          <UButton size="sm" color="neutral" variant="ghost" class="tap44" @click="cancelBulkMode">Cancel</UButton>
+          <UButton size="sm" color="primary" variant="soft" class="tap44" @click="applyBulk">Apply</UButton>
         </div>
       </div>
 
@@ -372,7 +373,16 @@ function save() {
         </div>
 
         <div v-for="row in rows" :key="row.id" class="flex flex-col gap-1.5 rounded-lg border border-line p-3">
-          <div class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+          <!-- Below sm, this stacks into three lines (key / value / switch
+               +remove) instead of the wrap-happy single row it used to be —
+               a masked-value row with a "Replace value" button next to it
+               used to wrap key onto its own line and dump value+switch+
+               remove onto a second, cramming the two hardest-to-hit
+               controls (switch, remove) against each other. `sm:contents`
+               on the two inner wrappers below dissolves them at the sm
+               breakpoint, so desktop gets back the exact original flat
+               single row. -->
+          <div class="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
             <UInput
               v-model="row.key"
               placeholder="MY_VAR"
@@ -383,55 +393,65 @@ function save() {
               :color="rowErrors.get(row.id) ? 'error' : undefined"
             />
 
-            <template v-if="row.masked">
-              <span class="min-w-0 flex-1 select-none rounded-md border border-line bg-surface-elevated/50 px-3 py-1.5 font-mono text-sm tracking-widest text-content-muted">
-                ●●●●●●●●
-              </span>
-              <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-pencil" @click="replaceValue(row)">
-                Replace value
-              </UButton>
-            </template>
-            <UInput
-              v-else
-              v-model="row.value"
-              placeholder="value"
-              autocomplete="off"
-              spellcheck="false"
-              class="w-full min-w-0 flex-1 font-mono"
-              :type="row.isSecret ? 'password' : 'text'"
-            />
-
-            <USwitch :model-value="row.isSecret" label="Secret" class="shrink-0" @update:model-value="(v: boolean) => onToggleSecret(row, v)" />
-
-            <UButton
-              v-if="row.originalKey === null"
-              size="sm"
-              color="error"
-              variant="ghost"
-              square
-              icon="i-lucide-trash-2"
-              aria-label="Remove variable"
-              @click="removeRow(row.id)"
-            />
-            <UPopover v-else :open="confirmRemoveId === row.id" @update:open="(v: boolean) => (confirmRemoveId = v ? row.id : null)">
-              <UButton size="sm" color="error" variant="ghost" square icon="i-lucide-trash-2" :aria-label="`Remove ${row.originalKey}`" />
-              <template #content>
-                <div class="flex flex-col gap-2 p-3">
-                  <p class="max-w-56 text-xs text-content-secondary">
-                    Remove <span class="font-mono">{{ row.originalKey }}</span>? Its stored value will be deleted on save.
-                  </p>
-                  <div class="flex justify-end gap-2">
-                    <UButton size="xs" color="neutral" variant="ghost" @click="confirmRemoveId = null">Cancel</UButton>
-                    <UButton size="xs" color="error" @click="removeRow(row.id)">Remove</UButton>
-                  </div>
-                </div>
+            <div class="flex items-center gap-2 sm:contents">
+              <template v-if="row.masked">
+                <span class="min-w-0 flex-1 select-none rounded-md border border-line bg-surface-elevated/50 px-3 py-1.5 font-mono text-sm tracking-widest text-content-muted">
+                  ●●●●●●●●
+                </span>
+                <UButton size="sm" color="neutral" variant="ghost" class="tap44" icon="i-lucide-pencil" @click="replaceValue(row)">
+                  Replace value
+                </UButton>
               </template>
-            </UPopover>
+              <UInput
+                v-else
+                v-model="row.value"
+                placeholder="value"
+                autocomplete="off"
+                spellcheck="false"
+                class="w-full min-w-0 flex-1 font-mono"
+                :type="row.isSecret ? 'password' : 'text'"
+              />
+            </div>
+
+            <div class="flex items-center justify-between gap-2 sm:contents">
+              <USwitch
+                :model-value="row.isSecret"
+                label="Secret"
+                class="tap44 shrink-0"
+                @update:model-value="(v: boolean) => onToggleSecret(row, v)"
+              />
+
+              <UButton
+                v-if="row.originalKey === null"
+                size="sm"
+                color="error"
+                variant="ghost"
+                square
+                class="tap44"
+                icon="i-lucide-trash-2"
+                aria-label="Remove variable"
+                @click="removeRow(row.id)"
+              />
+              <UPopover v-else :open="confirmRemoveId === row.id" @update:open="(v: boolean) => (confirmRemoveId = v ? row.id : null)">
+                <UButton size="sm" color="error" variant="ghost" square class="tap44" icon="i-lucide-trash-2" :aria-label="`Remove ${row.originalKey}`" />
+                <template #content>
+                  <div class="flex flex-col gap-2 p-3">
+                    <p class="max-w-56 text-xs text-content-secondary">
+                      Remove <span class="font-mono">{{ row.originalKey }}</span>? Its stored value will be deleted on save.
+                    </p>
+                    <div class="tap-row flex justify-end gap-2">
+                      <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="confirmRemoveId = null">Cancel</UButton>
+                      <UButton size="xs" color="error" class="tap44" @click="removeRow(row.id)">Remove</UButton>
+                    </div>
+                  </div>
+                </template>
+              </UPopover>
+            </div>
           </div>
           <p v-if="rowErrors.get(row.id)" class="pl-1 text-xs text-status-error">{{ rowErrors.get(row.id) }}</p>
         </div>
 
-        <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-plus" class="self-start" @click="addRow">
+        <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-plus" class="tap44 self-start" @click="addRow">
           Add variable
         </UButton>
       </div>
@@ -440,6 +460,7 @@ function save() {
         <UButton
           color="primary"
           icon="i-lucide-save"
+          class="tap44"
           :loading="saveMutation.isPending.value"
           :disabled="bulkMode || hasErrors || !isRowsDirty || saveMutation.isPending.value"
           @click="save"
@@ -464,9 +485,9 @@ function save() {
     </template>
 
     <template #footer>
-      <div class="flex w-full justify-end gap-2">
-        <UButton color="neutral" variant="ghost" @click="cancelBulkDemote">Cancel</UButton>
-        <UButton color="warning" @click="confirmBulkDemote">Demote and apply</UButton>
+      <div class="tap-row flex w-full justify-end gap-2">
+        <UButton color="neutral" variant="ghost" class="tap44" @click="cancelBulkDemote">Cancel</UButton>
+        <UButton color="warning" class="tap44" @click="confirmBulkDemote">Demote and apply</UButton>
       </div>
     </template>
   </UModal>

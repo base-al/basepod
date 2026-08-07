@@ -113,7 +113,7 @@ function confirmRevoke(session: Session) {
             :open="confirmOpenId === row.original.id"
             @update:open="(v: boolean) => (confirmOpenId = v ? row.original.id : null)"
           >
-            <UButton size="xs" color="error" variant="ghost" icon="i-lucide-log-out" :disabled="revokeMutation.isPending.value">
+            <UButton size="xs" color="error" variant="ghost" class="tap44" icon="i-lucide-log-out" :disabled="revokeMutation.isPending.value">
               Revoke
             </UButton>
             <template #content>
@@ -122,11 +122,12 @@ function confirmRevoke(session: Session) {
                   <template v-if="row.original.current">Revoke this session? You'll be signed out immediately.</template>
                   <template v-else>Revoke this session?</template>
                 </p>
-                <div class="flex justify-end gap-2">
-                  <UButton size="xs" color="neutral" variant="ghost" @click="confirmOpenId = null">Cancel</UButton>
+                <div class="tap-row flex justify-end gap-2">
+                  <UButton size="xs" color="neutral" variant="ghost" class="tap44" @click="confirmOpenId = null">Cancel</UButton>
                   <UButton
                     size="xs"
                     color="error"
+                    class="tap44"
                     :loading="revokeMutation.isPending.value && revokingId === row.original.id"
                     @click="confirmRevoke(row.original)"
                   >

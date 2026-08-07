@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useToast } from '@nuxt/ui/composables'
@@ -92,6 +92,23 @@ function onTabChange(value: string | number) {
   }
   activeTab.value = String(value)
 }
+
+// The tab strip's `list` is a manually horizontally-scrolling row (see
+// the `:ui` override below — UTabs itself has no built-in "keep the
+// active trigger in view" behavior). A tab change driven by a click
+// already means the trigger the user tapped is on screen, but the two
+// programmatic changes below (the ?buildLog= handoff from NewApp.vue's
+// upload flow, and GitPanel's "Deploy now" handoff) can jump straight to
+// a tab the user never touched — scroll it into view explicitly so it's
+// never left off the edge of a phone-width strip.
+const tabsRoot = ref<{ $el?: HTMLElement } | null>(null)
+
+watch(activeTab, async () => {
+  await nextTick()
+  const el = tabsRoot.value?.$el
+  const active = el?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+  active?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+})
 
 const deployError = ref('')
 
@@ -228,7 +245,7 @@ const deleteMutation = useMutation({
     <div class="mb-6 flex flex-wrap items-center gap-3">
       <RouterLink
         :to="{ name: 'apps' }"
-        class="flex items-center gap-1 rounded-md text-sm text-content-secondary transition-colors hover:text-content-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        class="tap44 flex items-center gap-1 rounded-md text-sm text-content-secondary transition-colors hover:text-content-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
       >
         <UIcon name="i-lucide-arrow-left" class="h-4 w-4" aria-hidden="true" />
         Apps
@@ -243,7 +260,7 @@ const deleteMutation = useMutation({
           :href="`https://${generatedDomain}`"
           target="_blank"
           rel="noopener noreferrer"
-          class="flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+          class="tap44 flex items-center gap-1 rounded-sm font-mono text-xs text-accent hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
         >
           {{ generatedDomain }}
           <UIcon name="i-lucide-external-link" class="h-3 w-3" />
@@ -276,7 +293,17 @@ const deleteMutation = useMutation({
              all seven tabs one thumb-swipe away on a phone, with the
              active one always rendered (never hidden behind a "more"
              menu). -->
+        <!-- pointer-coarse:py-3 gives each trigger a real 44px-tall tap
+             target on touch (Tailwind's built-in `pointer: coarse` media
+             variant — the same finger-vs-mouse signal as the .tap44 CSS
+             utility elsewhere, just expressed as a direct size bump here
+             since these sit in a horizontally-scrolling strip: an
+             invisible hit-area overlay between adjacent tabs would make
+             swipe-to-scroll and tap-to-select ambiguous at the boundary,
+             which padding doesn't. Desktop keeps its original compact
+             trigger height. -->
         <UTabs
+          ref="tabsRoot"
           :items="tabItems"
           :model-value="activeTab"
           :content="false"
@@ -284,7 +311,7 @@ const deleteMutation = useMutation({
           class="mb-6"
           :ui="{
             list: 'flex-nowrap overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
-            trigger: 'shrink-0',
+            trigger: 'shrink-0 pointer-coarse:py-3',
           }"
           @update:model-value="onTabChange"
         />
@@ -292,10 +319,10 @@ const deleteMutation = useMutation({
         <div v-if="activeTab === 'overview'" class="flex flex-col gap-6">
           <UAlert v-if="hasPendingPlaceholder" color="warning" variant="subtle" title="No successful build yet" icon="i-lucide-alert-triangle">
             <template #actions>
-              <UButton size="sm" color="warning" variant="soft" icon="i-lucide-package-plus" @click="openNewImage">
+              <UButton size="sm" color="warning" variant="soft" class="tap44" icon="i-lucide-package-plus" @click="openNewImage">
                 Deploy new image…
               </UButton>
-              <UButton size="sm" color="neutral" variant="ghost" to="/apps/new" icon="i-lucide-upload">
+              <UButton size="sm" color="neutral" variant="ghost" class="tap44" to="/apps/new" icon="i-lucide-upload">
                 New app (upload)
               </UButton>
             </template>
@@ -346,10 +373,11 @@ const deleteMutation = useMutation({
             </template>
 
             <div class="flex flex-col gap-4">
-              <div class="flex flex-wrap items-center gap-2">
+              <div class="tap-row flex flex-wrap items-center gap-2">
                 <UButton
                   color="primary"
                   variant="soft"
+                  class="tap44"
                   icon="i-lucide-rocket"
                   :loading="deployMutation.isPending.value"
                   :disabled="isDeploying || hasPendingPlaceholder"
@@ -363,6 +391,7 @@ const deleteMutation = useMutation({
                   v-if="!newImageOpen"
                   color="neutral"
                   variant="ghost"
+                  class="tap44"
                   icon="i-lucide-package-plus"
                   :disabled="isDeploying"
                   @click="openNewImage"
@@ -370,12 +399,12 @@ const deleteMutation = useMutation({
                   Deploy new image…
                 </UButton>
 
-                <UButton color="error" variant="ghost" icon="i-lucide-trash-2" :disabled="isDeploying" @click="deleteModalOpen = true">
+                <UButton color="error" variant="ghost" class="tap44" icon="i-lucide-trash-2" :disabled="isDeploying" @click="deleteModalOpen = true">
                   Delete
                 </UButton>
               </div>
 
-              <div v-if="newImageOpen" class="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
+              <div v-if="newImageOpen" class="tap-row flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
                 <UInput
                   v-model="newImageValue"
                   placeholder="docker.io/library/nginx:alpine"
@@ -384,10 +413,10 @@ const deleteMutation = useMutation({
                   autofocus
                   @keyup.enter="confirmNewImage"
                 />
-                <UButton color="primary" size="sm" :disabled="!newImageValue.trim() || isDeploying" @click="confirmNewImage">
+                <UButton color="primary" size="sm" class="tap44" :disabled="!newImageValue.trim() || isDeploying" @click="confirmNewImage">
                   Deploy image
                 </UButton>
-                <UButton color="neutral" variant="ghost" size="sm" :disabled="isDeploying" @click="cancelNewImage">Cancel</UButton>
+                <UButton color="neutral" variant="ghost" size="sm" class="tap44" :disabled="isDeploying" @click="cancelNewImage">Cancel</UButton>
               </div>
             </div>
           </UCard>
@@ -458,12 +487,12 @@ const deleteMutation = useMutation({
               <h2 class="font-mono text-sm font-medium tracking-wide text-status-error uppercase">Danger zone</h2>
             </template>
 
-            <div class="flex items-center justify-between gap-4">
-              <p class="text-sm text-content-secondary">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p class="min-w-0 flex-1 text-sm break-words text-content-secondary">
                 Stops and removes this app's containers and routes, and deletes its deployment history. This cannot be
                 undone.
               </p>
-              <UButton color="error" variant="soft" icon="i-lucide-trash-2" :disabled="isDeploying" @click="deleteModalOpen = true">
+              <UButton color="error" variant="soft" class="tap44" icon="i-lucide-trash-2" :disabled="isDeploying" @click="deleteModalOpen = true">
                 Delete app
               </UButton>
             </div>
