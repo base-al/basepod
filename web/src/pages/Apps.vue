@@ -236,7 +236,7 @@ const deleteProjectMutation = useMutation({
         </p>
       </div>
 
-      <UButton to="/apps/new" color="primary" variant="soft" icon="i-lucide-plus" size="sm">New app</UButton>
+      <UButton to="/apps/new" color="primary" variant="soft" icon="i-lucide-plus" size="sm" class="tap44">New app</UButton>
     </div>
 
     <UAlert
@@ -273,7 +273,7 @@ const deleteProjectMutation = useMutation({
       <p class="max-w-sm text-sm text-content-muted">
         Deploy a container image or upload a build context to get your first app running.
       </p>
-      <UButton to="/apps/new" color="primary" icon="i-lucide-plus" class="mt-1">New app</UButton>
+      <UButton to="/apps/new" color="primary" icon="i-lucide-plus" class="tap44 mt-1">New app</UButton>
     </div>
 
     <template v-else>
@@ -294,6 +294,7 @@ const deleteProjectMutation = useMutation({
             color="error"
             variant="ghost"
             icon="i-lucide-trash-2"
+            class="tap44"
             @click="deleteProjectTarget = group"
           >
             Delete project
