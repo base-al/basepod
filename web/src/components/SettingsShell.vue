@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // Settings' own layout: AppShell (the app-wide rail/top-bar/bottom-bar)
-// plus a second-level nav for the three settings sub-pages (IA reorg —
-// Settings used to be one flat page; it's now Account/Instance/Users,
-// each a real route under /settings/*, see router.ts).
+// plus a second-level nav for the settings sub-pages (IA reorg — Settings
+// used to be one flat page; it's now Account/Instance/Users/Audit, each a
+// real route under /settings/*, see router.ts).
 //
 // Two structurally different sub-nav treatments, same reasoning as
 // AppShell's own header split: desktop gets a narrow side column (enough
@@ -11,8 +11,9 @@
 // row of wrapping pills, NOT a second horizontally-scrolling strip — this
 // page already lives inside AppShell's outer chrome, and a scroll-strip
 // nested inside another scroll-strip is exactly the pattern the IA reorg
-// was asked to avoid. Three items comfortably wrap to one line at 390px,
-// so `flex-wrap` alone is enough; there's no need for a select/dropdown.
+// was asked to avoid. Four items wrap cleanly across one or two lines at
+// 390px either way, so `flex-wrap` alone is enough; there's no need for a
+// select/dropdown.
 import { RouterLink, useRoute } from 'vue-router'
 
 import AppShell from './AppShell.vue'
@@ -23,6 +24,7 @@ const items = [
   { label: 'Account', icon: 'i-lucide-user-round', to: { name: 'settings-account' } },
   { label: 'Instance', icon: 'i-lucide-server', to: { name: 'settings-instance' } },
   { label: 'Users', icon: 'i-lucide-users', to: { name: 'settings-users' } },
+  { label: 'Audit', icon: 'i-lucide-scroll-text', to: { name: 'settings-audit' } },
 ] as const
 
 function isActive(name: string) {

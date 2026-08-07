@@ -43,8 +43,30 @@
  *      recalibrate radii so `rounded-md` etc. carry the brand's
  *      proportions everywhere for free.
  *   5. Motion — durations/easings, and the prefers-reduced-motion gate.
+ *
+ * Note on the "static" keyword just below: without it, this theme block
+ * only emits a given variable into compiled CSS when Tailwind's scanner
+ * can see some utility class in app source that resolves to it. The
+ * Nuxt UI plugin's own generated CSS leans on the full ink ramp
+ * indirectly (its dark-mode "neutral" role chains through every ink-50
+ * through ink-950 shade) in a way that scan can never see, since none
+ * of it is a literal class name in this repo's own source. Without
+ * "static", every ink shade this app doesn't happen to use directly
+ * (most of them — almost everything here reads through the semantic
+ * --bp- tokens (bg-surface and friends) below instead) got pruned, which
+ * silently broke every Nuxt UI component's default/neutral surface in
+ * dark mode specifically, discovered via UModal's own dialog rendering
+ * fully transparent in dark mode (feat/users-ui's invite flow surfaced
+ * it, but ConfirmDanger.vue reproduces the identical break — a pre-
+ * existing bug, not new). Most of those components sit directly on this
+ * app's own near-identical dark page background, where transparent and
+ * the intended dark neutral read as the same pixel, until something
+ * needs real contrast against arbitrary content behind it, like a modal
+ * over a busy page. "static" makes Tailwind always emit the full ramp
+ * regardless of what its scanner can prove is used directly, so Nuxt
+ * UI's own indirect references resolve unconditionally in both themes.
  */
-@theme {
+@theme static {
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
 
