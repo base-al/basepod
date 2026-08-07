@@ -10,8 +10,8 @@ import SessionsPanel from '../components/SessionsPanel.vue'
 <template>
   <AppShell max-width="3xl">
     <div class="mb-6">
-      <h1 class="text-2xl font-semibold tracking-tight text-slate-100">Settings</h1>
-      <p class="mt-1 text-sm text-slate-400">Account security — password and active sessions.</p>
+      <h1 class="font-mono text-2xl font-semibold tracking-tight text-content-primary">Settings</h1>
+      <p class="mt-1 text-sm text-content-secondary">Account security — password and active sessions.</p>
     </div>
 
     <div class="flex flex-col gap-6">

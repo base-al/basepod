@@ -161,9 +161,9 @@ function save() {
 </script>
 
 <template>
-  <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+  <UCard variant="subtle" :ui="{ root: 'ring-line' }">
     <template #header>
-      <h2 class="text-sm font-medium text-slate-400">Resource limits</h2>
+      <h2 class="text-sm font-medium text-content-secondary">Resource limits</h2>
     </template>
 
     <UAlert
@@ -174,10 +174,10 @@ function save() {
       :description="appQuery.error.value instanceof ApiError ? appQuery.error.value.message : 'Check that the BasePod server is running and reachable.'"
     />
 
-    <div v-else-if="!form" class="flex items-center justify-center py-10 text-sm text-slate-500">Loading…</div>
+    <div v-else-if="!form" class="flex items-center justify-center py-10 text-sm text-content-muted">Loading…</div>
 
     <div v-else class="flex flex-col gap-5">
-      <p class="text-xs text-slate-500">
+      <p class="text-xs text-content-muted">
         Caps applied to every container this app deploys — memory, CPU, and max processes. A hostile or misbehaving
         image can't balloon memory or fork-bomb past these. Changes take effect on the app's <em>next</em> deploy.
       </p>
@@ -186,7 +186,7 @@ function save() {
 
       <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <div class="flex flex-col gap-1.5">
-          <label class="text-xs text-slate-500">Memory (MiB)</label>
+          <label class="text-xs text-content-muted">Memory (MiB)</label>
           <UInput
             :model-value="form.memoryMB"
             type="number"
@@ -197,11 +197,11 @@ function save() {
             @update:model-value="(v: string | number) => { form!.memoryMB = Number(v); lastTyped.memoryMB = Number(v) }"
           />
           <USwitch :model-value="form.memoryUnlimited" label="Unlimited" @update:model-value="(v: boolean) => onToggleUnlimited('memory', v)" />
-          <p v-if="memoryError" class="text-xs text-red-400">{{ memoryError }}</p>
+          <p v-if="memoryError" class="text-xs text-status-error">{{ memoryError }}</p>
         </div>
 
         <div class="flex flex-col gap-1.5">
-          <label class="text-xs text-slate-500">CPU (cores)</label>
+          <label class="text-xs text-content-muted">CPU (cores)</label>
           <UInput
             :model-value="form.cpu"
             type="number"
@@ -213,11 +213,11 @@ function save() {
             @update:model-value="(v: string | number) => { form!.cpu = Number(v); lastTyped.cpu = Number(v) }"
           />
           <USwitch :model-value="form.cpuUnlimited" label="Unlimited" @update:model-value="(v: boolean) => onToggleUnlimited('cpu', v)" />
-          <p v-if="cpuError" class="text-xs text-red-400">{{ cpuError }}</p>
+          <p v-if="cpuError" class="text-xs text-status-error">{{ cpuError }}</p>
         </div>
 
         <div class="flex flex-col gap-1.5">
-          <label class="text-xs text-slate-500">Max processes</label>
+          <label class="text-xs text-content-muted">Max processes</label>
           <UInput
             :model-value="form.pids"
             type="number"
@@ -228,7 +228,7 @@ function save() {
             @update:model-value="(v: string | number) => { form!.pids = Number(v); lastTyped.pids = Number(v) }"
           />
           <USwitch :model-value="form.pidsUnlimited" label="Unlimited" @update:model-value="(v: boolean) => onToggleUnlimited('pids', v)" />
-          <p v-if="pidsError" class="text-xs text-red-400">{{ pidsError }}</p>
+          <p v-if="pidsError" class="text-xs text-status-error">{{ pidsError }}</p>
         </div>
       </div>
 

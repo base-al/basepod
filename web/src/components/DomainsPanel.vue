@@ -126,18 +126,18 @@ function confirmDelete(id: number) {
       :description="domainsQuery.error.value instanceof ApiError ? domainsQuery.error.value.message : 'Check that the BasePod server is running and reachable.'"
     />
 
-    <div v-else-if="domainsQuery.isPending.value" class="flex items-center justify-center rounded-lg border border-slate-800 py-16 text-sm text-slate-500">
+    <div v-else-if="domainsQuery.isPending.value" class="flex items-center justify-center rounded-lg border border-line py-16 text-sm text-content-muted">
       Loading domains…
     </div>
 
     <template v-else>
-      <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+      <UCard variant="subtle" :ui="{ root: 'ring-line' }">
         <template #header>
-          <h2 class="text-sm font-medium text-slate-400">Generated domain</h2>
+          <h2 class="text-sm font-medium text-content-secondary">Generated domain</h2>
         </template>
 
         <div class="flex flex-wrap items-center gap-2">
-          <span class="min-w-0 flex-1 truncate font-mono text-sm text-slate-200">{{ generated }}</span>
+          <span class="min-w-0 flex-1 truncate font-mono text-sm text-content-primary">{{ generated }}</span>
           <UBadge color="neutral" variant="subtle">Managed</UBadge>
           <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy hostname" @click="copyGenerated" />
           <UButton
@@ -151,12 +151,12 @@ function confirmDelete(id: number) {
             aria-label="Open in new tab"
           />
         </div>
-        <p class="mt-2 text-xs text-slate-500">Always routes to this app — it can't be edited or removed.</p>
+        <p class="mt-2 text-xs text-content-muted">Always routes to this app — it can't be edited or removed.</p>
       </UCard>
 
-      <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+      <UCard variant="subtle" :ui="{ root: 'ring-line' }">
         <template #header>
-          <h2 class="text-sm font-medium text-slate-400">Custom domains</h2>
+          <h2 class="text-sm font-medium text-content-secondary">Custom domains</h2>
         </template>
 
         <div class="flex flex-col gap-4">
@@ -180,23 +180,23 @@ function confirmDelete(id: number) {
                 :disabled="addMutation.isPending.value"
                 @update:model-value="(v: string | number) => onHostnameInput(String(v))"
               />
-              <p v-if="newHostname && !hostnameValid" class="mt-1 text-xs text-red-400">
+              <p v-if="newHostname && !hostnameValid" class="mt-1 text-xs text-status-error">
                 Must be a valid lowercase hostname, e.g. app.example.com.
               </p>
-              <p v-else-if="addError" class="mt-1 text-xs text-red-400">{{ addError }}</p>
+              <p v-else-if="addError" class="mt-1 text-xs text-status-error">{{ addError }}</p>
             </div>
             <UButton type="submit" color="primary" variant="soft" icon="i-lucide-plus" :loading="addMutation.isPending.value" :disabled="!hostnameValid || addMutation.isPending.value">
               Add domain
             </UButton>
           </form>
 
-          <div v-if="!custom.length" class="rounded-lg border border-slate-800 py-8 text-center text-sm text-slate-500">
+          <div v-if="!custom.length" class="rounded-lg border border-line py-8 text-center text-sm text-content-muted">
             No custom domains yet.
           </div>
 
           <ul v-else class="flex flex-col gap-2">
-            <li v-for="domain in custom" :key="domain.id" class="flex items-center gap-2 rounded-lg border border-slate-800 px-3 py-2">
-              <span class="min-w-0 flex-1 truncate font-mono text-sm text-slate-200">{{ domain.hostname }}</span>
+            <li v-for="domain in custom" :key="domain.id" class="flex items-center gap-2 rounded-lg border border-line px-3 py-2">
+              <span class="min-w-0 flex-1 truncate font-mono text-sm text-content-primary">{{ domain.hostname }}</span>
               <UButton
                 size="sm"
                 color="neutral"
@@ -211,7 +211,7 @@ function confirmDelete(id: number) {
                 <UButton size="sm" color="error" variant="ghost" square icon="i-lucide-trash-2" :aria-label="`Delete ${domain.hostname}`" />
                 <template #content>
                   <div class="flex flex-col gap-2 p-3">
-                    <p class="text-xs text-slate-300">Remove <span class="font-mono">{{ domain.hostname }}</span>?</p>
+                    <p class="text-xs text-content-secondary">Remove <span class="font-mono">{{ domain.hostname }}</span>?</p>
                     <div class="flex justify-end gap-2">
                       <UButton size="xs" color="neutral" variant="ghost" @click="confirmOpenId = null">Cancel</UButton>
                       <UButton

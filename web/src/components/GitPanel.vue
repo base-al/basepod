@@ -286,7 +286,7 @@ const detectedAccordionValue = computed(() => {
       :description="gitQuery.error.value instanceof ApiError ? gitQuery.error.value.message : 'Check that the BasePod server is running and reachable.'"
     />
 
-    <div v-else-if="gitQuery.isPending.value" class="flex items-center justify-center rounded-lg border border-slate-800 py-16 text-sm text-slate-500">
+    <div v-else-if="gitQuery.isPending.value" class="flex items-center justify-center rounded-lg border border-line py-16 text-sm text-content-muted">
       Loading git connection…
     </div>
 
@@ -294,16 +294,16 @@ const detectedAccordionValue = computed(() => {
       <!-- Connect form: shown when nothing is connected, or while editing
            an existing connection (editing.value, toggled from the facts
            card below). -->
-      <UCard v-if="!connected || editing" variant="subtle" :ui="{ root: 'ring-slate-800' }">
+      <UCard v-if="!connected || editing" variant="subtle" :ui="{ root: 'ring-line' }">
         <template #header>
-          <h2 class="text-sm font-medium text-slate-400">{{ connected ? 'Edit connection' : 'Connect a repo' }}</h2>
+          <h2 class="text-sm font-medium text-content-secondary">{{ connected ? 'Edit connection' : 'Connect a repo' }}</h2>
         </template>
 
         <form class="flex flex-col gap-4" novalidate @submit.prevent="submitForm">
           <UFormField label="Repository URL" name="url">
             <UInput v-model="form.url" placeholder="https://github.com/org/repo.git" class="w-full font-mono" :disabled="connectMutation.isPending.value" autofocus />
             <template #hint>
-              <span v-if="form.url && !urlValid" class="text-xs text-red-400">Must be an https:// URL.</span>
+              <span v-if="form.url && !urlValid" class="text-xs text-status-error">Must be an https:// URL.</span>
             </template>
           </UFormField>
 
@@ -321,7 +321,7 @@ const detectedAccordionValue = computed(() => {
               :disabled="connectMutation.isPending.value"
             />
             <template #hint>
-              <span class="text-xs text-slate-500">Write-only — never shown again once saved, same as a secret env value.</span>
+              <span class="text-xs text-content-muted">Write-only — never shown again once saved, same as a secret env value.</span>
             </template>
           </UFormField>
 
@@ -340,26 +340,26 @@ const detectedAccordionValue = computed(() => {
 
       <template v-else-if="gitSource">
         <!-- Connection facts -->
-        <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+        <UCard variant="subtle" :ui="{ root: 'ring-line' }">
           <template #header>
             <div class="flex items-center justify-between">
-              <h2 class="text-sm font-medium text-slate-400">Connected repo</h2>
+              <h2 class="text-sm font-medium text-content-secondary">Connected repo</h2>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-pencil" @click="startEdit">Edit</UButton>
             </div>
           </template>
 
           <dl class="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
             <div class="col-span-2 min-w-0 sm:col-span-1">
-              <dt class="text-xs text-slate-500">Repository</dt>
-              <dd class="mt-1 truncate font-mono text-sm text-slate-200" :title="gitSource.url">{{ gitSource.url }}</dd>
+              <dt class="text-xs text-content-muted">Repository</dt>
+              <dd class="mt-1 truncate font-mono text-sm text-content-primary" :title="gitSource.url">{{ gitSource.url }}</dd>
             </div>
             <div>
-              <dt class="text-xs text-slate-500">Branch</dt>
-              <dd class="mt-1 font-mono text-sm text-slate-300">{{ gitSource.branch }}</dd>
+              <dt class="text-xs text-content-muted">Branch</dt>
+              <dd class="mt-1 font-mono text-sm text-content-secondary">{{ gitSource.branch }}</dd>
             </div>
             <div>
-              <dt class="text-xs text-slate-500">Access token</dt>
-              <dd class="mt-1 text-sm text-slate-300">
+              <dt class="text-xs text-content-muted">Access token</dt>
+              <dd class="mt-1 text-sm text-content-secondary">
                 <UBadge :color="gitSource.token === 'set' ? 'success' : 'neutral'" variant="subtle">
                   {{ gitSource.token === 'set' ? 'Set' : 'Not set (public repo)' }}
                 </UBadge>
@@ -369,9 +369,9 @@ const detectedAccordionValue = computed(() => {
         </UCard>
 
         <!-- Webhook setup -->
-        <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+        <UCard variant="subtle" :ui="{ root: 'ring-line' }">
           <template #header>
-            <h2 class="text-sm font-medium text-slate-400">Webhook</h2>
+            <h2 class="text-sm font-medium text-content-secondary">Webhook</h2>
           </template>
 
           <div class="flex flex-col gap-4">
@@ -384,9 +384,9 @@ const detectedAccordionValue = computed(() => {
             />
 
             <div>
-              <p class="mb-1.5 text-xs text-slate-500">Payload URL — paste this into your forge's webhook settings.</p>
+              <p class="mb-1.5 text-xs text-content-muted">Payload URL — paste this into your forge's webhook settings.</p>
               <div class="flex items-center gap-2">
-                <span class="min-w-0 flex-1 truncate rounded-md border border-slate-800 bg-slate-900/50 px-3 py-1.5 font-mono text-sm text-slate-200">
+                <span class="min-w-0 flex-1 truncate rounded-md border border-line bg-surface-elevated/50 px-3 py-1.5 font-mono text-sm text-content-primary">
                   {{ gitSource.webhook_url }}
                 </span>
                 <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy webhook URL" @click="copyText(gitSource.webhook_url, 'Webhook URL')" />
@@ -394,19 +394,19 @@ const detectedAccordionValue = computed(() => {
             </div>
 
             <div>
-              <p class="mb-1.5 text-xs text-slate-500">
+              <p class="mb-1.5 text-xs text-content-muted">
                 Secret — write-only, same as the access token below. Shown once, right here, the moment it's minted (on
                 connect or rotate); BasePod never returns it again after that.
               </p>
 
               <!-- Just-minted/rotated: the one chance to copy it. -->
-              <div v-if="revealedSecret" class="flex flex-col gap-2 rounded-md border border-emerald-800/60 bg-emerald-950/30 p-3">
-                <p class="flex items-center gap-1.5 text-xs font-medium text-emerald-300">
+              <div v-if="revealedSecret" class="flex flex-col gap-2 rounded-md border border-moss-400/30 bg-status-running-bg p-3">
+                <p class="flex items-center gap-1.5 text-xs font-medium text-status-running">
                   <UIcon name="i-lucide-eye" class="size-3.5" />
                   Copy this now — it won't be shown again
                 </p>
                 <div class="flex items-center gap-2">
-                  <span class="min-w-0 flex-1 truncate rounded-md border border-slate-800 bg-slate-900/60 px-3 py-1.5 font-mono text-sm text-emerald-200">
+                  <span class="min-w-0 flex-1 truncate rounded-md border border-line bg-surface-sunken px-3 py-1.5 font-mono text-sm text-content-primary">
                     {{ revealedSecret }}
                   </span>
                   <UButton size="sm" color="neutral" variant="ghost" square icon="i-lucide-copy" aria-label="Copy secret" @click="copyText(revealedSecret, 'Webhook secret')" />
@@ -426,7 +426,7 @@ const detectedAccordionValue = computed(() => {
                   <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-rotate-cw">Rotate</UButton>
                   <template #content>
                     <div class="flex max-w-64 flex-col gap-2 p-3">
-                      <p class="text-xs text-slate-300">
+                      <p class="text-xs text-content-secondary">
                         Rotate the webhook secret? Any webhook already configured on your forge will need updating with the
                         new value shown once here after rotating.
                       </p>
@@ -442,19 +442,19 @@ const detectedAccordionValue = computed(() => {
 
             <UAccordion :items="providerHintItems" :default-value="detectedAccordionValue" type="multiple">
               <template #github>
-                <p class="pb-2 text-xs text-slate-400">
+                <p class="pb-2 text-xs text-content-secondary">
                   Settings → Webhooks → Add webhook. Payload URL: the URL above. Content type:
                   <span class="font-mono">application/json</span>. Secret: the value above. Trigger on: just the push event.
                 </p>
               </template>
               <template #gitlab>
-                <p class="pb-2 text-xs text-slate-400">
+                <p class="pb-2 text-xs text-content-secondary">
                   Settings → Webhooks → Add new webhook. URL: the URL above. Secret token: the value above. Trigger on push
                   events.
                 </p>
               </template>
               <template #gitea>
-                <p class="pb-2 text-xs text-slate-400">
+                <p class="pb-2 text-xs text-content-secondary">
                   Settings → Webhooks → Add Webhook (Gitea/Gogs). Target URL: the URL above. Secret: the value above.
                   Trigger on push events.
                 </p>
@@ -464,16 +464,16 @@ const detectedAccordionValue = computed(() => {
         </UCard>
 
         <!-- Deploy now -->
-        <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+        <UCard variant="subtle" :ui="{ root: 'ring-line' }">
           <template #header>
-            <h2 class="text-sm font-medium text-slate-400">Manual deploy</h2>
+            <h2 class="text-sm font-medium text-content-secondary">Manual deploy</h2>
           </template>
 
           <div class="flex flex-col gap-3">
             <UAlert v-if="deployError" color="error" variant="subtle" title="Deploy failed" :description="deployError" icon="i-lucide-alert-circle" />
             <div class="flex items-center justify-between gap-4">
-              <p class="text-sm text-slate-400">
-                Clones <span class="font-mono text-slate-300">{{ gitSource.branch }}</span> right now and deploys it, without
+              <p class="text-sm text-content-secondary">
+                Clones <span class="font-mono text-content-secondary">{{ gitSource.branch }}</span> right now and deploys it, without
                 waiting for a push.
               </p>
               <UButton color="primary" variant="soft" icon="i-lucide-rocket" :loading="deployMutation.isPending.value" :disabled="deployMutation.isPending.value" @click="deployNow">
@@ -484,10 +484,10 @@ const detectedAccordionValue = computed(() => {
         </UCard>
 
         <!-- Deliveries -->
-        <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+        <UCard variant="subtle" :ui="{ root: 'ring-line' }">
           <template #header>
             <div class="flex items-center justify-between">
-              <h2 class="text-sm font-medium text-slate-400">Recent deliveries</h2>
+              <h2 class="text-sm font-medium text-content-secondary">Recent deliveries</h2>
               <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" :loading="deliveriesQuery.isFetching.value" @click="refreshDeliveries">
                 Refresh
               </UButton>
@@ -504,18 +504,18 @@ const detectedAccordionValue = computed(() => {
 
           <UTable v-else :data="deliveries" :columns="deliveryColumns" empty="No deliveries yet — push to the configured branch, or use Deploy now above." class="w-full">
             <template #received_at-cell="{ row }">
-              <span class="text-xs text-slate-400" :title="row.original.received_at">{{ relativeTime(row.original.received_at) }}</span>
+              <span class="text-xs text-content-secondary" :title="row.original.received_at">{{ relativeTime(row.original.received_at) }}</span>
             </template>
 
             <template #ref-cell="{ row }">
-              <span class="font-mono text-xs text-slate-300">{{ formatGitRef(row.original.ref) || '—' }}</span>
+              <span class="font-mono text-xs text-content-secondary">{{ formatGitRef(row.original.ref) || '—' }}</span>
             </template>
 
             <template #commit_sha-cell="{ row }">
-              <span v-if="row.original.commit_sha" class="font-mono text-xs text-slate-400" :title="row.original.commit_sha">
+              <span v-if="row.original.commit_sha" class="font-mono text-xs text-content-secondary" :title="row.original.commit_sha">
                 {{ shortSha(row.original.commit_sha) }}
               </span>
-              <span v-else class="text-xs text-slate-600">—</span>
+              <span v-else class="text-xs text-content-muted">—</span>
             </template>
 
             <template #status-cell="{ row }">
@@ -528,12 +528,12 @@ const detectedAccordionValue = computed(() => {
                   />
                   {{ deliveryStatusStyle(row.original.status).label }}
                 </UBadge>
-                <span v-if="row.original.detail" class="max-w-xs text-xs text-slate-500">{{ row.original.detail }}</span>
+                <span v-if="row.original.detail" class="max-w-xs text-xs text-content-muted">{{ row.original.detail }}</span>
               </div>
             </template>
 
             <template #deployment-cell="{ row }">
-              <span v-if="row.original.deployment_number" class="font-mono text-xs text-slate-400">
+              <span v-if="row.original.deployment_number" class="font-mono text-xs text-content-secondary">
                 #{{ row.original.deployment_number }}
               </span>
             </template>
@@ -541,13 +541,13 @@ const detectedAccordionValue = computed(() => {
         </UCard>
 
         <!-- Danger zone -->
-        <UCard variant="subtle" :ui="{ root: 'ring-red-900/60' }">
+        <UCard variant="subtle" :ui="{ root: 'ring-status-error/35' }">
           <template #header>
-            <h2 class="text-sm font-medium text-red-400">Danger zone</h2>
+            <h2 class="text-sm font-medium text-status-error">Danger zone</h2>
           </template>
 
           <div class="flex items-center justify-between gap-4">
-            <p class="text-sm text-slate-400">
+            <p class="text-sm text-content-secondary">
               Disconnects this repo: the webhook stops accepting pushes and the stored secret/token are deleted. The app
               itself and its deployment history are untouched.
             </p>

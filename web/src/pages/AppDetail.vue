@@ -228,29 +228,29 @@ const deleteMutation = useMutation({
     <div class="mb-6 flex flex-wrap items-center gap-3">
       <RouterLink
         :to="{ name: 'apps' }"
-        class="flex items-center gap-1 rounded-md text-sm text-slate-400 transition-colors hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400"
+        class="flex items-center gap-1 rounded-md text-sm text-content-secondary transition-colors hover:text-content-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
       >
         <UIcon name="i-lucide-arrow-left" class="h-4 w-4" aria-hidden="true" />
         Apps
       </RouterLink>
-      <span class="text-slate-700" aria-hidden="true">/</span>
+      <span class="text-content-muted" aria-hidden="true">/</span>
 
       <template v-if="app">
-        <span class="font-mono text-base font-semibold tracking-tight text-slate-100">{{ app.slug }}</span>
+        <span class="font-mono text-base font-semibold tracking-tight text-content-primary">{{ app.slug }}</span>
         <StatusBadge :status="displayStatus" />
         <a
           v-if="generatedDomain"
           :href="`https://${generatedDomain}`"
           target="_blank"
           rel="noopener noreferrer"
-          class="flex items-center gap-1 font-mono text-xs text-emerald-400 hover:underline"
+          class="flex items-center gap-1 font-mono text-xs text-accent hover:underline"
         >
           {{ generatedDomain }}
           <UIcon name="i-lucide-external-link" class="h-3 w-3" />
         </a>
         <ImageRef :value="app.image" class="ml-auto max-w-xs" />
       </template>
-      <span v-else-if="appQuery.isPending.value" class="text-sm text-slate-500">Loading…</span>
+      <span v-else-if="appQuery.isPending.value" class="text-sm text-content-muted">Loading…</span>
     </div>
 
     <UAlert
@@ -263,13 +263,31 @@ const deleteMutation = useMutation({
 
       <div
         v-else-if="appQuery.isPending.value"
-        class="flex items-center justify-center rounded-lg border border-slate-800 py-24 text-sm text-slate-500"
+        class="flex items-center justify-center rounded-lg border border-line py-24 text-sm text-content-muted"
       >
         Loading app…
       </div>
 
       <template v-else-if="app">
-        <UTabs :items="tabItems" :model-value="activeTab" :content="false" variant="link" class="mb-6" @update:model-value="onTabChange" />
+        <!-- variant="link" wraps by default at narrow widths, pushing
+             the later tabs (Domains/Git/Settings) below the fold
+             instead of keeping every tab reachable. Overriding the
+             list slot to a horizontally-scrollable single row keeps
+             all seven tabs one thumb-swipe away on a phone, with the
+             active one always rendered (never hidden behind a "more"
+             menu). -->
+        <UTabs
+          :items="tabItems"
+          :model-value="activeTab"
+          :content="false"
+          variant="link"
+          class="mb-6"
+          :ui="{
+            list: 'flex-nowrap overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
+            trigger: 'shrink-0',
+          }"
+          @update:model-value="onTabChange"
+        />
 
         <div v-if="activeTab === 'overview'" class="flex flex-col gap-6">
           <UAlert v-if="hasPendingPlaceholder" color="warning" variant="subtle" title="No successful build yet" icon="i-lucide-alert-triangle">
@@ -282,10 +300,10 @@ const deleteMutation = useMutation({
               </UButton>
             </template>
             <template #description>
-              <p class="text-sm text-slate-400">
+              <p class="text-sm text-content-secondary">
                 This app was created for an upload build that never finished, so it has no real image to run —
                 deploying now would just fail trying to pull a placeholder tag. Deploy a real image below, delete
-                this app and re-upload from <span class="font-medium text-slate-300">New app</span>, or deploy a
+                this app and re-upload from <span class="font-medium text-content-secondary">New app</span>, or deploy a
                 build context from the command line with <span class="font-mono">basepod deploy</span>.
               </p>
             </template>
@@ -293,38 +311,38 @@ const deleteMutation = useMutation({
 
           <UAlert v-if="deployError" color="error" variant="subtle" title="Deploy failed" :description="deployError" icon="i-lucide-alert-circle" />
 
-          <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+          <UCard variant="subtle" :ui="{ root: 'ring-line' }">
             <template #header>
-              <h2 class="text-sm font-medium text-slate-400">Facts</h2>
+              <h2 class="font-mono text-sm font-medium tracking-wide text-content-secondary uppercase">Facts</h2>
             </template>
 
             <dl class="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
               <div>
-                <dt class="text-xs text-slate-500">Status</dt>
+                <dt class="text-xs text-content-muted">Status</dt>
                 <dd class="mt-1"><StatusBadge :status="displayStatus" /></dd>
               </div>
               <div class="min-w-0">
-                <dt class="text-xs text-slate-500">Image</dt>
+                <dt class="text-xs text-content-muted">Image</dt>
                 <dd class="mt-1"><ImageRef :value="app.image" /></dd>
               </div>
               <div>
-                <dt class="text-xs text-slate-500">Port</dt>
-                <dd class="mt-1 font-mono text-sm text-slate-300">{{ app.port }}</dd>
+                <dt class="text-xs text-content-muted">Port</dt>
+                <dd class="mt-1 font-mono text-sm tabular-nums text-content-secondary">{{ app.port }}</dd>
               </div>
               <div>
-                <dt class="text-xs text-slate-500">Internal hostname</dt>
-                <dd class="mt-1 font-mono text-sm text-slate-300">bp-{{ app.slug }}</dd>
+                <dt class="text-xs text-content-muted">Internal hostname</dt>
+                <dd class="mt-1 font-mono text-sm text-content-secondary">bp-{{ app.slug }}</dd>
               </div>
               <div>
-                <dt class="text-xs text-slate-500">Deployments</dt>
-                <dd class="mt-1 text-sm text-slate-300">{{ app.deployments.length }}</dd>
+                <dt class="text-xs text-content-muted">Deployments</dt>
+                <dd class="mt-1 text-sm text-content-secondary">{{ app.deployments.length }}</dd>
               </div>
             </dl>
           </UCard>
 
-          <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+          <UCard variant="subtle" :ui="{ root: 'ring-line' }">
             <template #header>
-              <h2 class="text-sm font-medium text-slate-400">Quick actions</h2>
+              <h2 class="font-mono text-sm font-medium tracking-wide text-content-secondary uppercase">Quick actions</h2>
             </template>
 
             <div class="flex flex-col gap-4">
@@ -357,7 +375,7 @@ const deleteMutation = useMutation({
                 </UButton>
               </div>
 
-              <div v-if="newImageOpen" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 p-3">
+              <div v-if="newImageOpen" class="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
                 <UInput
                   v-model="newImageValue"
                   placeholder="docker.io/library/nginx:alpine"
@@ -408,40 +426,40 @@ const deleteMutation = useMutation({
         </div>
 
         <div v-else-if="activeTab === 'settings'" class="flex flex-col gap-6">
-          <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+          <UCard variant="subtle" :ui="{ root: 'ring-line' }">
             <template #header>
-              <h2 class="text-sm font-medium text-slate-400">App facts</h2>
+              <h2 class="font-mono text-sm font-medium tracking-wide text-content-secondary uppercase">App facts</h2>
             </template>
 
             <dl class="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
               <div>
-                <dt class="text-xs text-slate-500">Slug</dt>
-                <dd class="mt-1 font-mono text-sm text-slate-300">{{ app.slug }}</dd>
+                <dt class="text-xs text-content-muted">Slug</dt>
+                <dd class="mt-1 font-mono text-sm text-content-secondary">{{ app.slug }}</dd>
               </div>
               <div class="min-w-0">
-                <dt class="text-xs text-slate-500">Image</dt>
+                <dt class="text-xs text-content-muted">Image</dt>
                 <dd class="mt-1"><ImageRef :value="app.image" /></dd>
               </div>
               <div>
-                <dt class="text-xs text-slate-500">Port</dt>
-                <dd class="mt-1 font-mono text-sm text-slate-300">{{ app.port }}</dd>
+                <dt class="text-xs text-content-muted">Port</dt>
+                <dd class="mt-1 font-mono text-sm tabular-nums text-content-secondary">{{ app.port }}</dd>
               </div>
               <div>
-                <dt class="text-xs text-slate-500">Internal hostname</dt>
-                <dd class="mt-1 font-mono text-sm text-slate-300">bp-{{ app.slug }}</dd>
+                <dt class="text-xs text-content-muted">Internal hostname</dt>
+                <dd class="mt-1 font-mono text-sm text-content-secondary">bp-{{ app.slug }}</dd>
               </div>
             </dl>
           </UCard>
 
           <ResourceLimitsPanel :slug="slug" />
 
-          <UCard variant="subtle" :ui="{ root: 'ring-red-900/60' }">
+          <UCard variant="subtle" :ui="{ root: 'ring-status-error/35' }">
             <template #header>
-              <h2 class="text-sm font-medium text-red-400">Danger zone</h2>
+              <h2 class="font-mono text-sm font-medium tracking-wide text-status-error uppercase">Danger zone</h2>
             </template>
 
             <div class="flex items-center justify-between gap-4">
-              <p class="text-sm text-slate-400">
+              <p class="text-sm text-content-secondary">
                 Stops and removes this app's containers and routes, and deletes its deployment history. This cannot be
                 undone.
               </p>

@@ -329,13 +329,13 @@ function save() {
       :description="envQuery.error.value instanceof ApiError ? envQuery.error.value.message : 'Check that the BasePod server is running and reachable.'"
     />
 
-    <div v-else-if="envQuery.isPending.value" class="flex items-center justify-center rounded-lg border border-slate-800 py-16 text-sm text-slate-500">
+    <div v-else-if="envQuery.isPending.value" class="flex items-center justify-center rounded-lg border border-line py-16 text-sm text-content-muted">
       Loading environment…
     </div>
 
     <template v-else>
       <div class="flex flex-wrap items-center justify-between gap-2">
-        <p class="text-xs text-slate-500">
+        <p class="text-xs text-content-muted">
           Secret values are never shown once saved. Leaving a replaced secret's value empty on save keeps the previously
           stored value.
         </p>
@@ -352,8 +352,8 @@ function save() {
         </div>
       </div>
 
-      <div v-if="bulkMode" class="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
-        <p class="text-xs text-slate-500">
+      <div v-if="bulkMode" class="flex flex-col gap-3 rounded-lg border border-line p-4">
+        <p class="text-xs text-content-muted">
           One <span class="font-mono">KEY=VALUE</span> per line. Blank lines and <span class="font-mono">#</span> comments
           are ignored; only the first <span class="font-mono">=</span> splits key from value, so values may contain
           <span class="font-mono">=</span> themselves. Secret values aren't shown here — applying this leaves existing
@@ -367,11 +367,11 @@ function save() {
       </div>
 
       <div v-else class="flex flex-col gap-2">
-        <div v-if="!rows.length" class="rounded-lg border border-slate-800 py-10 text-center text-sm text-slate-500">
+        <div v-if="!rows.length" class="rounded-lg border border-line py-10 text-center text-sm text-content-muted">
           No environment variables yet.
         </div>
 
-        <div v-for="row in rows" :key="row.id" class="flex flex-col gap-1.5 rounded-lg border border-slate-800 p-3">
+        <div v-for="row in rows" :key="row.id" class="flex flex-col gap-1.5 rounded-lg border border-line p-3">
           <div class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
             <UInput
               v-model="row.key"
@@ -384,7 +384,7 @@ function save() {
             />
 
             <template v-if="row.masked">
-              <span class="min-w-0 flex-1 select-none rounded-md border border-slate-800 bg-slate-900/50 px-3 py-1.5 font-mono text-sm tracking-widest text-slate-500">
+              <span class="min-w-0 flex-1 select-none rounded-md border border-line bg-surface-elevated/50 px-3 py-1.5 font-mono text-sm tracking-widest text-content-muted">
                 ●●●●●●●●
               </span>
               <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-pencil" @click="replaceValue(row)">
@@ -417,7 +417,7 @@ function save() {
               <UButton size="sm" color="error" variant="ghost" square icon="i-lucide-trash-2" :aria-label="`Remove ${row.originalKey}`" />
               <template #content>
                 <div class="flex flex-col gap-2 p-3">
-                  <p class="max-w-56 text-xs text-slate-300">
+                  <p class="max-w-56 text-xs text-content-secondary">
                     Remove <span class="font-mono">{{ row.originalKey }}</span>? Its stored value will be deleted on save.
                   </p>
                   <div class="flex justify-end gap-2">
@@ -428,7 +428,7 @@ function save() {
               </template>
             </UPopover>
           </div>
-          <p v-if="rowErrors.get(row.id)" class="pl-1 text-xs text-red-400">{{ rowErrors.get(row.id) }}</p>
+          <p v-if="rowErrors.get(row.id)" class="pl-1 text-xs text-status-error">{{ rowErrors.get(row.id) }}</p>
         </div>
 
         <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-plus" class="self-start" @click="addRow">
@@ -453,12 +453,12 @@ function save() {
   <UModal :open="bulkDemoteConfirmOpen" title="Demote secrets to plain values?" @update:open="(v: boolean) => (v ? undefined : cancelBulkDemote())">
     <template #body>
       <div class="flex flex-col gap-3">
-        <p class="text-sm text-slate-400">
+        <p class="text-sm text-content-secondary">
           The bulk text includes {{ bulkDemoteKeys.length === 1 ? 'a key' : 'keys' }} currently stored as secrets. Applying
           will replace {{ bulkDemoteKeys.length === 1 ? 'it' : 'them' }} with the plain value typed in the textarea:
         </p>
         <ul class="flex flex-col gap-1">
-          <li v-for="key in bulkDemoteKeys" :key="key" class="font-mono text-sm text-amber-400">{{ key }}</li>
+          <li v-for="key in bulkDemoteKeys" :key="key" class="font-mono text-sm text-status-deploying">{{ key }}</li>
         </ul>
       </div>
     </template>

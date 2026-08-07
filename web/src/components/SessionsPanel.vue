@@ -77,9 +77,9 @@ function confirmRevoke(session: Session) {
 </script>
 
 <template>
-  <UCard variant="subtle" :ui="{ root: 'ring-slate-800' }">
+  <UCard variant="subtle" :ui="{ root: 'ring-line' }">
     <template #header>
-      <h2 class="text-sm font-medium text-slate-400">Sessions</h2>
+      <h2 class="text-sm font-medium text-content-secondary">Sessions</h2>
     </template>
 
     <UAlert
@@ -90,17 +90,17 @@ function confirmRevoke(session: Session) {
       :description="sessionsQuery.error.value instanceof ApiError ? sessionsQuery.error.value.message : 'Check that the BasePod server is running and reachable.'"
     />
 
-    <div v-else-if="sessionsQuery.isPending.value" class="flex items-center justify-center py-10 text-sm text-slate-500">
+    <div v-else-if="sessionsQuery.isPending.value" class="flex items-center justify-center py-10 text-sm text-content-muted">
       Loading sessions…
     </div>
 
     <UTable v-else :data="sessionsQuery.data.value ?? []" :columns="columns" empty="No active sessions." class="w-full">
       <template #created_at-cell="{ row }">
-        <span class="text-xs text-slate-400" :title="row.original.created_at">{{ relativeTime(row.original.created_at) }}</span>
+        <span class="text-xs text-content-secondary" :title="row.original.created_at">{{ relativeTime(row.original.created_at) }}</span>
       </template>
 
       <template #expires_at-cell="{ row }">
-        <span class="text-xs text-slate-400" :title="row.original.expires_at">{{ relativeTime(row.original.expires_at) }}</span>
+        <span class="text-xs text-content-secondary" :title="row.original.expires_at">{{ relativeTime(row.original.expires_at) }}</span>
       </template>
 
       <template #device-cell="{ row }">
@@ -118,7 +118,7 @@ function confirmRevoke(session: Session) {
             </UButton>
             <template #content>
               <div class="flex flex-col gap-2 p-3">
-                <p class="max-w-64 text-xs text-slate-300">
+                <p class="max-w-64 text-xs text-content-secondary">
                   <template v-if="row.original.current">Revoke this session? You'll be signed out immediately.</template>
                   <template v-else>Revoke this session?</template>
                 </p>

@@ -132,21 +132,21 @@ function retry() {
 const connectionChip = () => {
   switch (connectionState.value) {
     case 'connecting':
-      return { label: 'Connecting', dotClass: 'bg-amber-400', pulse: true }
+      return { label: 'Connecting', dotClass: 'bg-ember-400', pulse: true }
     case 'open':
-      return { label: 'Live', dotClass: 'bg-emerald-400', pulse: false }
+      return { label: 'Live', dotClass: 'bg-moss-400', pulse: false }
     case 'reconnecting':
-      return { label: 'Reconnecting', dotClass: 'bg-amber-400', pulse: true }
+      return { label: 'Reconnecting', dotClass: 'bg-ember-400', pulse: true }
     case 'closed':
-      return { label: 'Closed', dotClass: 'bg-slate-500', pulse: false }
+      return { label: 'Closed', dotClass: 'bg-ink-500', pulse: false }
   }
 }
 </script>
 
 <template>
-  <div class="overflow-hidden rounded-lg border border-slate-800 bg-slate-950">
-    <div class="flex items-center justify-between border-b border-slate-800 px-3 py-1.5">
-      <span class="text-[11px] font-medium tracking-wide text-slate-500 uppercase">
+  <div class="overflow-hidden rounded-lg border border-line bg-surface">
+    <div class="flex items-center justify-between border-b border-line px-3 py-1.5">
+      <span class="text-[11px] font-medium tracking-wide text-content-muted uppercase">
         Build log — deployment #{{ deployment.number }}
       </span>
       <UBadge
@@ -165,23 +165,23 @@ const connectionChip = () => {
       </UBadge>
     </div>
 
-    <div v-if="phase === 'loading'" class="flex items-center justify-center py-10 text-xs text-slate-500">
+    <div v-if="phase === 'loading'" class="flex items-center justify-center py-10 text-xs text-content-muted">
       Loading build log…
     </div>
 
-    <div v-else-if="phase === 'unavailable'" class="flex items-center justify-center py-10 text-xs text-slate-500">
+    <div v-else-if="phase === 'unavailable'" class="flex items-center justify-center py-10 text-xs text-content-muted">
       Log unavailable.
     </div>
 
     <div v-else-if="phase === 'error'" class="flex flex-col items-center gap-2 py-10 text-xs">
-      <span class="text-red-400">{{ errorMessage }}</span>
+      <span class="text-status-error">{{ errorMessage }}</span>
       <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" @click="retry">Retry</UButton>
     </div>
 
     <pre
       v-else
       ref="container"
-      class="max-h-96 overflow-y-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all text-slate-300 select-text"
-    ><span v-if="!lines.length" class="text-slate-600">No output yet…</span><template v-else>{{ lines.join('\n') }}</template></pre>
+      class="max-h-96 overflow-y-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all text-content-secondary select-text"
+    ><span v-if="!lines.length" class="text-content-muted">No output yet…</span><template v-else>{{ lines.join('\n') }}</template></pre>
   </div>
 </template>
