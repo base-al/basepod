@@ -43,6 +43,18 @@ type Runtime interface {
 	// podman.Client.ContainerStats's doc comment for the wire format and
 	// its verification trail.
 	ContainerStats(ctx context.Context, nameOrID string) (io.ReadCloser, error)
+	// BulkContainerStats streams EVERY currently-running container's
+	// resource-usage stats over one connection — used by AllStats, the
+	// batch-stats route's substrate (GET /api/v1/stats). See
+	// podman.Client.BulkContainerStats's doc comment for the wire format,
+	// why it deliberately never filters by name server-side, and its
+	// verification trail.
+	BulkContainerStats(ctx context.Context) (io.ReadCloser, error)
+	// HostCPUs reports the podman host's online CPU count — used by
+	// HostCPUs to normalize BulkContainerStats' raw (unnormalized) CPU%
+	// onto the same scale ContainerStats' already promises. See
+	// podman.Client.HostCPUs's doc comment.
+	HostCPUs(ctx context.Context) (int, error)
 }
 
 // Prober checks that an upstream ("host:port" reachable on the basepod

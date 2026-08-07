@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useToast } from '@nuxt/ui/composables'
 
-import { api, type App } from '../lib/api'
+import { api, type AllStatsSample, type App } from '../lib/api'
 import { formatLimitsSummary } from '../lib/formatLimits'
+import { connect, type SseConnection, type SseState } from '../lib/sse'
+import { formatCpuPercent, formatMemUsedLive, pushStatsSample, type AppStatsBySlug } from '../lib/statsBuffer'
 import { statusStyles } from '../theme'
 import AppShell from '../components/AppShell.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import ImageRef from '../components/ImageRef.vue'
 import ConfirmDanger from '../components/ConfirmDanger.vue'
+import CpuSparkline from '../components/CpuSparkline.vue'
 
 // POLL_INTERVAL_MS: apps' deploy status changes over time (created ->
 // deploying -> running/error) without any push channel in this milestone,
@@ -26,6 +29,90 @@ const appsQuery = useQuery({
 })
 
 const apps = computed(() => appsQuery.data.value ?? [])
+
+// --- Live CPU/memory sparklines (batch stats stream) ----------------------
+//
+// One SSE connection for the whole page (GET /api/v1/stats via lib/sse.ts's
+// connect(), scope "all_stats") rather than one per row — that's the whole
+// point of the batch route (see internal/api/allstats.go): opening N
+// EventSources for N apps would multiply connections, podman-side
+// goroutines, and reconnect/backoff logic by however many apps are
+// deployed. Each `event: stats` message carries a `slug` (see
+// lib/api.ts's AllStatsSample) that routes it to the right row via
+// lib/statsBuffer.ts's rolling window, keyed by slug — apps that aren't
+// currently running simply never appear as a key (see AllStatsProvider's
+// RunningAppContainers doc comment server-side), which is exactly why a
+// row for a stopped/deploying-with-no-container-yet app just shows the
+// seed state below rather than anything needing special-casing here.
+const statsBySlug = ref<AppStatsBySlug>({})
+
+// statsStreamState mirrors lib/sse.ts's SseState. Only 'closed' (a
+// DEFINITIVE failure — see connect()'s doc comment: a dead session, or a
+// run of failures confirmed not to be a live-but-flaky session) makes the
+// numbers below fall back to "unavailable" instead of showing (possibly a
+// little stale, mid-reconnect) last-known values — a transient
+// 'reconnecting' blip isn't reason enough to blank out real numbers that
+// are still probably close to right.
+const statsStreamState = ref<SseState>('connecting')
+
+let statsConnection: SseConnection | null = null
+
+onMounted(() => {
+  statsConnection = connect(
+    '/api/v1/stats',
+    { scope: 'all_stats', slug: '' },
+    {
+      events: ['stats'],
+      onEvent: (_name, dataJSON) => {
+        // A malformed event payload is silently dropped (that row's
+        // numbers simply don't update this tick) rather than thrown or
+        // logged — degrading honestly means never spamming the console
+        // over a single skipped sample, and JSON.parse on server-sent
+        // data is the one place here that can actually throw.
+        try {
+          const sample = JSON.parse(dataJSON) as AllStatsSample
+          statsBySlug.value = pushStatsSample(statsBySlug.value, sample)
+        } catch {
+          // ignored — see above.
+        }
+      },
+      onStateChange: (state) => {
+        statsStreamState.value = state
+      },
+    },
+  )
+})
+
+onBeforeUnmount(() => {
+  statsConnection?.close()
+  statsConnection = null
+})
+
+/** This row's recent CPU-percent history for CpuSparkline — an empty
+ * array once the stream is confirmed dead (statsStreamState 'closed'),
+ * so the sparkline falls back to its own flat/neutral seed state instead
+ * of freezing on a last-known shape that can no longer be trusted live. */
+function cpuHistory(slug: string): number[] {
+  if (statsStreamState.value === 'closed') return []
+  return statsBySlug.value[slug]?.cpuHistory ?? []
+}
+
+/** "12%" once a sample has arrived for this app, "—" before the first one
+ * lands OR once the stream is confirmed dead — never a stale-looking
+ * number presented as current. */
+function cpuText(slug: string): string {
+  if (statsStreamState.value === 'closed') return '—'
+  const latest = statsBySlug.value[slug]?.latest
+  return latest ? formatCpuPercent(latest.cpu_percent) : '—'
+}
+
+/** "41 / 512 MB" (used / this app's configured limit) once a sample has
+ * arrived, "—" otherwise — mirrors cpuText's degrade-honestly rule. */
+function memText(app: App): string {
+  if (statsStreamState.value === 'closed') return '—'
+  const latest = statsBySlug.value[app.slug]?.latest
+  return latest ? formatMemUsedLive(latest.mem_used_bytes, app.memory_limit_mb) : '—'
+}
 
 // NOTE ON SCOPE: the apps list intentionally does NOT show each app's
 // public URL. The generated hostname (<slug>.<root_domain>) requires
@@ -218,10 +305,12 @@ const deleteProjectMutation = useMutation({
              two rows) and the whole row is a link, not just the slug. -->
         <div class="hidden overflow-hidden rounded-lg border border-line md:block">
           <div
-            class="grid grid-cols-[minmax(0,1.1fr)_auto_minmax(0,1.6fr)_auto_auto] items-center gap-4 border-b border-line bg-surface-elevated/40 px-5 py-2.5 text-xs font-medium uppercase tracking-wide text-content-muted"
+            class="grid grid-cols-[minmax(0,1.1fr)_auto_auto_auto_minmax(0,1.3fr)_auto_auto] items-center gap-4 border-b border-line bg-surface-elevated/40 px-5 py-2.5 text-xs font-medium uppercase tracking-wide text-content-muted"
           >
             <span>App</span>
             <span>Status</span>
+            <span>CPU</span>
+            <span>Mem</span>
             <span>Image</span>
             <span>Port</span>
             <span>Limits</span>
@@ -232,7 +321,7 @@ const deleteProjectMutation = useMutation({
             :key="app.slug"
             :to="{ name: 'app-detail', params: { slug: app.slug } }"
             :aria-label="`Open app ${app.slug}, ${statusStyles[app.status].label}${app.internal ? ', internal' : ''}`"
-            class="grid grid-cols-[minmax(0,1.1fr)_auto_minmax(0,1.6fr)_auto_auto] items-center gap-4 border-b border-line px-5 py-3.5 transition-colors last:border-b-0 hover:bg-surface-elevated/60 focus-visible:bg-surface-elevated/60 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
+            class="grid grid-cols-[minmax(0,1.1fr)_auto_auto_auto_minmax(0,1.3fr)_auto_auto] items-center gap-4 border-b border-line px-5 py-3.5 transition-colors last:border-b-0 hover:bg-surface-elevated/60 focus-visible:bg-surface-elevated/60 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
           >
             <span class="truncate font-mono text-sm font-medium text-content-primary">
               {{ app.compose_project ? app.compose_service : app.slug }}
@@ -244,6 +333,11 @@ const deleteProjectMutation = useMutation({
                 Internal
               </UBadge>
             </div>
+            <div class="flex items-center gap-2">
+              <CpuSparkline :samples="cpuHistory(app.slug)" :status="app.status" />
+              <span class="font-mono text-xs tabular-nums text-content-secondary">{{ cpuText(app.slug) }}</span>
+            </div>
+            <span class="whitespace-nowrap font-mono text-xs tabular-nums text-content-secondary">{{ memText(app) }}</span>
             <ImageRef :value="app.image" class="min-w-0" />
             <span class="font-mono text-sm text-content-secondary tabular-nums">{{ app.internal ? '—' : app.port }}</span>
             <span class="whitespace-nowrap font-mono text-xs tabular-nums text-content-secondary">
@@ -278,6 +372,20 @@ const deleteProjectMutation = useMutation({
             <div class="flex items-center justify-between text-xs text-content-muted">
               <span class="font-mono">{{ app.internal ? 'internal' : `port ${app.port}` }}</span>
               <span class="font-mono">{{ formatLimitsSummary(app.memory_limit_mb, app.cpu_limit) }}</span>
+            </div>
+            <!-- Live CPU/memory, numbers only — no sparkline graphic here.
+                 At card width (~390px) the row above already carries two
+                 text segments (port, limits); a third element squeezed in
+                 next to the state chip would either force a wrap or shrink
+                 the spark's ~60px trend line down to a few illegible
+                 pixels. The numbers are the actual value-add (an operator
+                 checking "is this thing busy" from their phone cares about
+                 the current reading, not the shape of the last 100s) so
+                 they're what's kept; the trend line stays a desktop-table
+                 affordance (see CpuSparkline.vue above). -->
+            <div class="flex items-center justify-between text-xs text-content-muted">
+              <span class="font-mono">cpu {{ cpuText(app.slug) }}</span>
+              <span class="font-mono">mem {{ memText(app) }}</span>
             </div>
           </RouterLink>
         </div>

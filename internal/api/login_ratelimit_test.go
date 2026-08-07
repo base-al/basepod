@@ -67,7 +67,7 @@ func TestClientIP(t *testing.T) {
 // ever allowed to grant trusted status in the real process.
 func newTrustedTestServer(t *testing.T, st *store.Store, dep Deployer, routes RoutesApplier) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(TrustedProxyMiddleware(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, unusedLogSource, nil, nil, unusedStatsSource)))
+	srv := httptest.NewServer(TrustedProxyMiddleware(New(st, dep, fakePinger(nil), "test-version", testSeal, testOpen, routes, unusedLogSource, nil, nil, unusedStatsSource, unusedAllStatsProvider)))
 	t.Cleanup(srv.Close)
 	return srv
 }

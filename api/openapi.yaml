@@ -24,11 +24,13 @@ info:
       `POST /auth/login` and valid up to 30 days. Used by every
       authenticated route except the two noted below.
     - `streamTokenAuth` — `?access_token=<stream-token>` on the query
-      string, accepted **only** on the three SSE routes
-      (`.../logs`, `.../deployments/{number}/log`, `.../stats`), because a
-      native browser `EventSource` cannot set request headers. A stream
-      token is minted via `POST /stream-token`, is scoped to exactly one
-      (scope, slug[, deployment_number]) triple, and expires in 5 minutes.
+      string, accepted **only** on the four SSE routes
+      (`.../logs`, `.../deployments/{number}/log`, `.../stats`,
+      `/stats`), because a native browser `EventSource` cannot set
+      request headers. A stream token is minted via `POST /stream-token`,
+      is scoped to exactly one (scope, slug[, deployment_number]) triple
+      — `/stats` (scope `"all_stats"`) is the one exception, naming no
+      slug at all since it streams every app — and expires in 5 minutes.
       A session token placed in `?access_token=` is rejected — this
       parameter accepts stream tokens only. This is a non-standard,
       route-specific scheme; OpenAPI's `apiKey`-in-query type is used here
@@ -774,6 +776,39 @@ paths:
         "502": { description: "stats_failed", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/TooManyStreams" }
 
+  /stats:
+    get:
+      operationId: streamAllStats
+      tags: [streaming]
+      summary: Stream every running app's container CPU/memory/network/block-IO stats — SSE, one connection
+      description: |
+        Server-Sent Events; ONE connection carries every currently-running
+        app's stats (rather than one connection per app the way
+        /apps/{slug}/stats would require if opened once per row) — each
+        message is `event: stats` with a JSON `AllStatsSample` body (the
+        same shape as `StatsSample` plus `slug`, identifying which app the
+        sample is for), emitted roughly once per libpod's own ~5s
+        sampling interval. An app with no running container simply never
+        emits — the stream itself never ends because one app stopped.
+        Accepts `sessionAuth` OR `streamTokenAuth` with scope
+        `"all_stats"` — a token minted for scope `"stats"` (or any other
+        scope) does not authenticate this route, and vice versa: each SSE
+        route's stream token is its own separate credential. Counts
+        against the same per-user/global concurrent-stream caps as the
+        other SSE routes.
+      security:
+        - sessionAuth: []
+        - streamTokenAuth: []
+      responses:
+        "200":
+          description: "SSE stream"
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/AllStatsSample" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { description: "stats_failed", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/TooManyStreams" }
+
   /openapi.yaml:
     get:
       operationId: getOpenAPISpec
@@ -800,7 +835,7 @@ components:
       description: |
         A stream token from POST /stream-token, scoped to one SSE route's
         (scope, slug[, deployment_number]) — see the top-level auth
-        description. Accepted ONLY on the three SSE routes; a session
+        description. Accepted ONLY on the four SSE routes; a session
         token here is rejected everywhere, including on those routes.
 
   parameters:
@@ -899,8 +934,8 @@ components:
       type: object
       required: [scope, slug]
       properties:
-        scope: { type: string, enum: [app_logs, build_log, stats] }
-        slug: { type: string }
+        scope: { type: string, enum: [app_logs, build_log, stats, all_stats] }
+        slug: { type: string, description: "Must be \"\" for scope \"all_stats\" (which names no single app); required and non-empty otherwise." }
         deployment_number:
           type: integer
           description: Required for scope "build_log", must be absent otherwise.
@@ -1115,6 +1150,28 @@ components:
         this contract doesn't move when podman changes. See
         internal/podman.ContainerStatsSample.
       properties:
+        cpu_percent: { type: number, description: "0-100 per core (a container fully using 2 cores reads 200)." }
+        mem_used_bytes: { type: integer, format: int64 }
+        mem_limit_bytes: { type: integer, format: int64 }
+        pids: { type: integer, format: int64 }
+        net_rx_bytes: { type: integer, format: int64 }
+        net_tx_bytes: { type: integer, format: int64 }
+        block_read_bytes: { type: integer, format: int64 }
+        block_write_bytes: { type: integer, format: int64 }
+
+    AllStatsSample:
+      type: object
+      description: |
+        StatsSample plus `slug` — the batch route's (GET /stats) per-tick
+        shape, letting one SSE connection carry every running app's
+        samples interleaved. cpu_percent is normalized onto the exact
+        same 0-100-per-core scale StatsSample's already uses (see
+        internal/podman.StreamBulkStats' doc comment for why that
+        normalization is necessary: the underlying podman bulk endpoint's
+        raw CPU field is NOT per-core-normalized the way the per-container
+        endpoint's is).
+      properties:
+        slug: { type: string, description: "Which app this sample is for." }
         cpu_percent: { type: number, description: "0-100 per core (a container fully using 2 cores reads 200)." }
         mem_used_bytes: { type: integer, format: int64 }
         mem_limit_bytes: { type: integer, format: int64 }

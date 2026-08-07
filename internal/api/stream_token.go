@@ -26,6 +26,20 @@ const (
 	// The stream_tokens.scope column is free TEXT (see store.StreamToken),
 	// so adding this scope needs no migration.
 	streamScopeStats = "stats"
+	// streamScopeAllStats is the batch-stats SSE route's scope
+	// (GET /api/v1/stats — the sparklines-on-the-apps-list milestone): a
+	// deliberately DIFFERENT scope from streamScopeStats even though both
+	// ultimately stream podman stats, because they authenticate different
+	// routes with different blast radii — a token minted for one app's
+	// stats must never double as a token that can read every app's, and a
+	// batch-stats token must never be mistaken for a single-app one. This
+	// scope names neither a slug nor a deployment number (see
+	// handleCreateStreamToken's early-return branch for it, and
+	// requireAuthAllStats below); the stream_tokens row it mints still
+	// stores slug "" (the column is NOT NULL, and "" satisfies that with
+	// no schema change) purely so CreateStreamToken's signature doesn't
+	// need a nilable slug just for this one scope.
+	streamScopeAllStats = "all_stats"
 )
 
 // streamTokenDuration is how long a minted stream token remains valid.
@@ -73,8 +87,39 @@ func (a *api) handleCreateStreamToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Scope != streamScopeAppLogs && req.Scope != streamScopeBuildLog && req.Scope != streamScopeStats {
-		writeError(w, http.StatusUnprocessableEntity, "validation", `scope must be "app_logs", "build_log", or "stats"`)
+	if req.Scope != streamScopeAppLogs && req.Scope != streamScopeBuildLog && req.Scope != streamScopeStats && req.Scope != streamScopeAllStats {
+		writeError(w, http.StatusUnprocessableEntity, "validation", `scope must be "app_logs", "build_log", "stats", or "all_stats"`)
+		return
+	}
+
+	// streamScopeAllStats names no single app — unlike every other scope,
+	// it must NOT go through the AppBySlug lookup below (which would 404
+	// for the empty slug this scope requires) or the deployment_number
+	// switch (which only makes sense once an app is in hand). Handled as
+	// its own early return rather than folded into the switch below so
+	// that switch can stay "given a real app, validate scope coherence"
+	// without an app-less case awkwardly threaded through it.
+	if req.Scope == streamScopeAllStats {
+		if req.Slug != "" {
+			writeError(w, http.StatusUnprocessableEntity, "validation", `slug must not be set for scope "all_stats"`)
+			return
+		}
+		if req.DeploymentNumber != nil {
+			writeError(w, http.StatusUnprocessableEntity, "validation", `deployment_number must not be set for scope "all_stats"`)
+			return
+		}
+
+		user := userFromContext(r.Context())
+		token, tokenHash := auth.NewStreamToken()
+		expiresAt := time.Now().Add(streamTokenDuration)
+		if err := a.st.CreateStreamToken(user.ID, tokenHash, req.Scope, "", nil, expiresAt); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "failed to create stream token")
+			return
+		}
+		writeJSON(w, http.StatusOK, streamTokenResponse{
+			Token:     token,
+			ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+		})
 		return
 	}
 
@@ -249,5 +294,20 @@ func (a *api) requireAuthBuildLog(next http.Handler) http.Handler {
 func (a *api) requireAuthStats(next http.Handler) http.Handler {
 	return a.requireAuthSSE(func(r *http.Request, token string) (*store.User, bool) {
 		return a.validateStreamToken(token, streamScopeStats, chi.URLParam(r, "slug"), nil)
+	})(next)
+}
+
+// requireAuthAllStats is requireAuthStats' batch-route twin for
+// GET /api/v1/stats: a query-string stream token must have been minted
+// with scope "all_stats" (see streamScopeAllStats's doc comment for why
+// that's a separate scope from "stats" rather than reusing it). There is
+// no {slug} URL param on this route, so the token's own slug (always ""
+// for this scope — see handleCreateStreamToken) is compared against a
+// fixed "" rather than a route param, mirroring how validateStreamToken
+// already compares scope/slug/deploymentNumber as a fixed triple for
+// every other SSE route.
+func (a *api) requireAuthAllStats(next http.Handler) http.Handler {
+	return a.requireAuthSSE(func(r *http.Request, token string) (*store.User, bool) {
+		return a.validateStreamToken(token, streamScopeAllStats, "", nil)
 	})(next)
 }
